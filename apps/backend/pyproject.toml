@@ -12,6 +12,7 @@ package = false
 
 [dependency-groups]
 dev = [
+    "mypy>=2.1.0",
     "ruff>=0.15.20",
 ]
 
@@ -29,3 +30,14 @@ select = ["E", "W", "F", "I", "UP", "B"]
 [tool.ruff.format]
 # Estilo por defecto de Ruff (equivalente a black).
 quote-style = "double"
+
+# mypy: type-checking estricto. Fuera de Turborepo (mismo patrón que Ruff).
+[tool.mypy]
+python_version = "3.12"
+strict = true
+# strict ya implica estos, pero los dejamos explícitos por claridad:
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_reexport = true
+# No tipar el entorno virtual ni librerías instaladas.
+exclude = ['\.venv/']

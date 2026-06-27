@@ -36,3 +36,12 @@ uv run ruff format .       # formatea
 
 En cada commit, el hook de lefthook (definido en la raíz) corre `ruff format` y
 `ruff check --fix` solo sobre los `.py` _staged_.
+
+## Type-checking (mypy, estricto)
+
+[mypy](https://mypy-lang.org/) en modo `strict` (configurado en `pyproject.toml`,
+`[tool.mypy]`). No está dentro de Turborepo (mismo patrón que Ruff).
+
+```bash
+uv run mypy .
+```

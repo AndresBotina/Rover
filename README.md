@@ -81,6 +81,32 @@ uv run ruff check .        # lintea (añade --fix para autocorregir)
 uv run ruff format .       # formatea
 ```
 
+## Type-checking (estricto)
+
+Chequeo de tipos estricto, también en los **dos mundos**. No va en el pre-commit
+hook (es más pesado); corre como script y en CI (HU-0.5).
+
+**JS/TS** — `tsc --noEmit` por workspace, orquestado por Turborepo. La estrictez
+vive en `tsconfig.base.json` (raíz) y los workspaces la heredan vía `extends`
+(`strict` + `noUncheckedIndexedAccess`, `noImplicitOverride`,
+`exactOptionalPropertyTypes`, `noFallthroughCasesInSwitch`,
+`forceConsistentCasingInFileNames`).
+
+```bash
+pnpm type-check      # tsc --noEmit en los workspaces JS/TS
+```
+
+> `web` y `mobile` aún no tienen fuentes: su `tsconfig.json` está listo y su
+> `type-check` es un no-op hasta que su HU (3.1 / 4.1) agregue `src/`.
+
+**Python** (`apps/backend`) — [mypy](https://mypy-lang.org/) en modo estricto
+(`strict = true` en `pyproject.toml`), fuera de Turborepo:
+
+```bash
+cd apps/backend
+uv run mypy .
+```
+
 ### Hooks de pre-commit (lefthook)
 
 Usamos [**lefthook**](https://lefthook.dev/) porque maneja TS y Python en un solo

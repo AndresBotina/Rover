@@ -1,0 +1,8 @@
+{
+  "//": "Config TS lista para HU-3.1 (Next.js). Cuando exista src/, activa el script type-check con 'tsc --noEmit'.",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"]
+  },
+  "include": ["src"]
+}

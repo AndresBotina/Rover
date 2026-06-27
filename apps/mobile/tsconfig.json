@@ -1,0 +1,5 @@
+{
+  "//": "Config TS lista para HU-4.1 (Expo). Cuando exista src/, activa el script type-check con 'tsc --noEmit'.",
+  "extends": "../../tsconfig.base.json",
+  "include": ["src"]
+}
