@@ -22,11 +22,16 @@ rover/
 │   └── mobile/       # Expo — placeholder (real en HU-4.1)
 ├── packages/
 │   └── shared/       # TS: tipos + cliente API — stub (se llena en HU-0.7)
+├── docs/             # Documentación del proyecto (backlog incluido)
 ├── package.json      # raíz privado "rover-app": scripts + Turborepo
 ├── pnpm-workspace.yaml
 ├── turbo.json
 └── .gitignore
 ```
+
+> La documentación del proyecto (backlog incluido) vive en
+> [`docs/`](docs/): `backlog.md` (Épica 0 en curso) y `backlog-full.md`
+> (panorama de las 7 épicas).
 
 ## Requisitos
 
