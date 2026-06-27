@@ -9,3 +9,23 @@ dependencies = []
 [tool.uv]
 # Proyecto-aplicación: no es un paquete instalable, solo un entorno gestionado por uv.
 package = false
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.20",
+]
+
+# Ruff: linter + formateador (reemplaza black + flake8 + isort).
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+# Reglas estándar y razonables, sin volverse agresivo:
+#   E/W = pycodestyle, F = pyflakes, I = isort (orden de imports),
+#   UP = pyupgrade, B = flake8-bugbear.
+select = ["E", "W", "F", "I", "UP", "B"]
+
+[tool.ruff.format]
+# Estilo por defecto de Ruff (equivalente a black).
+quote-style = "double"

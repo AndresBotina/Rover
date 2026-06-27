@@ -1,0 +1,29 @@
+# Hooks de Git gestionados por lefthook.
+# Se instalan tras un clone con `pnpm install` (script "prepare") o `pnpm lefthook install`.
+#
+# Filosofía: rápido y NO agresivo. Solo toca los archivos STAGED que cambiaron.
+# NO incluye type-check ni tests (eso va en HU-0.3 y HU-0.5).
+pre-commit:
+  parallel: false
+  jobs:
+    # --- TS/JS: Prettier (formato) primero, luego ESLint --fix ---
+    - name: prettier
+      glob: "*.{js,jsx,ts,tsx,mjs,cjs,json,md,yml,yaml,css}"
+      run: pnpm exec prettier --write {staged_files}
+      stage_fixed: true
+
+    - name: eslint
+      glob: "*.{js,jsx,ts,tsx,mjs,cjs}"
+      run: pnpm exec eslint --fix --no-error-on-unmatched-pattern {staged_files}
+      stage_fixed: true
+
+    # --- Python: Ruff format + check --fix (vía uv, en el proyecto backend) ---
+    - name: ruff-format
+      glob: "*.py"
+      run: uv run --project apps/backend ruff format {staged_files}
+      stage_fixed: true
+
+    - name: ruff-check
+      glob: "*.py"
+      run: uv run --project apps/backend ruff check --fix {staged_files}
+      stage_fixed: true

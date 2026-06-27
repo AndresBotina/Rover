@@ -23,3 +23,16 @@ uv run python -V # ejecuta dentro del entorno
 
 El backend se ejecuta y prueba de forma independiente de los comandos `pnpm`
 de la raíz del monorepo.
+
+## Lint y formato (Ruff)
+
+[Ruff](https://docs.astral.sh/ruff/) hace de linter **y** formateador (configurado
+en `pyproject.toml`, `[tool.ruff]`). No está dentro de Turborepo.
+
+```bash
+uv run ruff check .        # lintea (--fix para autocorregir)
+uv run ruff format .       # formatea
+```
+
+En cada commit, el hook de lefthook (definido en la raíz) corre `ruff format` y
+`ruff check --fix` solo sobre los `.py` _staged_.

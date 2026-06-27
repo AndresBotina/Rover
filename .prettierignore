@@ -1,0 +1,14 @@
+# Dependencias y outputs
+node_modules
+**/dist
+**/.next
+**/.turbo
+
+# Lockfiles
+pnpm-lock.yaml
+
+# Mundo Python (lo gestiona Ruff)
+apps/backend
+
+# Documentación de prosa (evita reflujos ruidosos del backlog)
+docs

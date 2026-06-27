@@ -4,6 +4,7 @@
   "private": true,
   "//": "Placeholder. El scaffold real de Expo llega en HU-4.1.",
   "scripts": {
-    "dev": "node -e \"console.log('[@rover/mobile] placeholder — el Expo real llega en HU-4.1')\""
+    "dev": "node -e \"console.log('[@rover/mobile] placeholder — el Expo real llega en HU-4.1')\"",
+    "lint": "eslint . --no-error-on-unmatched-pattern"
   }
 }

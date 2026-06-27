@@ -44,17 +44,56 @@ rover/
 
 ## Comandos (JS/TS, desde la raíz)
 
-| Comando            | Descripción                                            |
-| ------------------ | ------------------------------------------------------ |
-| `pnpm install`     | Instala dependencias y enlaza los workspaces.          |
-| `pnpm dev`         | Arranca las apps en desarrollo (`turbo run dev`).      |
-| `pnpm build`       | Compila todos los paquetes (`turbo run build`).        |
-| `pnpm lint`        | Linter en todos los paquetes (`turbo run lint`).       |
-| `pnpm type-check`  | Chequeo de tipos (`turbo run type-check`).             |
-| `pnpm test`        | Tests (`turbo run test`).                              |
+| Comando           | Descripción                                       |
+| ----------------- | ------------------------------------------------- |
+| `pnpm install`    | Instala dependencias y enlaza los workspaces.     |
+| `pnpm dev`        | Arranca las apps en desarrollo (`turbo run dev`). |
+| `pnpm build`      | Compila todos los paquetes (`turbo run build`).   |
+| `pnpm lint`       | ESLint en todos los paquetes (`turbo run lint`).  |
+| `pnpm format`     | Formatea los archivos JS/TS con Prettier.         |
+| `pnpm type-check` | Chequeo de tipos (`turbo run type-check`).        |
+| `pnpm test`       | Tests (`turbo run test`).                         |
 
 > Algunas tareas aún no están implementadas en todos los paquetes (web/mobile son
 > placeholders); el pipeline está definido en `turbo.json` desde ya.
+
+## Calidad de código (lint & formato)
+
+El repo es híbrido, así que el linting/formateo vive en **dos mundos**:
+
+**JS/TS** (web, mobile, shared) — ESLint (flat config en `eslint.config.mjs`) +
+Prettier (`.prettierrc.json`). ESLint solo revisa calidad; el formato lo decide
+Prettier (las reglas de formato de ESLint quedan apagadas con `eslint-config-prettier`).
+
+```bash
+pnpm lint            # ESLint en los workspaces JS/TS
+pnpm format          # Prettier escribe los archivos JS/TS
+pnpm format:check    # Prettier en modo verificación (no escribe)
+```
+
+**Python** (`apps/backend`) — [Ruff](https://docs.astral.sh/ruff/) como linter
+**y** formateador (reemplaza black + flake8 + isort), gestionado con uv **fuera**
+de Turborepo:
+
+```bash
+cd apps/backend
+uv run ruff check .        # lintea (añade --fix para autocorregir)
+uv run ruff format .       # formatea
+```
+
+### Hooks de pre-commit (lefthook)
+
+Usamos [**lefthook**](https://lefthook.dev/) porque maneja TS y Python en un solo
+repo con un único binario, es muy rápido y corre solo sobre los archivos _staged_.
+En cada commit: Prettier + ESLint `--fix` en TS/JS y `ruff format` + `ruff check --fix`
+en Python (ver `lefthook.yml`). No corre type-check ni tests (eso es HU-0.3 / HU-0.5).
+
+Tras un clone fresco, los hooks se instalan solos con `pnpm install` (script
+`prepare`). Si necesitas (re)instalarlos a mano:
+
+```bash
+pnpm lefthook install
+```
 
 ## Backend Python (aparte)
 

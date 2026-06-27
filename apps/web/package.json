@@ -4,6 +4,7 @@
   "private": true,
   "//": "Placeholder. El scaffold real de Next.js llega en HU-3.1.",
   "scripts": {
-    "dev": "node -e \"console.log('[@rover/web] placeholder — el Next.js real llega en HU-3.1')\""
+    "dev": "node -e \"console.log('[@rover/web] placeholder — el Next.js real llega en HU-3.1')\"",
+    "lint": "eslint . --no-error-on-unmatched-pattern"
   }
 }
