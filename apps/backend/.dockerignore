@@ -1,0 +1,18 @@
+# Entorno virtual y caches (imagen ligera)
+.venv
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# No se necesitan dentro de la imagen
+tests
+README.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+.python-version
+.env
+.env.*

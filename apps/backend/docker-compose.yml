@@ -1,0 +1,18 @@
+# Compose para DESARROLLO local del backend.
+# El mismo Dockerfile sirve para el deploy de producción (HU-0.6); aquí solo
+# añadimos hot-reload y el montaje del código para iterar cómodo.
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rover-backend:dev
+    ports:
+      - "8000:8000"
+    environment:
+      ROVER_ENV: local
+    volumes:
+      # Monta el código fuente para recarga en caliente.
+      - ./app:/app/app
+    # Override de desarrollo: recarga al cambiar archivos.
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
