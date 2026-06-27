@@ -1,0 +1,25 @@
+# apps/backend — Backend de Rover (Python + FastAPI)
+
+> ⚠️ Placeholder. El FastAPI real llega en **HU-0.4**.
+
+Este directorio contiene el backend en **Python** del monorepo. A diferencia del
+resto de apps, **NO** forma parte del workspace de pnpm/Turborepo: se gestiona
+aparte con [**uv**](https://docs.astral.sh/uv/).
+
+## Estado actual
+
+- `pyproject.toml` mínimo (proyecto `rover-backend`, sin dependencias de app).
+- Aún no hay código de aplicación; el scaffold de FastAPI llega en HU-0.4.
+
+## Tooling
+
+Requiere Python ≥ 3.12 y `uv` instalado.
+
+```bash
+# desde apps/backend/
+uv sync          # crea el entorno virtual (.venv) y resuelve dependencias
+uv run python -V # ejecuta dentro del entorno
+```
+
+El backend se ejecuta y prueba de forma independiente de los comandos `pnpm`
+de la raíz del monorepo.

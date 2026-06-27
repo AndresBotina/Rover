@@ -1,0 +1,11 @@
+[project]
+name = "rover-backend"
+version = "0.0.0"
+description = "Backend de Rover (FastAPI). La implementación real llega en HU-0.4."
+requires-python = ">=3.12"
+# Sin dependencias de app todavía — se añaden en HU-0.4.
+dependencies = []
+
+[tool.uv]
+# Proyecto-aplicación: no es un paquete instalable, solo un entorno gestionado por uv.
+package = false

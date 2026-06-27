@@ -1,0 +1,6 @@
+# Workspaces JS/TS gestionados por pnpm + Turborepo.
+# NOTA: apps/backend NO va aquí — es Python y se gestiona aparte con uv.
+packages:
+  - "packages/*"
+  - "apps/web"
+  - "apps/mobile"
