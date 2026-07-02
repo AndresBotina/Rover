@@ -1,0 +1,85 @@
+name: CI
+
+# Pipeline de calidad de Rover.
+# Dos mundos independientes → dos jobs en paralelo: si algo falla,
+# la pestaña Actions muestra de un vistazo si el rojo es de TS o de Python.
+
+on:
+  push:
+    branches: [develop]
+  # Permite lanzarlo a mano desde la UI de GitHub (Actions → CI → Run workflow).
+  workflow_dispatch:
+
+# Si llegan varios pushes seguidos a develop, cancela los runs previos y
+# quédate con el último — así el badge refleja el estado más reciente.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: TS (lint, format, type-check)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # pnpm se toma de package.json → "packageManager": "pnpm@9.15.9".
+      # action-setup lo lee de ahí y lo instala vía corepack.
+      - name: Configurar pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Configurar Node 22 (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Instalar dependencias (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: ESLint
+        run: pnpm lint
+
+      - name: Prettier (check)
+        run: pnpm format:check
+
+      - name: Type-check (tsc estricto)
+        run: pnpm type-check
+
+  backend:
+    name: Python (ruff, mypy, pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Action oficial de Astral para uv. Habilita caché y ata la clave al
+      # uv.lock del backend para que se invalide solo cuando cambian las deps.
+      - name: Configurar uv (con caché)
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: apps/backend/uv.lock
+
+      # Python 3.12 (uv lee apps/backend/.python-version y lo instala si falta).
+      - name: Instalar Python 3.12
+        run: uv python install 3.12
+
+      - name: Sincronizar dependencias (frozen lockfile)
+        run: uv sync --frozen
+
+      - name: Ruff (lint)
+        run: uv run ruff check .
+
+      - name: Ruff (format check)
+        run: uv run ruff format --check .
+
+      - name: mypy (estricto)
+        run: uv run mypy .
+
+      - name: pytest
+        run: uv run pytest

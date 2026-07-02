@@ -1,5 +1,7 @@
 # Rover
 
+[![CI](https://github.com/AndresBotina/Rover/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/AndresBotina/Rover/actions/workflows/ci.yml)
+
 Asistente de viajes con IA. Este repositorio es un **monorepo híbrido**:
 
 - La parte **JS/TS** (web, mobile, paquetes compartidos) se gestiona con
