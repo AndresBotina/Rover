@@ -12,10 +12,12 @@ Las features (DB, auth, agente) llegan en HUs posteriores.
 ```
 app/
 ├── main.py            # crea la app FastAPI e incluye los routers
-├── core/config.py     # Settings (pydantic-settings): APP_NAME, ENV, VERSION
+├── core/config.py     # Settings por ambiente (pydantic-settings) + fail-fast
 └── api/v1/health.py   # GET /v1/health
 tests/
-└── test_health.py     # test del healthcheck
+├── test_health.py     # test del healthcheck
+└── test_config.py     # tests de config por ambiente y fail-fast
+.env.example           # plantilla de variables (el .env real NUNCA se commitea)
 Dockerfile             # imagen de producción (Python 3.12 slim + uv, no-root)
 docker-compose.yml     # servicio de desarrollo (hot-reload + puerto 8000)
 ```
@@ -28,16 +30,39 @@ docker-compose.yml     # servicio de desarrollo (hot-reload + puerto 8000)
 { "status": "ok", "version": "0.1.0", "env": "local" }
 ```
 
-## Configuración
+## Configuración y secretos
 
-`app/core/config.py` lee variables de entorno con prefijo `ROVER_` (defaults
-sensatos, sin secretos):
+`app/core/config.py` (pydantic-settings) lee variables de entorno con prefijo
+`ROVER_`. Ambientes soportados: `local` | `test` | `production`.
 
-| Variable        | Default  | Descripción                |
-| --------------- | -------- | -------------------------- |
-| `ROVER_APP_NAME`| `Rover`  | Nombre de la app.          |
-| `ROVER_ENV`     | `local`  | Entorno (`local`, `prod`…).|
-| `ROVER_VERSION` | `0.1.0`  | Versión (origen: `app.__version__`). |
+| Variable         | Default | Descripción                          |
+| ---------------- | ------- | ------------------------------------ |
+| `ROVER_APP_NAME` | `Rover` | Nombre de la app.                    |
+| `ROVER_ENV`      | `local` | Ambiente (`local`/`test`/`production`). |
+| `ROVER_VERSION`  | `0.1.0` | Versión (origen: `app.__version__`). |
+
+**Desarrollo local** — copia la plantilla y ajusta lo que necesites:
+
+```bash
+cp .env.example .env
+```
+
+El `.env` real está **git-ignorado y nunca se commitea** (regla de oro: ningún
+secreto en el código ni en git). La plantilla versionada es `.env.example`:
+documenta TODAS las variables, con placeholders, incluidas las que llegan en
+Épica 1 (Supabase, LLM) marcadas como **SECRETO**.
+
+**Producción (Render)** — no hay archivo `.env`: las variables se configuran en
+el panel del servicio (**Environment**). El mismo código sirve para ambos
+caminos sin cambios.
+
+**Fail-fast** — los settings se validan al importar el módulo, así que la app
+**no arranca** si la config es inválida: un `ROVER_ENV` desconocido, o una
+variable obligatoria ausente en producción (lista `_REQUIRED_IN_PRODUCTION` en
+`config.py`), cortan el arranque con un error que nombra la variable que falta.
+El patrón para añadir secretos futuros (campo `SecretStr | None` + entrada en
+esa lista + placeholder en `.env.example`) está documentado en `config.py` y
+probado en `tests/test_config.py`.
 
 ## Correr en local (uv)
 
