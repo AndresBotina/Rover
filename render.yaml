@@ -1,0 +1,25 @@
+# Infraestructura como código para Render (https://render.com/docs/blueprint-spec).
+# HU-0.6: deploy del backend como web service Docker en el plan free.
+# La otra mitad de la HU es manual: conectar el repo como Blueprint en el panel
+# de Render; a partir de ahí, cada push a `develop` dispara un deploy.
+services:
+  - type: web
+    name: rover-backend
+    runtime: docker
+    plan: free
+    # Región del servicio. `virginia` (US East) es la más cercana a Latinoamérica
+    # de las disponibles en el plan free. Cambiar aquí si hace falta; otras
+    # opciones: oregon, ohio, frankfurt, singapore.
+    region: virginia
+    branch: develop
+    autoDeploy: true
+    # El backend vive en apps/backend dentro del monorepo.
+    dockerfilePath: apps/backend/Dockerfile
+    dockerContext: apps/backend
+    # Render marca el deploy como sano cuando este path responde 200.
+    healthCheckPath: /v1/health
+    envVars:
+      - key: ROVER_ENV
+        value: production
+      # PORT no se declara: Render lo inyecta automáticamente y el CMD del
+      # Dockerfile lo respeta (${PORT:-8000}).

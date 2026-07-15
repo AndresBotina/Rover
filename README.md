@@ -123,6 +123,13 @@ Tras un clone fresco, los hooks se instalan solos con `pnpm install` (script
 pnpm lefthook install
 ```
 
+## Deploy a Render (backend)
+
+El backend se despliega en **Render** (plan free) como servicio Docker, definido
+en [`render.yaml`](render.yaml): deploy automático en cada push a `develop` y
+healthcheck en `GET /v1/health`. Detalles (incluida la nota del arranque en frío
+del plan free) en [`docs/deploy.md`](docs/deploy.md).
+
 ## Backend Python (aparte)
 
 El backend **no** se gestiona con pnpm. Ver [`apps/backend/README.md`](apps/backend/README.md):

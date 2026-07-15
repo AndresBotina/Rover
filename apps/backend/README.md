@@ -60,7 +60,10 @@ docker compose down              # detener
 ```
 
 El `Dockerfile` produce una imagen apta para producción (uvicorn sin `--reload`,
-usuario no-root, capas cacheables) y es el que usará el deploy de HU-0.6.
+usuario no-root, capas cacheables) y es el que usa el deploy a Render definido
+en `render.yaml` (raíz del repo); ver [`docs/deploy.md`](../../docs/deploy.md).
+En Render el puerto lo inyecta la plataforma vía `PORT` (el CMD usa
+`${PORT:-8000}`, así que en local sigue siendo 8000).
 
 ## Tests
 

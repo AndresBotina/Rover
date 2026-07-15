@@ -30,4 +30,5 @@ ENV PATH="/app/.venv/bin:$PATH"
 EXPOSE 8000
 
 # Producción: sin --reload (el compose lo añade solo para desarrollo).
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Render inyecta el puerto vía $PORT; en local (sin PORT) cae a 8000.
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
