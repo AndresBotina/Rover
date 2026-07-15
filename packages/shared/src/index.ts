@@ -1,4 +1,9 @@
-// Punto de entrada del paquete compartido (@rover/shared).
-// Stub mínimo: los tipos y el cliente API reales llegan en HU-0.7.
+// API pública de @rover/shared: marca, tipos compartidos y cliente HTTP tipado.
+// web y mobile importan SOLO desde aquí; los internos pueden reorganizarse.
 
-export { APP_NAME } from "./config";
+export { APP_NAME } from "./config.ts";
+
+export { isHealthResponse, type HealthResponse } from "./types/health.ts";
+
+export { ApiClient, ApiError } from "./client/client.ts";
+export { DEFAULT_BASE_URL, resolveBaseUrl, type ApiClientConfig } from "./client/config.ts";

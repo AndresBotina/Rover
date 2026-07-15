@@ -2,10 +2,16 @@
   "name": "@rover/web",
   "version": "0.0.0",
   "private": true,
-  "//": "Placeholder. El scaffold real de Next.js llega en HU-3.1.",
+  "//": "Placeholder. El scaffold real de Next.js llega en HU-3.1; @rover/shared ya está cableado (HU-0.7).",
   "scripts": {
     "dev": "node -e \"console.log('[@rover/web] placeholder — el Next.js real llega en HU-3.1')\"",
     "lint": "eslint . --no-error-on-unmatched-pattern",
-    "type-check": "node -e \"console.log('[@rover/web] sin fuentes aún — tsconfig listo; cambia a tsc --noEmit en HU-3.1')\""
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@rover/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
   }
 }

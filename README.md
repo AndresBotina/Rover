@@ -23,7 +23,7 @@ rover/
 │   ├── web/          # Next.js — placeholder (real en HU-3.1)
 │   └── mobile/       # Expo — placeholder (real en HU-4.1)
 ├── packages/
-│   └── shared/       # TS: tipos + cliente API — stub (se llena en HU-0.7)
+│   └── shared/       # TS: tipos compartidos + cliente API tipado (HU-0.7)
 ├── docs/             # Documentación del proyecto (backlog incluido)
 ├── package.json      # raíz privado "rover-app": scripts + Turborepo
 ├── pnpm-workspace.yaml
@@ -98,8 +98,9 @@ vive en `tsconfig.base.json` (raíz) y los workspaces la heredan vía `extends`
 pnpm type-check      # tsc --noEmit en los workspaces JS/TS
 ```
 
-> `web` y `mobile` aún no tienen fuentes: su `tsconfig.json` está listo y su
-> `type-check` es un no-op hasta que su HU (3.1 / 4.1) agregue `src/`.
+> `web` y `mobile` siguen siendo placeholders (su app real llega en HU-3.1 /
+> HU-4.1), pero ya consumen `@rover/shared` (tipos + cliente API) y su
+> `type-check` corre `tsc --noEmit` de verdad.
 
 **Python** (`apps/backend`) — [mypy](https://mypy-lang.org/) en modo estricto
 (`strict = true` en `pyproject.toml`), fuera de Turborepo:

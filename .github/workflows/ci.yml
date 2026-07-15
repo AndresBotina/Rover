@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   frontend:
-    name: TS (lint, format, type-check)
+    name: TS (lint, format, type-check, test)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -46,6 +46,10 @@ jobs:
 
       - name: Type-check (tsc estricto)
         run: pnpm type-check
+
+      # node --test sobre .ts directo (type stripping, Node ≥ 22.18).
+      - name: Tests
+        run: pnpm test
 
   backend:
     name: Python (ruff, mypy, pytest)

@@ -7,6 +7,10 @@
     "moduleResolution": "Bundler",
     "lib": ["ES2022"],
     "esModuleInterop": true,
+    // @rover/shared se consume como FUENTE y sus tests corren con node --test
+    // directo sobre .ts (type stripping), que exige la extensión .ts en los
+    // imports relativos; esta opción permite escribirla (requiere noEmit).
+    "allowImportingTsExtensions": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
     "declaration": true,

@@ -1,5 +1,5 @@
 {
-  "//": "Config TS lista para HU-3.1 (Next.js). Cuando exista src/, activa el script type-check con 'tsc --noEmit'.",
+  "//": "Config TS para HU-3.1 (Next.js). type-check ya corre tsc --noEmit (src/ existe desde HU-0.7).",
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "lib": ["ES2022", "DOM", "DOM.Iterable"]

@@ -2,7 +2,7 @@
   "name": "@rover/shared",
   "version": "0.0.0",
   "private": true,
-  "//": "Stub. Tipos compartidos + cliente API se llenan en HU-0.7.",
+  "//": "Tipos compartidos + cliente API tipado (HU-0.7). Se consume como fuente TS (exports → src); en Épica 1 los tipos pasarán a generarse desde el OpenAPI del backend.",
   "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
@@ -11,7 +11,8 @@
   },
   "scripts": {
     "lint": "eslint .",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "test": "node --test src/client/client.test.ts"
   },
   "devDependencies": {
     "typescript": "^5.7.2"
