@@ -10,8 +10,8 @@
 
 - **Jerarquía:** Épica → Historia de Usuario (HU = un Issue) → Tareas técnicas (checklist dentro del Issue).
 - **Tablero (GitHub Projects):** `Backlog → En progreso → En revisión → Done`.
-- **Ramas y PRs:** una rama por HU (`feat/hu-0.1-monorepo`), un PR por HU enlazado al Issue con `Closes #N`. El PR es obligatorio aunque te revises tú mismo.
-- **Labels sugeridas:** `epica:0-fundacion` · `tipo:hu | bug | tech-debt` · `prioridad:alta | media | baja` · `bloqueante`.
+- **Flujo de trabajo:** un solo desarrollador; todo el trabajo se commitea directo en `develop` (no hay rama `main` ni PRs por ahora). La calidad la garantizan los hooks locales (lefthook) y el CI que corre en cada push a `develop`.
+- **Labels sugeridas:** `epica:0-fundacion` · `epica:1-backend` · `tipo:hu | bug | tech-debt` · `prioridad:alta | media | baja` · `bloqueante`.
 - **Sprints:** solo como *timeboxes* de foco (elige unas pocas HU, no toques nada fuera de ese alcance). Sin story points ni dailies.
 
 ---
@@ -25,8 +25,8 @@ Una HU está **Done** solo cuando:
 - [ ] Se cumplen **todos los criterios de aceptación** de la HU.
 - [ ] Si tocó el esquema de base de datos: la **migración Alembic** está escrita y aplicada.
 - [ ] Si cambió un endpoint o un tipo: el **paquete compartido** (cliente API tipado) está actualizado.
-- [ ] El cambio pasó por un **Pull Request** revisado (aunque sea por ti mismo), con su diff leído en frío.
-- [ ] El **CI está verde** antes de hacer merge a `main`.
+- [ ] El trabajo está commiteado en **`develop`**; la calidad la garantizan los **hooks locales (lefthook)** y el **CI** que corre en cada push a `develop`.
+- [ ] El **CI está verde** en `develop` tras el push.
 - [ ] No se introdujeron **secretos** en el repo ni valores hardcodeados que deban ir en config.
 
 ---
@@ -36,7 +36,7 @@ Una HU está **Done** solo cuando:
 | Épica | Nombre | Objetivo | Estado |
 |-------|--------|----------|--------|
 | 0 | Fundación | Monorepo, tooling, CI/CD desplegando desde el día uno | Completada ✅ |
-| **1** | Backend core | API `/v1`, async Supabase, Alembic, auth JWT, rate limiting, errores, config | **En curso** |
+| **1** | Backend core | API `/v1`, async Supabase, Alembic, auth JWT, rate limiting, errores | **En curso** |
 | 2 | El agente | RAG + tool-calling, streaming, sesiones, caché semántico, voz opcional (pipeline) | Pendiente |
 | 3 | Web | Next.js con auth, chat con streaming, pricing | Pendiente |
 | 4 | Mobile | Expo reusando la capa compartida | Pendiente |
@@ -93,12 +93,12 @@ Una HU está **Done** solo cuando:
 *Como* desarrollador, *quiero* un FastAPI mínimo con un endpoint de salud, *para* tener algo real que desplegar desde el día uno.
 
 **Criterios de aceptación:**
-- `GET /health` responde `200` con `{"status": "ok"}` y versión.
+- `GET /v1/health` responde `200` con `{"status": "ok"}` y versión (versionado bajo `/v1` desde el día uno).
 - La app arranca con un comando documentado y corre en contenedor.
 - Existe `Dockerfile` y `docker-compose.yml` para desarrollo local.
 - Hay al menos un test que verifica el healthcheck.
 
-**Tareas técnicas:** scaffold FastAPI · endpoint `/health` · Dockerfile · docker-compose · primer test.
+**Tareas técnicas:** scaffold FastAPI · endpoint `/v1/health` · Dockerfile · docker-compose · primer test.
 
 ---
 
@@ -115,16 +115,16 @@ Una HU está **Done** solo cuando:
 
 ---
 
-### ✅ HU-0.6 — Pipeline de CD (deploy en merge a main)
-*Como* desarrollador, *quiero* que un merge a `main` despliegue solo al PaaS, *para* no integrar la infraestructura al final del proyecto.
+### ✅ HU-0.6 — Pipeline de CD (deploy automático a Render)
+*Como* desarrollador, *quiero* que un push a `develop` despliegue solo al PaaS, *para* no integrar la infraestructura al final del proyecto.
 
-**Criterios de aceptación:**
-- Merge a `main` dispara un deploy automático del backend al PaaS elegido.
-- El deploy usa la imagen contenedorizada de la HU-0.4.
-- Si el deploy falla, hay notificación visible y `main` no queda en estado roto silencioso.
-- La URL desplegada responde el `/health` correctamente tras el deploy.
+**Criterios de aceptación (como se construyó):**
+- El deploy está definido como **Infraestructura como Código** en `render.yaml` (Blueprint de Render): servicio web Docker en plan free, **sin** workflow de CD propio ni secretos del deploy en GitHub.
+- Push a `develop` dispara un deploy automático del backend en Render (`autoDeploy`).
+- El deploy usa la imagen contenedorizada de la HU-0.4; el contenedor respeta el `$PORT` que inyecta Render (con fallback a 8000 en local).
+- Render solo marca el deploy como sano si `GET /v1/health` responde `200` (healthcheck del servicio); un deploy fallido queda visible en el panel.
 
-**Tareas técnicas:** elegir PaaS (Railway / Render / Fly.io) · workflow de CD · configurar secretos del deploy en GitHub · verificación post-deploy del healthcheck.
+**Tareas técnicas (como se hizo):** elegir PaaS (Render) · `render.yaml` en la raíz (`dockerfilePath`/`dockerContext` → `apps/backend`, `healthCheckPath: /v1/health`, `ROVER_ENV=production`) · CMD del Dockerfile con `${PORT:-8000}` · conexión del Blueprint en el panel de Render (paso manual, una vez) · documentar en `docs/deploy.md` (incluida la nota del arranque en frío del plan free).
 
 ---
 
@@ -275,6 +275,8 @@ Una HU está **Done** solo cuando:
 - El cliente compartido apunta a `/v1`.
 
 **Tareas técnicas:** router raíz `/v1` · organización de routers · habilitar docs OpenAPI · wiring del cliente compartido.
+
+> **Nota (estado real):** dos criterios YA se cumplen desde la Épica 0 — todos los endpoints cuelgan de `/v1` (HU-0.4) y el cliente compartido apunta a `/v1` (HU-0.7). Lo **pendiente** de esta HU es: organizar los routers por dominio (`auth`, `users`, …) y habilitar/documentar las docs OpenAPI. No duplicar el trabajo ya hecho.
 
 ---
 
