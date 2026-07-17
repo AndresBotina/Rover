@@ -102,16 +102,16 @@ Una HU está **Done** solo cuando:
 
 ---
 
-### ✅ HU-0.5 — Pipeline de CI (calidad en cada PR)
-*Como* desarrollador, *quiero* que cada PR corra lint, type-check y tests, *para* que nada roto llegue a `main`.
+### ✅ HU-0.5 — Pipeline de CI (calidad en cada push)
+*Como* desarrollador, *quiero* que cada push a `develop` corra lint, type-check y tests, *para* que nada roto se quede en la rama sin avisar.
 
-**Criterios de aceptación:**
-- GitHub Action que en cada PR corre `lint` + `type-check` + `test`.
-- El merge se **bloquea** si cualquier paso falla (branch protection en `main`).
-- El pipeline corre en un tiempo razonable (cachea dependencias).
-- El estado del check aparece visible en el PR.
+**Criterios de aceptación (como se construyó):**
+- GitHub Actions con un workflow (`.github/workflows/ci.yml`) que corre en cada push a `develop` y permite disparo manual (`workflow_dispatch`).
+- Dos jobs en **paralelo**: **TS** (ESLint, Prettier check, tsc estricto y, desde la HU-0.7, tests con `node --test`) y **Python** (ruff check, ruff format check, mypy estricto, pytest).
+- Cachés atadas a cada lockfile (`pnpm-lock.yaml` y `apps/backend/uv.lock`); instalaciones frozen/locked; `concurrency` con cancel-in-progress (si llegan varios pushes seguidos, gana el último); badge de estado en el README.
+- El CI **no** bloquea merges ni exige PRs (no aplica al flujo de un solo desarrollador en `develop`): su función es avisar con el check verde/rojo y validar todo en un entorno limpio.
 
-**Tareas técnicas:** workflow de CI en `.github/workflows/` · cache de deps · branch protection rule en `main` · badge de estado en README.
+**Tareas técnicas (como se hizo):** workflow en `.github/workflows/ci.yml` con jobs frontend + backend · cache de pnpm (`setup-node`) y de uv (`setup-uv` con `cache-dependency-glob` al `uv.lock`) · `pnpm install --frozen-lockfile` / `uv sync --frozen` · `concurrency` por ref con cancel-in-progress · badge de estado en el README.
 
 ---
 
