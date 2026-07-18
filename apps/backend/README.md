@@ -102,6 +102,32 @@ contener credenciales); el detalle queda en los logs del servidor. Los tests
 NO tocan Supabase: sustituyen la fábrica de sesiones por SQLite async en
 memoria (ver `tests/test_database.py`), así el CI pasa sin secretos.
 
+## Migraciones (Alembic)
+
+El esquema se versiona con Alembic (`alembic.ini` + `migrations/`), configurado
+para el engine **async** del proyecto: `migrations/env.py` reutiliza la URL de
+`ROVER_DATABASE_URL` (vía `app.core.config`) y la misma construcción de engine
+que la app (`build_async_url` + `engine_kwargs`, detección del pooler
+incluida). La URL **nunca** se escribe en `alembic.ini`: ese archivo se
+versiona y la URL es un secreto.
+
+Comandos (desde `apps/backend/`, con `ROVER_DATABASE_URL` en `.env`):
+
+```bash
+uv run alembic revision --autogenerate -m "descripción"  # nueva migración desde los modelos
+uv run alembic upgrade head    # aplicar hasta la última revisión
+uv run alembic downgrade -1    # revertir la última (con `base` revierte todo)
+uv run alembic current         # revisión aplicada en la base
+uv run alembic history         # historial de revisiones
+```
+
+`--autogenerate` compara `Base.metadata` con la base real; cuando existan
+modelos (HU-1.10), basta con importar sus módulos en `migrations/env.py` para
+que Alembic los vea. Las migraciones generadas pasan solas por `ruff --fix` +
+`ruff format` (hooks en `alembic.ini`). La primera revisión es una **baseline
+sin tablas** (los modelos llegan en HU-1.10). Cómo se aplican las migraciones
+en producción: ver [`docs/deploy.md`](../../docs/deploy.md).
+
 ## Correr en local (uv)
 
 Requiere `uv` instalado. Desde `apps/backend/`:

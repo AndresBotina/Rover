@@ -43,7 +43,7 @@ def is_supabase_pooler(url: URL) -> bool:
     return "pooler.supabase.com" in host or url.port == 6543
 
 
-def _engine_kwargs(url: URL) -> dict[str, Any]:
+def engine_kwargs(url: URL) -> dict[str, Any]:
     """Argumentos del engine según el tipo de conexión (pooler vs directa)."""
     if is_supabase_pooler(url):
         # ---- Transaction Pooler de Supabase (Supavisor) ---------------------
@@ -97,7 +97,7 @@ def get_engine() -> AsyncEngine:
                 "(local) o en Render → Environment (producción); ver .env.example."
             )
         url = build_async_url(settings.database_url.get_secret_value())
-        _engine = create_async_engine(url, **_engine_kwargs(url))
+        _engine = create_async_engine(url, **engine_kwargs(url))
     return _engine
 
 

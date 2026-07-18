@@ -15,7 +15,7 @@ from sqlalchemy import NullPool, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core import database
-from app.core.database import _engine_kwargs, build_async_url, get_db, is_supabase_pooler
+from app.core.database import build_async_url, engine_kwargs, get_db, is_supabase_pooler
 from app.main import app
 
 _URL_POOLER = "postgresql://postgres.abc:pw@aws-1-us-east-1.pooler.supabase.com:6543/postgres"
@@ -50,7 +50,7 @@ def test_detecta_pooler_por_host_o_puerto() -> None:
 
 def test_url_de_pooler_desactiva_prepared_statements() -> None:
     """Contra el Transaction Pooler, asyncpg no debe cachear prepared statements."""
-    kwargs = _engine_kwargs(build_async_url(_URL_POOLER))
+    kwargs = engine_kwargs(build_async_url(_URL_POOLER))
 
     connect_args = kwargs["connect_args"]
     assert connect_args["statement_cache_size"] == 0
@@ -63,7 +63,7 @@ def test_url_de_pooler_desactiva_prepared_statements() -> None:
 
 
 def test_url_directa_mantiene_comportamiento_por_defecto() -> None:
-    kwargs = _engine_kwargs(build_async_url(_URL_DIRECTA))
+    kwargs = engine_kwargs(build_async_url(_URL_DIRECTA))
 
     assert "connect_args" not in kwargs
     assert "poolclass" not in kwargs
@@ -73,7 +73,7 @@ def test_url_directa_mantiene_comportamiento_por_defecto() -> None:
 def test_el_engine_acepta_los_kwargs_del_pooler() -> None:
     """create_async_engine debe aceptar los nombres de los kwargs (sin conectar)."""
     url = build_async_url(_URL_POOLER)
-    engine = create_async_engine(url, **_engine_kwargs(url))
+    engine = create_async_engine(url, **engine_kwargs(url))
     asyncio.run(engine.dispose())
 
 
