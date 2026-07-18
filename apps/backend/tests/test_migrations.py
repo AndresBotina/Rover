@@ -23,15 +23,15 @@ def test_la_configuracion_de_alembic_carga() -> None:
     assert (Path(script.dir) / "env.py").is_file()
 
 
-def test_una_sola_head_y_baseline_sin_padre() -> None:
-    """Historia lineal: una única head, y la baseline arranca desde cero."""
+def test_historia_lineal_con_una_head_y_una_baseline() -> None:
+    """Historia lineal: una única head y una única raíz (baseline) sin padre."""
     script = _script_directory()
 
-    heads = script.get_heads()
-    assert len(heads) == 1
+    assert len(script.get_heads()) == 1
 
-    baseline = script.get_revision(heads[0])
-    assert baseline.down_revision is None
+    bases = script.get_bases()
+    assert len(bases) == 1
+    assert script.get_revision(bases[0]).down_revision is None
 
 
 def test_alembic_ini_no_contiene_la_url_de_la_base() -> None:

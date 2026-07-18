@@ -15,6 +15,7 @@ from sqlalchemy import URL
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from app import models  # noqa: F401  (registra las tablas en Base.metadata)
 from app.core.config import settings
 from app.core.database import Base, build_async_url, engine_kwargs
 
@@ -25,8 +26,8 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 # Metadata de los modelos (heredan de Base): habilita --autogenerate.
-# Los modelos de dominio llegan en HU-1.10; bastará con importar sus módulos
-# aquí cuando existan para que Alembic los compare contra la base.
+# El import de app.models de arriba es lo que la puebla; un modelo nuevo debe
+# importarse en app/models/__init__.py o Alembic no lo verá.
 target_metadata = Base.metadata
 
 
