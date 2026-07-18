@@ -36,7 +36,7 @@ Una HU está **Done** solo cuando:
 | Épica | Nombre | Objetivo | Estado |
 |-------|--------|----------|--------|
 | 0 | Fundación | Monorepo, tooling, CI/CD desplegando desde el día uno | Completada ✅ |
-| **1** | Backend core | API `/v1`, async Supabase, Alembic, auth JWT, rate limiting, errores | **En curso** |
+| **1** | Backend core | API `/v1`, async Supabase, Alembic, auth vía Supabase Auth, rate limiting, errores | **En curso** |
 | 2 | El agente | RAG + tool-calling, streaming, sesiones, caché semántico, voz opcional (pipeline) | Pendiente |
 | 3 | Web | Next.js con auth, chat con streaming, pricing | Pendiente |
 | 4 | Mobile | Expo reusando la capa compartida | Pendiente |
@@ -155,7 +155,9 @@ Una HU está **Done** solo cuando:
 
 # ÉPICA 1 — Backend core
 
-**Objetivo:** el backend permanente y bien construido. API versionada, conexión async a Supabase, migraciones, autenticación con JWT, rate limiting por plan, manejo de errores centralizado y observabilidad básica. Esto no se bota cuando crezcas; solo le pones más máquinas detrás.
+**Objetivo:** el backend permanente y bien construido. API versionada, conexión async a Supabase, migraciones, autenticación delegada en Supabase Auth, rate limiting por plan, manejo de errores centralizado y observabilidad básica. Esto no se bota cuando crezcas; solo le pones más máquinas detrás.
+
+> **Decisión de arquitectura: Supabase Auth como proveedor de identidad.** El backend **no emite JWT propios**: delega registro y login en Supabase Auth y **valida** los tokens que este emite. Motivos: el login social con Google/Apple que exigen las stores viene resuelto de serie, la seguridad de credenciales (hashing, rotación de refresh tokens, recuperación de contraseña) queda en un servicio probado en vez de código propio, y es coherente con el Postgres de Supabase que ya usamos (HU-1.1). Trade-off asumido: **acoplamiento al proveedor** — migrar de Supabase Auth tendría costo; se mitiga concentrando la integración en el servicio de auth del backend. Consecuencia en el modelo de datos: la tabla local de usuarios pasa a ser un **perfil** que referencia el id de Supabase (`auth.users`), no una fuente de identidad (ver HU-1.10).
 
 ### ✅ HU-1.1 — Conexión async a base de datos
 *Como* sistema, *quiero* conectarme a Supabase Postgres de forma asíncrona, *para* no bloquear el event loop bajo carga.
@@ -185,57 +187,56 @@ Una HU está **Done** solo cuando:
 
 ---
 
-### HU-1.3 — Registro de usuario
+### HU-1.3 — Registro de usuario (vía Supabase Auth)
 *Como* viajero nuevo, *quiero* crear una cuenta con email y contraseña, *para* guardar mis conversaciones y preferencias.
 
 **Criterios de aceptación:**
-- `POST /v1/auth/register` crea el usuario vía Supabase Auth.
-- La contraseña nunca se almacena en texto plano (lo maneja Supabase).
-- Email ya existente responde `409` con mensaje claro, no `500`.
-- Email inválido o contraseña débil responde `422` con detalle.
-- En éxito devuelve JWT + refresh token.
-- Test de integración cubre el caso feliz y los dos casos de error.
+- `POST /v1/auth/register` delega la creación del usuario en Supabase Auth (email + contraseña; el almacenamiento seguro de la contraseña es de Supabase).
+- Tras el alta, se crea en la base local la fila de **perfil** del usuario, referenciando el id de Supabase (`auth.users`) como clave.
+- **Consistencia:** si el alta en Supabase tiene éxito pero falla la creación del perfil local, no puede quedar un usuario huérfano; la estrategia (compensación, reintento o creación perezosa del perfil en el primer acceso) queda definida y documentada.
+- Email ya existente responde `409` con mensaje claro, sin revelar de más; email inválido o contraseña débil responde `422` con detalle.
+- En éxito devuelve la sesión de Supabase (access token + refresh token).
+- Tests que **no** dependen de Supabase real (cliente de Supabase mockeado); cubren el caso feliz y los casos de error.
 
-**Tareas técnicas:** schema Pydantic request/response · servicio de auth (integración Supabase) · endpoint · tests · actualizar cliente compartido.
+**Tareas técnicas:** schema Pydantic request/response · servicio de auth (cliente de Supabase) · creación del perfil local + estrategia de consistencia · endpoint · tests con mock · actualizar cliente compartido.
 
 ---
 
-### HU-1.4 — Login y emisión de JWT
+### HU-1.4 — Login (delegado en Supabase Auth)
 *Como* usuario registrado, *quiero* iniciar sesión, *para* acceder a mi cuenta de forma segura.
 
 **Criterios de aceptación:**
-- `POST /v1/auth/login` valida credenciales y devuelve JWT + refresh token.
+- `POST /v1/auth/login` delega la validación de credenciales en Supabase Auth.
+- Devuelve la sesión de Supabase (access + refresh token); el backend **no firma JWT propios**.
 - Credenciales inválidas responden `401` sin revelar si el email existe.
-- El JWT incluye el `user_id` y el plan del usuario en los claims.
-- Test cubre login exitoso y fallido.
+- Tests con el cliente de Supabase mockeado (login exitoso y fallido).
 
-**Tareas técnicas:** schema de login · servicio de login · firma/validación de JWT en `core/security.py` · endpoint · tests.
+**Tareas técnicas:** schema de login · servicio de login (cliente de Supabase) · endpoint · tests con mock.
 
 ---
 
-### HU-1.5 — Renovación de sesión (refresh token)
+### HU-1.5 — Renovación de sesión
 *Como* usuario, *quiero* renovar mi sesión sin volver a loguearme, *para* una experiencia fluida sobre todo en móvil.
 
 **Criterios de aceptación:**
-- `POST /v1/auth/refresh` emite un nuevo JWT a partir de un refresh token válido.
-- Refresh token inválido o expirado responde `401`.
-- El refresh rota el token (el anterior queda inutilizable).
-- Test cubre refresh válido e inválido.
+- El refresh y la **rotación** de tokens son responsabilidad de Supabase (y de su SDK en los clientes web/móvil); el backend **no** implementa lógica propia de refresh ni de rotación.
+- El flujo queda documentado: cómo renuevan sesión los clientes contra Supabase.
+- Solo si aporta a los clientes, se expone un `POST /v1/auth/refresh` que **delega** en Supabase; en ese caso, refresh token inválido o expirado responde `401` y hay tests con el cliente mockeado.
 
-**Tareas técnicas:** lógica de refresh + rotación · endpoint · tests.
+**Tareas técnicas:** documentar el flujo de refresh de Supabase · decidir si se expone un endpoint de refresh delegado (y si sí: endpoint + tests con mock).
 
 ---
 
-### HU-1.6 — Middleware de autenticación
+### HU-1.6 — Middleware de autenticación (validación del JWT de Supabase)
 *Como* sistema, *quiero* proteger rutas que requieren sesión, *para* que solo usuarios autenticados accedan a recursos privados.
 
 **Criterios de aceptación:**
-- Existe una dependencia `get_current_user` que valida el JWT y entrega el usuario.
-- Rutas protegidas sin token o con token inválido responden `401`.
+- Existe una dependencia `get_current_user` que **valida el JWT emitido por Supabase** (verificación de firma y expiración) y resuelve el **perfil local** a partir del id que trae el token.
+- Rutas protegidas sin token o con token inválido/expirado responden `401`.
 - El `user_id` y el plan quedan disponibles en el contexto del request.
-- Test verifica acceso permitido y denegado.
+- Tests con tokens de prueba, sin depender de Supabase real.
 
-**Tareas técnicas:** dependency de auth · manejo de token expirado/ inválido · tests · marcar rutas protegidas.
+**Tareas técnicas:** dependency de auth (verificación de firma y expiración del JWT de Supabase) · resolución del perfil local · manejo de token expirado/inválido · tests con tokens de prueba · marcar rutas protegidas.
 
 ---
 
@@ -286,7 +287,7 @@ Una HU está **Done** solo cuando:
 *Como* usuario, *quiero* tener un perfil con mis datos y preferencias de viaje, *para* que el agente me dé respuestas personalizadas más adelante.
 
 **Criterios de aceptación:**
-- Modelo de usuario con: id, email, plan, fecha de creación, preferencias (json).
+- Modelo de **perfil** de usuario con: id (el de Supabase `auth.users`, que lo referencia como clave), email, plan, fecha de creación, preferencias (json). No es fuente de identidad ni almacena contraseñas: eso vive en Supabase Auth.
 - `GET /v1/users/me` devuelve el perfil del usuario autenticado.
 - `PATCH /v1/users/me` actualiza preferencias con validación.
 - Migración Alembic asociada.
