@@ -157,7 +157,7 @@ Una HU está **Done** solo cuando:
 
 **Objetivo:** el backend permanente y bien construido. API versionada, conexión async a Supabase, migraciones, autenticación con JWT, rate limiting por plan, manejo de errores centralizado y observabilidad básica. Esto no se bota cuando crezcas; solo le pones más máquinas detrás.
 
-### HU-1.1 — Conexión async a base de datos
+### ✅ HU-1.1 — Conexión async a base de datos
 *Como* sistema, *quiero* conectarme a Supabase Postgres de forma asíncrona, *para* no bloquear el event loop bajo carga.
 
 **Criterios de aceptación:**
@@ -170,16 +170,18 @@ Una HU está **Done** solo cuando:
 
 ---
 
-### HU-1.2 — Alembic y primera migración
+### ✅ HU-1.2 — Alembic y primera migración
 *Como* desarrollador, *quiero* migraciones versionadas, *para* controlar el esquema en producción sin sorpresas.
 
-**Criterios de aceptación:**
-- Alembic configurado contra el mismo engine async.
-- `alembic upgrade head` y `downgrade` funcionan en local.
-- La primera migración crea el esquema base (al menos la tabla de usuarios).
-- El proceso de migración está documentado y se puede correr en el deploy.
+**Criterios de aceptación (como se construyó):**
+- Alembic configurado sobre el **mismo engine async** del proyecto: `migrations/env.py` reutiliza la construcción del engine de `app.core.database` (`build_async_url` + `engine_kwargs`, detección del Transaction Pooler de Supabase incluida) y resuelve la URL desde `ROVER_DATABASE_URL`; la URL **nunca** se escribe en `alembic.ini` (ese archivo se versiona y la URL es un secreto — un test lo garantiza).
+- `alembic upgrade head` y `downgrade` verificados desde local contra Supabase.
+- La primera migración es una **baseline que ancla el versionado sin crear tablas** (solo aparece la tabla de control `alembic_version`): los modelos de dominio —incluida la tabla de usuarios— corresponden a la HU-1.10, y crearlos aquí habría adelantado ese diseño.
+- La estrategia de migración en producción (manual desde local; por qué no está automatizada en el plan free de Render) está documentada en `docs/deploy.md`, y los comandos del día a día en el README del backend.
 
-**Tareas técnicas:** init de Alembic · configurar `env.py` para async · primera migración · documentar comando de migración en CD.
+> **Nota:** la tabla de usuarios y su migración llegan con la HU-1.10 (modelos de dominio).
+
+**Tareas técnicas (como se hizo):** init de Alembic · `env.py` async reutilizando la config real del backend · migración baseline · hooks de ruff (fix + format) para las migraciones autogeneradas · tests de configuración sin base real · documentar en README y `docs/deploy.md`.
 
 ---
 
