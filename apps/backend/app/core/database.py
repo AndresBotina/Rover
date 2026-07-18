@@ -9,8 +9,10 @@ error claro) y el pool se cierra limpiamente en el lifespan (dispose_engine).
 """
 
 from collections.abc import AsyncIterator
+from typing import Any
+from uuid import uuid4
 
-from sqlalchemy import URL, make_url
+from sqlalchemy import URL, NullPool, make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -31,6 +33,56 @@ def build_async_url(database_url: str) -> URL:
     return make_url(database_url).set(drivername="postgresql+asyncpg")
 
 
+def is_supabase_pooler(url: URL) -> bool:
+    """True si la URL apunta al Transaction Pooler de Supabase (Supavisor).
+
+    Se DERIVA de la propia URL (host del pooler o su puerto 6543) a propósito:
+    sin flag manual, cambiar la URL nunca puede dejar una config incoherente.
+    """
+    host = url.host or ""
+    return "pooler.supabase.com" in host or url.port == 6543
+
+
+def _engine_kwargs(url: URL) -> dict[str, Any]:
+    """Argumentos del engine según el tipo de conexión (pooler vs directa)."""
+    if is_supabase_pooler(url):
+        # ---- Transaction Pooler de Supabase (Supavisor) ---------------------
+        # Usamos el pooler porque la conexión directa de Supabase resuelve a
+        # IPv6, sin salida IPv6 ni en local ni en Render; el pooler da IPv4.
+        #
+        # El pooler en modo transacción reparte cada petición a CUALQUIER
+        # conexión física del pool: dos consultas seguidas pueden caer en
+        # conexiones distintas. Los PREPARED STATEMENTS que asyncpg usa por
+        # defecto viven en una conexión concreta, así que contra el pooler
+        # rompen ("prepared statement … does not exist" o nombres duplicados).
+        # Este es el ajuste ESTÁNDAR documentado por SQLAlchemy y Supabase:
+        # desactivar ambas cachés de prepared statements y dar nombre único a
+        # los statements efímeros. El costo de rendimiento es despreciable
+        # para esta app. Es 100% REVERSIBLE: con una URL de conexión directa
+        # esta rama no se ejecuta y todo vuelve al comportamiento por defecto.
+        return {
+            # El pooling real ya lo hace Supavisor: NullPool evita apilar un
+            # segundo pool que retenga slots del pooler con conexiones ociosas
+            # de larga vida (abrir contra el pooler es barato: él mantiene las
+            # conexiones calientes hacia Postgres). pre_ping sobra sin pool.
+            "poolclass": NullPool,
+            "connect_args": {
+                "statement_cache_size": 0,  # caché nativa de asyncpg
+                "prepared_statement_cache_size": 0,  # caché del dialecto SQLAlchemy
+                "prepared_statement_name_func": lambda: f"__asyncpg_{uuid4()}__",
+            },
+        }
+    # Conexión directa: comportamiento original de HU-1.1.
+    return {
+        # Pool moderado: Supabase (plan free) limita las conexiones directas.
+        "pool_size": 5,
+        "max_overflow": 5,
+        # Detecta conexiones muertas antes de entregarlas (Supabase las
+        # recicla tras inactividad).
+        "pool_pre_ping": True,
+    }
+
+
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
@@ -44,15 +96,8 @@ def get_engine() -> AsyncEngine:
                 "ROVER_DATABASE_URL no está configurada. Defínela en apps/backend/.env "
                 "(local) o en Render → Environment (producción); ver .env.example."
             )
-        _engine = create_async_engine(
-            build_async_url(settings.database_url.get_secret_value()),
-            # Pool moderado: Supabase (plan free) limita las conexiones directas.
-            pool_size=5,
-            max_overflow=5,
-            # Detecta conexiones muertas antes de entregarlas (Supabase las
-            # recicla tras inactividad).
-            pool_pre_ping=True,
-        )
+        url = build_async_url(settings.database_url.get_secret_value())
+        _engine = create_async_engine(url, **_engine_kwargs(url))
     return _engine
 
 

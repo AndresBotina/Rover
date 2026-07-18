@@ -73,9 +73,20 @@ probado en `tests/test_config.py`.
 guarda en config **tal cual la entrega Supabase** (`postgresql://…`); el código
 le cambia el driver a `postgresql+asyncpg://` al crear el engine. El engine es
 **perezoso** (se crea en el primer uso: local/test arrancan sin base
-configurada) con pool moderado y `pool_pre_ping`; se cierra en el lifespan.
-Los endpoints reciben sesión con la dependencia `get_db` (una `AsyncSession`
-por request); los modelos futuros heredan de `Base` (HU-1.10).
+configurada) y se cierra en el lifespan. Los endpoints reciben sesión con la
+dependencia `get_db` (una `AsyncSession` por request); los modelos futuros
+heredan de `Base` (HU-1.10).
+
+**Transaction Pooler de Supabase** — se usa la URL del pooler (Supavisor,
+puerto 6543) en vez de la conexión directa: la directa resuelve a **IPv6** y ni
+la red local ni Render tienen salida IPv6. El código **detecta el pooler por la
+URL** (host `pooler.supabase.com` o puerto 6543, sin flag manual) y en ese caso
+desactiva los prepared statements de asyncpg (`statement_cache_size=0` + nombres
+únicos) — el pooling en modo transacción no garantiza que dos consultas caigan
+en la misma conexión, y los prepared statements viven en una conexión concreta.
+Además usa `NullPool`: el pooling real lo hace Supavisor. Todo esto es
+**reversible**: con una URL directa (puerto 5432) se vuelve al comportamiento
+por defecto (prepared statements + pool propio con `pool_pre_ping`).
 
 **Verificar la conexión en local** (con `ROVER_DATABASE_URL` puesta en `.env`):
 

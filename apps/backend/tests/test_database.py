@@ -11,12 +11,15 @@ import asyncio
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import text
+from sqlalchemy import NullPool, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core import database
-from app.core.database import build_async_url, get_db
+from app.core.database import _engine_kwargs, build_async_url, get_db, is_supabase_pooler
 from app.main import app
+
+_URL_POOLER = "postgresql://postgres.abc:pw@aws-1-us-east-1.pooler.supabase.com:6543/postgres"
+_URL_DIRECTA = "postgresql://postgres:pw@db.proyecto.supabase.co:5432/postgres"
 
 
 def _sqlite_factory() -> async_sessionmaker[AsyncSession]:
@@ -36,6 +39,42 @@ def test_build_async_url_anade_el_driver_async() -> None:
     assert url.host == "db.proyecto.supabase.co"
     assert url.port == 5432
     assert url.database == "postgres"
+
+
+def test_detecta_pooler_por_host_o_puerto() -> None:
+    assert is_supabase_pooler(build_async_url(_URL_POOLER))
+    # Puerto 6543 basta, aunque el host no sea el típico del pooler.
+    assert is_supabase_pooler(build_async_url("postgresql://u:p@otro-host:6543/db"))
+    assert not is_supabase_pooler(build_async_url(_URL_DIRECTA))
+
+
+def test_url_de_pooler_desactiva_prepared_statements() -> None:
+    """Contra el Transaction Pooler, asyncpg no debe cachear prepared statements."""
+    kwargs = _engine_kwargs(build_async_url(_URL_POOLER))
+
+    connect_args = kwargs["connect_args"]
+    assert connect_args["statement_cache_size"] == 0
+    assert connect_args["prepared_statement_cache_size"] == 0
+    # Nombres únicos para los statements efímeros (recomendación SQLAlchemy/Supabase).
+    nombre = connect_args["prepared_statement_name_func"]()
+    assert nombre.startswith("__asyncpg_")
+    # El pooling lo hace Supavisor: sin segundo pool en SQLAlchemy.
+    assert kwargs["poolclass"] is NullPool
+
+
+def test_url_directa_mantiene_comportamiento_por_defecto() -> None:
+    kwargs = _engine_kwargs(build_async_url(_URL_DIRECTA))
+
+    assert "connect_args" not in kwargs
+    assert "poolclass" not in kwargs
+    assert kwargs["pool_pre_ping"] is True
+
+
+def test_el_engine_acepta_los_kwargs_del_pooler() -> None:
+    """create_async_engine debe aceptar los nombres de los kwargs (sin conectar)."""
+    url = build_async_url(_URL_POOLER)
+    engine = create_async_engine(url, **_engine_kwargs(url))
+    asyncio.run(engine.dispose())
 
 
 def test_get_db_entrega_y_cierra_la_sesion(monkeypatch: pytest.MonkeyPatch) -> None:
