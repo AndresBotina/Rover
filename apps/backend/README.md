@@ -11,12 +11,14 @@ Las features (DB, auth, agente) llegan en HUs posteriores.
 
 ```
 app/
-├── main.py            # crea la app FastAPI e incluye los routers
+├── main.py            # crea la app FastAPI (lifespan: dispose de la DB al apagar)
 ├── core/config.py     # Settings por ambiente (pydantic-settings) + fail-fast
-└── api/v1/health.py   # GET /v1/health
+├── core/database.py   # SQLAlchemy 2.0 async + asyncpg: engine, get_db, Base
+└── api/v1/health.py   # GET /v1/health y GET /v1/health/db
 tests/
 ├── test_health.py     # test del healthcheck
-└── test_config.py     # tests de config por ambiente y fail-fast
+├── test_config.py     # tests de config por ambiente y fail-fast
+└── test_database.py   # tests de la capa DB SIN base real (SQLite en memoria)
 .env.example           # plantilla de variables (el .env real NUNCA se commitea)
 Dockerfile             # imagen de producción (Python 3.12 slim + uv, no-root)
 docker-compose.yml     # servicio de desarrollo (hot-reload + puerto 8000)
@@ -40,6 +42,7 @@ docker-compose.yml     # servicio de desarrollo (hot-reload + puerto 8000)
 | `ROVER_APP_NAME` | `Rover` | Nombre de la app.                    |
 | `ROVER_ENV`      | `local` | Ambiente (`local`/`test`/`production`). |
 | `ROVER_VERSION`  | `0.1.0` | Versión (origen: `app.__version__`). |
+| `ROVER_DATABASE_URL` | — | **SECRETO.** URL directa de Supabase Postgres, tal cual la da Supabase (`postgresql://…`). Obligatoria en producción. |
 
 **Desarrollo local** — copia la plantilla y ajusta lo que necesites:
 
@@ -63,6 +66,30 @@ variable obligatoria ausente en producción (lista `_REQUIRED_IN_PRODUCTION` en
 El patrón para añadir secretos futuros (campo `SecretStr | None` + entrada en
 esa lista + placeholder en `.env.example`) está documentado en `config.py` y
 probado en `tests/test_config.py`.
+
+## Base de datos (Supabase Postgres, async)
+
+`app/core/database.py` (HU-1.1): SQLAlchemy 2.0 async + asyncpg. La URL se
+guarda en config **tal cual la entrega Supabase** (`postgresql://…`); el código
+le cambia el driver a `postgresql+asyncpg://` al crear el engine. El engine es
+**perezoso** (se crea en el primer uso: local/test arrancan sin base
+configurada) con pool moderado y `pool_pre_ping`; se cierra en el lifespan.
+Los endpoints reciben sesión con la dependencia `get_db` (una `AsyncSession`
+por request); los modelos futuros heredan de `Base` (HU-1.10).
+
+**Verificar la conexión en local** (con `ROVER_DATABASE_URL` puesta en `.env`):
+
+```bash
+uv run uvicorn app.main:app          # terminal 1
+curl http://127.0.0.1:8000/v1/health/db   # terminal 2
+# ok:    {"status":"ok","detail":null}
+# fallo: 503 {"status":"error","detail":"No se pudo conectar a la base de datos."}
+```
+
+El error nunca incluye la causa real (la URL o el mensaje del driver podrían
+contener credenciales); el detalle queda en los logs del servidor. Los tests
+NO tocan Supabase: sustituyen la fábrica de sesiones por SQLite async en
+memoria (ver `tests/test_database.py`), así el CI pasa sin secretos.
 
 ## Correr en local (uv)
 

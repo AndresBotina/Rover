@@ -3,7 +3,12 @@
 
 export { APP_NAME } from "./config.ts";
 
-export { isHealthResponse, type HealthResponse } from "./types/health.ts";
+export {
+  isDbHealthResponse,
+  isHealthResponse,
+  type DbHealthResponse,
+  type HealthResponse,
+} from "./types/health.ts";
 
 export { ApiClient, ApiError } from "./client/client.ts";
 export { DEFAULT_BASE_URL, resolveBaseUrl, type ApiClientConfig } from "./client/config.ts";

@@ -20,7 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import ClassVar, Literal, Self
 
-from pydantic import model_validator
+from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app import __version__
@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     # La versión tiene una sola fuente de verdad: app.__version__.
     version: str = __version__
 
-    # --- Secretos (llegan en Épica 1: Supabase, LLM) ------------------------
+    # --- Secretos (Épica 1) --------------------------------------------------
     # PATRÓN para añadir un secreto:
     #   1. Campo tipado ``SecretStr | None = None`` (opcional: local/test deben
     #      poder arrancar sin él; SecretStr enmascara el valor en logs y repr).
@@ -56,12 +56,14 @@ class Settings(BaseSettings):
     #      producción, la app NO arranca (validador de abajo).
     #   3. Documentarlo en .env.example con placeholder; el valor real va SOLO
     #      en apps/backend/.env (local) o en Render → Environment.
-    # Ejemplo (Épica 1):
-    #   supabase_url: SecretStr | None = None
-    #   _REQUIRED_IN_PRODUCTION: ClassVar[tuple[str, ...]] = ("supabase_url",)
+
+    # URL de Supabase Postgres, TAL CUAL la entrega Supabase (postgresql://…).
+    # El driver async (postgresql+asyncpg://) lo añade el código al crear el
+    # engine (app/core/database.py); aquí NUNCA se guarda transformada.
+    database_url: SecretStr | None = None
 
     # Campos que no pueden faltar cuando env == "production".
-    _REQUIRED_IN_PRODUCTION: ClassVar[tuple[str, ...]] = ()
+    _REQUIRED_IN_PRODUCTION: ClassVar[tuple[str, ...]] = ("database_url",)
 
     @model_validator(mode="after")
     def _fail_fast_if_missing_required(self) -> Self:

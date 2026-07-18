@@ -7,7 +7,12 @@
  * aparte en ../types y aquí solo hay transporte + validación.
  */
 
-import { isHealthResponse, type HealthResponse } from "../types/health.ts";
+import {
+  isDbHealthResponse,
+  isHealthResponse,
+  type DbHealthResponse,
+  type HealthResponse,
+} from "../types/health.ts";
 import { resolveBaseUrl, type ApiClientConfig } from "./config.ts";
 
 /**
@@ -41,6 +46,20 @@ export class ApiClient {
     const url = `${this.baseUrl}/v1/health`;
     const { status, data } = await getJson(url);
     if (!isHealthResponse(data)) {
+      throw new ApiError(`Respuesta de ${url} con forma inesperada`, { url, status });
+    }
+    return data;
+  }
+
+  /**
+   * GET /v1/health/db — conectividad del backend con la base de datos.
+   * Si la base está caída, el backend responde 503 y esto lanza ApiError
+   * (status 503), igual que cualquier otro no-2xx.
+   */
+  async getDbHealth(): Promise<DbHealthResponse> {
+    const url = `${this.baseUrl}/v1/health/db`;
+    const { status, data } = await getJson(url);
+    if (!isDbHealthResponse(data)) {
       throw new ApiError(`Respuesta de ${url} con forma inesperada`, { url, status });
     }
     return data;

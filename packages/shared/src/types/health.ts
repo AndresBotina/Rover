@@ -22,3 +22,21 @@ export function isHealthResponse(value: unknown): value is HealthResponse {
   const v = value as Record<string, unknown>;
   return v["status"] === "ok" && typeof v["version"] === "string" && typeof v["env"] === "string";
 }
+
+/** Respuesta de GET /v1/health/db (estado de la conexión backend ↔ base de datos). */
+export interface DbHealthResponse {
+  status: "ok" | "error";
+  detail: string | null;
+}
+
+/** Type guard: valida en runtime que un JSON desconocido es un DbHealthResponse. */
+export function isDbHealthResponse(value: unknown): value is DbHealthResponse {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const v = value as Record<string, unknown>;
+  return (
+    (v["status"] === "ok" || v["status"] === "error") &&
+    (v["detail"] === null || typeof v["detail"] === "string")
+  );
+}

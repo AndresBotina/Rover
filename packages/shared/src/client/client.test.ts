@@ -47,6 +47,19 @@ test("getHealth usa el default local si no se pasa baseUrl", async () => {
   assert.equal(calledUrl, "http://localhost:8000/v1/health");
 });
 
+test("getDbHealth parsea la respuesta de /v1/health/db", async () => {
+  let calledUrl: string | undefined;
+  globalThis.fetch = async (input) => {
+    calledUrl = String(input);
+    return jsonResponse({ status: "ok", detail: null });
+  };
+
+  const dbHealth = await new ApiClient({ baseUrl: "http://api.test" }).getDbHealth();
+
+  assert.equal(calledUrl, "http://api.test/v1/health/db");
+  assert.deepEqual(dbHealth, { status: "ok", detail: null });
+});
+
 test("un status no-2xx lanza ApiError con el status", async () => {
   globalThis.fetch = async () => jsonResponse({ detail: "boom" }, 500);
 

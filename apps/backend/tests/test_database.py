@@ -1,0 +1,102 @@
+"""Tests de la capa de base de datos y de /v1/health/db — SIN base real.
+
+El CI no tiene Supabase, así que la base real se SUSTITUYE en cada test:
+monkeypatch de ``app.core.database.get_session_factory`` para que entregue
+sesiones de SQLite async en memoria (aiosqlite) o falle a propósito. La
+conectividad real contra Supabase se verifica a mano con GET /v1/health/db
+(ver README del backend).
+"""
+
+import asyncio
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from app.core import database
+from app.core.database import build_async_url, get_db
+from app.main import app
+
+
+def _sqlite_factory() -> async_sessionmaker[AsyncSession]:
+    """Fábrica de sesiones contra SQLite async en memoria (sustituto de Supabase)."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    return async_sessionmaker(engine, expire_on_commit=False)
+
+
+def test_build_async_url_anade_el_driver_async() -> None:
+    """La URL se guarda como la da Supabase; el driver lo añade el código."""
+    url = build_async_url("postgresql://postgres:secreto@db.proyecto.supabase.co:5432/postgres")
+
+    assert url.drivername == "postgresql+asyncpg"
+    # El resto de la URL queda intacto.
+    assert url.username == "postgres"
+    assert url.password == "secreto"
+    assert url.host == "db.proyecto.supabase.co"
+    assert url.port == 5432
+    assert url.database == "postgres"
+
+
+def test_get_db_entrega_y_cierra_la_sesion(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_db entrega una AsyncSession usable y la cierra al agotarse."""
+    factory = _sqlite_factory()
+    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
+
+    closed = False
+    original_close = AsyncSession.close
+
+    async def close_espia(self: AsyncSession) -> None:
+        nonlocal closed
+        closed = True
+        await original_close(self)
+
+    monkeypatch.setattr(AsyncSession, "close", close_espia)
+
+    async def ejercicio() -> None:
+        generador = get_db()
+        session = await anext(generador)
+
+        assert isinstance(session, AsyncSession)
+        assert (await session.execute(text("SELECT 1"))).scalar_one() == 1
+
+        # FastAPI agota el generador al terminar el request; aquí lo simulamos.
+        with pytest.raises(StopAsyncIteration):
+            await anext(generador)
+
+    asyncio.run(ejercicio())
+    assert closed, "la sesión debe cerrarse cuando el request termina"
+
+
+def test_health_db_ok_con_base_sustituta(monkeypatch: pytest.MonkeyPatch) -> None:
+    factory = _sqlite_factory()
+    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
+
+    with TestClient(app) as client:
+        response = client.get("/v1/health/db")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "detail": None}
+
+
+def test_health_db_error_responde_503_sin_filtrar_secretos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Base caída o sin configurar → 503 tipado, sin credenciales en el cuerpo."""
+
+    def factory_rota() -> async_sessionmaker[AsyncSession]:
+        # Simula el fallo real (config ausente / conexión rechazada) con un
+        # mensaje que CONTIENE un secreto: no debe llegar al cliente.
+        raise RuntimeError("postgresql://postgres:password-secreta@db.x.supabase.co")
+
+    monkeypatch.setattr(database, "get_session_factory", factory_rota)
+
+    with TestClient(app) as client:
+        response = client.get("/v1/health/db")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "error",
+        "detail": "No se pudo conectar a la base de datos.",
+    }
+    assert "password-secreta" not in response.text
