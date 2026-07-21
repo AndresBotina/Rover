@@ -230,16 +230,24 @@ Contexto: con **"Confirm email" activado** en Supabase (lo deseable en producci�
 
 ---
 
-### HU-1.4 — Login (delegado en Supabase Auth)
+### ✅ HU-1.4 — Login (delegado en Supabase Auth)
 *Como* usuario registrado, *quiero* iniciar sesión, *para* acceder a mi cuenta de forma segura.
 
-**Criterios de aceptación:**
-- `POST /v1/auth/login` delega la validación de credenciales en Supabase Auth.
-- Devuelve la sesión de Supabase (access + refresh token); el backend **no firma JWT propios**.
-- Credenciales inválidas responden `401` sin revelar si el email existe.
-- Tests con el cliente de Supabase mockeado (login exitoso y fallido).
+**Criterios de aceptación (como se construyó):**
+- `POST /v1/auth/login` delega en Supabase Auth (endpoint de **token** de GoTrue con `grant_type=password`) usando la **anon key**. Responde `200` con `user` (`id`, `email`) y la sesión (access + refresh token). El backend **no firma JWT propios**.
+- El transporte y el parseo se extrajeron a **helpers compartidos** con el registro (`_gotrue_post`, `_parse_user_and_session`), evitando duplicación. `_parse_signin` **exige sesión**: en login, un `2xx` sin tokens es incoherente (`AuthProviderError`), a diferencia del registro donde es un estado válido (`pending_email_confirmation`).
+- Nuevas excepciones de dominio `InvalidCredentials` y `EmailNotConfirmed`, traducidas por los `error_code` estables `invalid_credentials` y `email_not_confirmed`.
+- Mapeo HTTP: `401` credenciales inválidas · `403` email sin confirmar · `429` rate limit · `503` fallo del proveedor.
+- Credenciales inválidas devuelven un cuerpo **idéntico** tanto si el email no existe como si la contraseña es incorrecta, para no revelar qué cuentas están registradas (verificado con un test que compara ambos cuerpos, y contra Supabase real).
+- El caso **"email sin confirmar" se resolvió como `403`** (no `401` con discriminante): las credenciales son correctas, lo que falta es activar la cuenta; meterlo en `401` conflaciona dos situaciones que interesa separar. Coherente con el estilo de la HU-1.3b, el cuerpo incluye un discriminante explícito (`reason: "email_not_confirmed"`) para que el cliente **no infiera**.
+- El login **no** crea ni materializa el perfil local: esa responsabilidad es del middleware de la **HU-1.6**, único punto por el que pasa toda petición autenticada. Criterio documentado en el endpoint.
+- Fallos **logueados** con status + `error_code` + mensaje del proveedor, **sin contraseñas ni llaves**.
+- `@rover/shared` actualizado con tipos, método (`ApiClient.login()`) y **type guard** de runtime.
+- **Verificado end-to-end** contra Supabase real: login correcto (`200`), contraseña incorrecta (`401`), email inexistente (`401` con cuerpo idéntico) y usuario sin confirmar (`403` con `reason`).
 
-**Tareas técnicas:** schema de login · servicio de login (cliente de Supabase) · endpoint · tests con mock.
+**Tareas técnicas (como se hizo):** `_gotrue_post` + `_parse_user_and_session` compartidos con el alta · `sign_in` + `_parse_signin` (sesión obligatoria) · excepciones `InvalidCredentials` / `EmailNotConfirmed` mapeadas por `error_code` · endpoint con mapeo `401/403/429/503` · cliente compartido con tipos + método + type guard · tests con httpx/servicio mockeados · flujo documentado en el README.
+
+> **Deuda técnica (infra de tests):** la suite emite 4 warnings de *teardown* de aiosqlite (engines de SQLite async que los tests de registro no cierran; solo afloran al correr el **conjunto completo**, por timing del GC). **No son fallos** y el CI no los trata como error, pero conviene una limpieza más adelante: cerrar los engines explícitamente en los fixtures/ayudantes de test (p. ej. un fixture que haga `engine.dispose()`). No es urgente ni bloquea nada.
 
 ---
 
