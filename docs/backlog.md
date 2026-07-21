@@ -187,18 +187,39 @@ Una HU está **Done** solo cuando:
 
 ---
 
-### HU-1.3 — Registro de usuario (vía Supabase Auth)
+### ✅ HU-1.3 — Registro de usuario (vía Supabase Auth)
 *Como* viajero nuevo, *quiero* crear una cuenta con email y contraseña, *para* guardar mis conversaciones y preferencias.
 
-**Criterios de aceptación:**
-- `POST /v1/auth/register` delega la creación del usuario en Supabase Auth (email + contraseña; el almacenamiento seguro de la contraseña es de Supabase).
-- Tras el alta, se crea en la base local la fila de **perfil** del usuario, referenciando el id de Supabase (`auth.users`) como clave.
-- **Consistencia:** si el alta en Supabase tiene éxito pero falla la creación del perfil local, no puede quedar un usuario huérfano; la estrategia (compensación, reintento o creación perezosa del perfil en el primer acceso) queda definida y documentada.
-- Email ya existente responde `409` con mensaje claro, sin revelar de más; email inválido o contraseña débil responde `422` con detalle.
-- En éxito devuelve la sesión de Supabase (access token + refresh token).
-- Tests que **no** dependen de Supabase real (cliente de Supabase mockeado); cubren el caso feliz y los casos de error.
+**Criterios de aceptación (como se construyó):**
+- `POST /v1/auth/register` delega el alta en Supabase Auth usando la **anon key** (no la service role: registrar no requiere privilegios elevados) y responde `201` con el usuario (`id`, `email`) y la sesión de Supabase (access + refresh token). El backend **no firma JWT propios**.
+- Toda la interacción con Supabase Auth está **encapsulada en `app/services/auth.py`**: se integró con `httpx` directo contra la API de GoTrue (menos peso que el SDK oficial y control propio del parseo de errores). Ningún otro módulo del backend habla con Supabase.
+- Los errores del proveedor se traducen a excepciones de dominio (`EmailAlreadyExists`, `WeakPassword`, `InvalidEmail`, `RateLimited`, `AuthProviderError`) por el campo **`error_code` estable** de Supabase + el status HTTP, **nunca** buscando palabras en el texto del mensaje. Mapeo a HTTP: `409` / `422` / `429` / `503`. Un `error_code` desconocido cae en `AuthProviderError`, conservando el código original solo para logs.
+- El **perfil local** se crea de forma **idempotente** tras el alta y su fallo **no rompe el registro** (se materializa después, HU-1.6). La sesión de base se gestiona a mano en vez de con `Depends(get_db)`, para que un fallo de la dependencia no aborte el request antes de poder contenerlo; un `IntegrityError` por id repetido se trata como idempotencia esperada, no como error.
+- Los fallos quedan **logueados** en servidor con status + `error_code` + mensaje del proveedor (warning para esperables, error para inesperados), **sin contraseñas ni llaves**; la respuesta al cliente sigue siendo genérica.
+- La contraseña **no aparece** en las respuestas de error de validación (handler propio en `app/core/errors.py` que elimina el campo `input` de errores sobre campos sensibles; se verificó que `SecretStr` por sí solo no lo evitaba).
+- Cliente compartido (`@rover/shared`) actualizado con los tipos y el método del registro. Tests que **no** dependen de Supabase real (cliente mockeado): caso feliz, `409`, `422`, `429`, `503`, fallo del perfil sin romper el registro e idempotencia.
+- **Verificado end-to-end** contra Supabase real: `201` con sesión, usuario en `auth.users` y fila en `user_profiles` con el mismo id y `plan='free'`.
 
-**Tareas técnicas:** schema Pydantic request/response · servicio de auth (cliente de Supabase) · creación del perfil local + estrategia de consistencia · endpoint · tests con mock · actualizar cliente compartido.
+**Tareas técnicas (como se hizo):** schemas Pydantic request/response · `app/services/auth.py` (httpx contra GoTrue + traducción de errores por `error_code`) · perfil local idempotente con sesión gestionada a mano · handler de validación que oculta campos sensibles · endpoint · cliente compartido · tests con mock.
+
+> **Nota:** el caso de **confirmación de email pendiente** (Supabase crea el usuario pero no devuelve sesión) quedó fuera de alcance y se aborda en la **HU-1.3b**.
+
+---
+
+### HU-1.3b — Registro con confirmación de email pendiente
+*Como* usuario que se registra, *quiero* saber que debo confirmar mi correo, *para* entender por qué aún no tengo sesión iniciada.
+
+Contexto: con **"Confirm email" activado** en Supabase (lo deseable en producción), el alta crea el usuario pero **no** devuelve sesión. Hoy el endpoint traduce esa ausencia a un `503` de "fallo del proveedor", que es incorrecto: es un estado legítimo del negocio, no un error de infraestructura.
+
+**Criterios de aceptación:**
+- Con la confirmación de email activada, `POST /v1/auth/register` responde `201` (no `503`) con el usuario creado, **sin sesión**, y con un indicador explícito de que la confirmación está pendiente.
+- La respuesta permite a web y móvil distinguir **sin ambigüedad** los dos casos: registro con sesión (confirmación desactivada) y registro pendiente de confirmación.
+- El perfil local se crea igualmente de forma **idempotente** en ambos casos.
+- El caso de rate limit de envío de correos (`over_email_send_rate_limit`) sigue devolviendo `429`.
+- El cliente compartido (`@rover/shared`) refleja el nuevo contrato de respuesta.
+- Tests sin Supabase real que cubran ambos casos (con y sin sesión).
+
+**Tareas técnicas:** ajustar el parseo de la respuesta de signup para tratar la ausencia de sesión como estado válido · modelo de respuesta que distinga ambos casos · actualizar el cliente compartido · tests de ambos caminos · documentar el flujo para los clientes.
 
 ---
 
