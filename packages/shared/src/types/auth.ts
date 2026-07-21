@@ -127,3 +127,30 @@ export function isLoginResponse(value: unknown): value is LoginResponse {
   const v = value as Record<string, unknown>;
   return isAuthUser(v["user"]) && isAuthSession(v["session"]);
 }
+
+/** Plan del usuario (espejo del StrEnum del backend). */
+export type Plan = "free" | "pro";
+
+/**
+ * Respuesta de GET /v1/auth/me: la identidad que el middleware resolvió a
+ * partir del token. Verificación mínima del middleware (HU-1.6); el perfil
+ * completo con preferencias llega en la HU-1.10b.
+ */
+export interface MeResponse {
+  id: string;
+  email: string;
+  plan: Plan;
+}
+
+/** Type guard: valida en runtime que un JSON desconocido es un MeResponse. */
+export function isMeResponse(value: unknown): value is MeResponse {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v["id"] === "string" &&
+    typeof v["email"] === "string" &&
+    (v["plan"] === "free" || v["plan"] === "pro")
+  );
+}

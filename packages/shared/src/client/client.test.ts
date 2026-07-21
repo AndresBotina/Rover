@@ -181,6 +181,38 @@ test("login con email sin confirmar (403) lanza ApiError con status 403", async 
   );
 });
 
+test("getMe envía el token en Authorization y parsea la identidad", async () => {
+  let calledUrl: string | undefined;
+  let calledHeaders: Headers | undefined;
+  globalThis.fetch = async (input, init) => {
+    calledUrl = String(input);
+    calledHeaders = new Headers(init?.headers);
+    return jsonResponse(
+      { id: "11111111-1111-1111-1111-111111111111", email: "a@b.com", plan: "free" },
+      200,
+    );
+  };
+
+  const me = await new ApiClient({ baseUrl: "http://api.test" }).getMe("mi-access-token");
+
+  assert.equal(calledUrl, "http://api.test/v1/auth/me");
+  assert.equal(calledHeaders?.get("Authorization"), "Bearer mi-access-token");
+  assert.deepEqual(me, {
+    id: "11111111-1111-1111-1111-111111111111",
+    email: "a@b.com",
+    plan: "free",
+  });
+});
+
+test("getMe con token inválido (401) lanza ApiError con status 401", async () => {
+  globalThis.fetch = async () => jsonResponse({ detail: "No autenticado." }, 401);
+
+  await assert.rejects(
+    new ApiClient({ baseUrl: "http://api.test" }).getMe("token-malo"),
+    (error: unknown) => error instanceof ApiError && error.status === 401,
+  );
+});
+
 test("register con email duplicado (409) lanza ApiError con ese status", async () => {
   globalThis.fetch = async () =>
     jsonResponse({ detail: "Ya existe una cuenta con ese email." }, 409);

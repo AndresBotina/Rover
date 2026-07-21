@@ -7,14 +7,15 @@ firma JWT propios (decisión de arquitectura, ver docs/backlog.md § Épica 1).
 import logging
 import uuid
 from enum import StrEnum
-from typing import Self
+from typing import Annotated, Self
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field, model_validator
 from sqlalchemy.exc import IntegrityError
 
+from app.api.deps import CurrentUser, get_current_user
 from app.core.database import get_db
-from app.models import UserProfile
+from app.models import Plan, UserProfile
 from app.services import auth as auth_service
 
 logger = logging.getLogger(__name__)
@@ -198,6 +199,25 @@ async def login(payload: LoginRequest) -> LoginResponse:
             refresh_token=result.session.refresh_token,
         ),
     )
+
+
+class MeResponse(BaseModel):
+    """Identidad del usuario autenticado (verificación del middleware, HU-1.6).
+
+    Los endpoints completos de perfil (`/v1/users/me` con actualización de
+    preferencias) llegan en la HU-1.10b; esto solo confirma que el middleware
+    resuelve la identidad de punta a punta.
+    """
+
+    id: uuid.UUID
+    email: str
+    plan: Plan
+
+
+@router.get("/me", response_model=MeResponse)
+async def me(user: Annotated[CurrentUser, Depends(get_current_user)]) -> MeResponse:
+    """Devuelve la identidad resuelta por el middleware para el token del request."""
+    return MeResponse(id=user.id, email=user.email, plan=user.plan)
 
 
 def _log_provider_failure(level: int, contexto: str, exc: auth_service.AuthError) -> None:

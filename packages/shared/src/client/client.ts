@@ -9,9 +9,11 @@
 
 import {
   isLoginResponse,
+  isMeResponse,
   isRegisterResponse,
   type LoginRequest,
   type LoginResponse,
+  type MeResponse,
   type RegisterRequest,
   type RegisterResponse,
 } from "../types/auth.ts";
@@ -103,13 +105,31 @@ export class ApiClient {
     }
     return data;
   }
+
+  /**
+   * GET /v1/auth/me — identidad del usuario autenticado. Envía el access token
+   * de Supabase en el header `Authorization: Bearer`. Un token ausente,
+   * inválido o expirado responde 401 (uniforme) y esto lanza ApiError con ese
+   * status.
+   */
+  async getMe(accessToken: string): Promise<MeResponse> {
+    const url = `${this.baseUrl}/v1/auth/me`;
+    const { status, data } = await getJson(url, { Authorization: `Bearer ${accessToken}` });
+    if (!isMeResponse(data)) {
+      throw new ApiError(`Respuesta de ${url} con forma inesperada`, { url, status });
+    }
+    return data;
+  }
 }
 
 /** GET de un JSON con errores normalizados a ApiError. Devuelve el cuerpo SIN tipar. */
-async function getJson(url: string): Promise<{ status: number; data: unknown }> {
+async function getJson(
+  url: string,
+  headers: Record<string, string> = {},
+): Promise<{ status: number; data: unknown }> {
   let response: Response;
   try {
-    response = await fetch(url, { headers: { Accept: "application/json" } });
+    response = await fetch(url, { headers: { Accept: "application/json", ...headers } });
   } catch (cause) {
     throw new ApiError(`Fallo de red llamando a ${url}`, { url, status: null, cause });
   }

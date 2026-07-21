@@ -184,6 +184,37 @@ En `@rover/shared`, `ApiClient.login()` devuelve `LoginResponse` (usuario +
 sesión) y lanza `ApiError` con el `status` en los casos de error; el `403` se
 distingue por su status.
 
+### Middleware de auth y `GET /v1/auth/me`
+
+Las rutas protegidas validan el **access token de Supabase** (un JWT) con la
+dependencia `get_current_user`. La validación es **local**, no remota: no se
+pregunta a Supabase por cada petición. Supabase firma con **ES256** y publica
+las claves en un **JWKS**; el backend descarga ese JWKS (derivado de
+`ROVER_SUPABASE_URL`), lo **cachea** en memoria (TTL de 10 min, con refresco al
+ver un `kid` desconocido y un cooldown para no martillar el endpoint), y
+verifica firma, **expiración**, **issuer** y **audiencia**. `get_current_user`
+resuelve el **perfil local** del usuario y, si no existe, lo **crea de forma
+perezosa e idempotente** — este es el único punto donde el perfil se
+materializa (lo que el registro y el login posponen).
+
+`GET /v1/auth/me` es la verificación mínima del middleware: devuelve la
+identidad resuelta. El envío del token va en el header:
+
+```
+Authorization: Bearer <access_token>
+```
+
+```json
+{ "id": "…uuid…", "email": "ana@example.com", "plan": "free" }
+```
+
+Cualquier fallo de autenticación (sin token, esquema incorrecto, malformado,
+firma inválida, expirado, issuer/audiencia incorrectos, `kid` desconocido)
+responde un **`401` uniforme** — mismo cuerpo para todos los motivos, para no
+revelar cuál falló; el motivo real solo va al **log** del servidor. Un problema
+de infraestructura (JWKS o base de datos no disponibles) responde **`503`**. En
+`@rover/shared`, `ApiClient.getMe(accessToken)` devuelve `MeResponse`.
+
 ## Migraciones (Alembic)
 
 El esquema se versiona con Alembic (`alembic.ini` + `migrations/`), configurado
