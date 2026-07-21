@@ -62,8 +62,33 @@ class Settings(BaseSettings):
     # engine (app/core/database.py); aquí NUNCA se guarda transformada.
     database_url: SecretStr | None = None
 
+    # --- Supabase Auth (HU-1.3): proveedor de identidad ----------------------
+    # El backend NO emite JWT propios: delega en Supabase Auth y valida sus
+    # tokens (decisión de arquitectura, ver docs/backlog.md § Épica 1).
+
+    # URL del proyecto de Supabase (https://TU-PROYECTO.supabase.co). No es un
+    # secreto en sí (es pública en cualquier request al API), pero SÍ es
+    # obligatoria: sin ella no hay a quién llamar.
+    supabase_url: str | None = None
+
+    # Anon/public key: la usa el registro (HU-1.3) y el login (HU-1.4). Es la
+    # llave de permisos de CLIENTE PÚBLICO — SecretStr para no filtrarla en
+    # logs/repr, aunque Supabase la considera segura para exponer en clientes.
+    supabase_anon_key: SecretStr | None = None
+
+    # Service-role key: permisos ADMINISTRATIVOS totales (se salta RLS). SOLO
+    # para el backend, JAMÁS en clientes ni en logs. Queda configurada para
+    # operaciones administrativas futuras; HU-1.3 NO la usa (ver
+    # app/services/auth.py).
+    supabase_service_role_key: SecretStr | None = None
+
     # Campos que no pueden faltar cuando env == "production".
-    _REQUIRED_IN_PRODUCTION: ClassVar[tuple[str, ...]] = ("database_url",)
+    _REQUIRED_IN_PRODUCTION: ClassVar[tuple[str, ...]] = (
+        "database_url",
+        "supabase_url",
+        "supabase_anon_key",
+        "supabase_service_role_key",
+    )
 
     @model_validator(mode="after")
     def _fail_fast_if_missing_required(self) -> Self:

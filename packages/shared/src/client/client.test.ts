@@ -78,6 +78,63 @@ test("un cuerpo con forma inesperada lanza ApiError (no devuelve algo mal tipado
   );
 });
 
+test("register hace POST a /v1/auth/register y parsea la sesión", async () => {
+  let calledUrl: string | undefined;
+  let calledInit: RequestInit | undefined;
+  globalThis.fetch = async (input, init) => {
+    calledUrl = String(input);
+    calledInit = init;
+    return jsonResponse(
+      {
+        user: { id: "11111111-1111-1111-1111-111111111111", email: "a@b.com" },
+        session: { access_token: "at", refresh_token: "rt", token_type: "bearer" },
+      },
+      201,
+    );
+  };
+
+  const result = await new ApiClient({ baseUrl: "http://api.test" }).register({
+    email: "a@b.com",
+    password: "una-contrasena-larga",
+  });
+
+  assert.equal(calledUrl, "http://api.test/v1/auth/register");
+  assert.equal(calledInit?.method, "POST");
+  assert.deepEqual(JSON.parse(String(calledInit?.body)), {
+    email: "a@b.com",
+    password: "una-contrasena-larga",
+  });
+  assert.deepEqual(result, {
+    user: { id: "11111111-1111-1111-1111-111111111111", email: "a@b.com" },
+    session: { access_token: "at", refresh_token: "rt", token_type: "bearer" },
+  });
+});
+
+test("register con email duplicado (409) lanza ApiError con ese status", async () => {
+  globalThis.fetch = async () =>
+    jsonResponse({ detail: "Ya existe una cuenta con ese email." }, 409);
+
+  await assert.rejects(
+    new ApiClient({ baseUrl: "http://api.test" }).register({
+      email: "a@b.com",
+      password: "una-contrasena-larga",
+    }),
+    (error: unknown) => error instanceof ApiError && error.status === 409,
+  );
+});
+
+test("register con forma de respuesta inesperada lanza ApiError", async () => {
+  globalThis.fetch = async () => jsonResponse({ user: { id: "x" } }, 201);
+
+  await assert.rejects(
+    new ApiClient({ baseUrl: "http://api.test" }).register({
+      email: "a@b.com",
+      password: "una-contrasena-larga",
+    }),
+    (error: unknown) => error instanceof ApiError && error.status === 201,
+  );
+});
+
 test("un fallo de red lanza ApiError con status null", async () => {
   globalThis.fetch = async () => {
     throw new TypeError("fetch failed");

@@ -7,6 +7,7 @@
  * aparte en ../types y aquí solo hay transporte + validación.
  */
 
+import { isRegisterResponse, type RegisterRequest, type RegisterResponse } from "../types/auth.ts";
 import {
   isDbHealthResponse,
   isHealthResponse,
@@ -64,6 +65,22 @@ export class ApiClient {
     }
     return data;
   }
+
+  /**
+   * POST /v1/auth/register — registra un usuario (delegado en Supabase Auth)
+   * y devuelve su sesión (access + refresh token). El backend no firma JWT
+   * propios. Un email ya existente responde 409; email inválido o contraseña
+   * débil, 422; fallo del proveedor, 502/503 — en los tres casos esto lanza
+   * ApiError con el status correspondiente (mismo contrato que getHealth).
+   */
+  async register(payload: RegisterRequest): Promise<RegisterResponse> {
+    const url = `${this.baseUrl}/v1/auth/register`;
+    const { status, data } = await postJson(url, payload);
+    if (!isRegisterResponse(data)) {
+      throw new ApiError(`Respuesta de ${url} con forma inesperada`, { url, status });
+    }
+    return data;
+  }
 }
 
 /** GET de un JSON con errores normalizados a ApiError. Devuelve el cuerpo SIN tipar. */
@@ -71,6 +88,32 @@ async function getJson(url: string): Promise<{ status: number; data: unknown }> 
   let response: Response;
   try {
     response = await fetch(url, { headers: { Accept: "application/json" } });
+  } catch (cause) {
+    throw new ApiError(`Fallo de red llamando a ${url}`, { url, status: null, cause });
+  }
+
+  if (!response.ok) {
+    throw new ApiError(`HTTP ${response.status} en ${url}`, { url, status: response.status });
+  }
+
+  let data: unknown;
+  try {
+    data = (await response.json()) as unknown;
+  } catch (cause) {
+    throw new ApiError(`Cuerpo no-JSON en ${url}`, { url, status: response.status, cause });
+  }
+  return { status: response.status, data };
+}
+
+/** POST de un JSON con errores normalizados a ApiError. Devuelve el cuerpo SIN tipar. */
+async function postJson(url: string, body: unknown): Promise<{ status: number; data: unknown }> {
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
+    });
   } catch (cause) {
     throw new ApiError(`Fallo de red llamando a ${url}`, { url, status: null, cause });
   }

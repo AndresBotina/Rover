@@ -4,6 +4,14 @@
 export { APP_NAME } from "./config.ts";
 
 export {
+  isRegisterResponse,
+  type AuthSession,
+  type AuthUser,
+  type RegisterRequest,
+  type RegisterResponse,
+} from "./types/auth.ts";
+
+export {
   isDbHealthResponse,
   isHealthResponse,
   type DbHealthResponse,

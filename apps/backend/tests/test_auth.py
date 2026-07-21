@@ -1,0 +1,237 @@
+"""Tests de POST /v1/auth/register — SIN Supabase real (CI sin credenciales).
+
+Supabase Auth se sustituye monkeypatcheando ``app.services.auth.sign_up``; la
+base de datos se sustituye por SQLite async en memoria con el esquema de
+``Base.metadata`` ya creado (mismo patrón que ``test_database.py`` y
+``test_models.py``).
+"""
+
+import asyncio
+import uuid
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from app.core import database
+from app.main import app
+from app.models import UserProfile
+from app.services import auth as auth_service
+
+_EMAIL = "viajera@example.com"
+_PASSWORD = "una-contrasena-larga-y-segura"
+
+
+def _sqlite_factory_con_esquema() -> async_sessionmaker[AsyncSession]:
+    """Fábrica de sesiones SQLite en memoria, con ``user_profiles`` ya creada."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+
+    async def crear_esquema() -> None:
+        async with engine.begin() as conn:
+            await conn.run_sync(database.Base.metadata.create_all)
+
+    asyncio.run(crear_esquema())
+    return async_sessionmaker(engine, expire_on_commit=False)
+
+
+def _mock_sign_up_exitoso(
+    monkeypatch: pytest.MonkeyPatch, *, user_id: uuid.UUID | None = None
+) -> uuid.UUID:
+    """Reemplaza ``sign_up`` por un éxito fijo; devuelve el id que usará."""
+    resuelto_id = user_id or uuid.uuid4()
+
+    async def fake_sign_up(email: str, password: str) -> auth_service.SupabaseSession:
+        return auth_service.SupabaseSession(
+            user_id=str(resuelto_id),
+            email=email,
+            access_token="access-de-prueba",
+            refresh_token="refresh-de-prueba",
+        )
+
+    monkeypatch.setattr(auth_service, "sign_up", fake_sign_up)
+    return resuelto_id
+
+
+def _mock_sign_up_error(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    async def fake_sign_up(email: str, password: str) -> auth_service.SupabaseSession:
+        raise error
+
+    monkeypatch.setattr(auth_service, "sign_up", fake_sign_up)
+
+
+def _leer_perfil(factory: async_sessionmaker[AsyncSession], user_id: uuid.UUID) -> UserProfile:
+    async def consulta() -> UserProfile:
+        async with factory() as session:
+            return (
+                await session.execute(select(UserProfile).where(UserProfile.id == user_id))
+            ).scalar_one()
+
+    return asyncio.run(consulta())
+
+
+def test_registro_exitoso_crea_el_perfil_y_devuelve_la_sesion_de_supabase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = _sqlite_factory_con_esquema()
+    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
+    user_id = _mock_sign_up_exitoso(monkeypatch)
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 201
+    assert response.json() == {
+        "user": {"id": str(user_id), "email": _EMAIL},
+        "session": {
+            "access_token": "access-de-prueba",
+            "refresh_token": "refresh-de-prueba",
+            "token_type": "bearer",
+        },
+    }
+
+    perfil = _leer_perfil(factory, user_id)
+    assert perfil.email == _EMAIL
+    assert perfil.plan.value == "free"
+
+
+def test_la_respuesta_no_filtra_la_contrasena(monkeypatch: pytest.MonkeyPatch) -> None:
+    factory = _sqlite_factory_con_esquema()
+    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
+    _mock_sign_up_exitoso(monkeypatch)
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert _PASSWORD not in response.text
+
+
+def test_email_duplicado_responde_409_sin_revelar_de_mas(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_sign_up_error(monkeypatch, auth_service.EmailAlreadyExists("detalle interno de Supabase"))
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Ya existe una cuenta con ese email."}
+
+
+def test_contrasena_rechazada_por_supabase_responde_422(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_sign_up_error(monkeypatch, auth_service.WeakPassword("no cumple la política"))
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 422
+
+
+def test_email_rechazado_por_supabase_responde_422(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_sign_up_error(monkeypatch, auth_service.InvalidEmail("no es válido"))
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 422
+
+
+def test_password_corta_responde_422_sin_llegar_a_supabase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """La validación local (longitud mínima) corta antes de tocar Supabase."""
+    llamado = False
+
+    async def fake_sign_up(email: str, password: str) -> auth_service.SupabaseSession:
+        nonlocal llamado
+        llamado = True
+        raise AssertionError("no debería llamarse: la validación local ya debió cortar")
+
+    monkeypatch.setattr(auth_service, "sign_up", fake_sign_up)
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/register", json={"email": _EMAIL, "password": "corta"})
+
+    assert response.status_code == 422
+    assert not llamado
+
+
+def test_email_con_formato_invalido_responde_422_sin_llegar_a_supabase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llamado = False
+
+    async def fake_sign_up(email: str, password: str) -> auth_service.SupabaseSession:
+        nonlocal llamado
+        llamado = True
+        raise AssertionError("no debería llamarse: la validación local ya debió cortar")
+
+    monkeypatch.setattr(auth_service, "sign_up", fake_sign_up)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/auth/register", json={"email": "no-es-un-email", "password": _PASSWORD}
+        )
+
+    assert response.status_code == 422
+    assert not llamado
+
+
+def test_fallo_del_proveedor_responde_503_sin_filtrar_detalles_internos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_sign_up_error(
+        monkeypatch, auth_service.AuthProviderError("timeout contra api-key=secreta-interna")
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 503
+    assert "secreta-interna" not in response.text
+
+
+def test_fallo_al_crear_el_perfil_local_no_rompe_el_registro(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """El alta en Supabase ya tuvo éxito: el registro debe seguir devolviendo 201."""
+
+    def factory_rota() -> async_sessionmaker[AsyncSession]:
+        raise RuntimeError("la base está caída")
+
+    monkeypatch.setattr(database, "get_session_factory", factory_rota)
+    user_id = _mock_sign_up_exitoso(monkeypatch)
+
+    with caplog.at_level("ERROR"):
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD}
+            )
+
+    assert response.status_code == 201
+    assert response.json()["user"]["id"] == str(user_id)
+    assert "perfil local" in caplog.text.lower()
+
+
+def test_idempotencia_el_mismo_id_no_duplica_ni_revienta(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Registrar dos veces con el mismo id de Supabase no rompe ni duplica la fila."""
+    factory = _sqlite_factory_con_esquema()
+    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
+    user_id = uuid.uuid4()
+    _mock_sign_up_exitoso(monkeypatch, user_id=user_id)
+
+    with TestClient(app) as client:
+        primera = client.post("/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD})
+        segunda = client.post("/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert primera.status_code == 201
+    assert segunda.status_code == 201
+
+    async def contar_filas() -> int:
+        async with factory() as session:
+            filas = (
+                (await session.execute(select(UserProfile).where(UserProfile.id == user_id)))
+                .scalars()
+                .all()
+            )
+            return len(filas)
+
+    assert asyncio.run(contar_filas()) == 1

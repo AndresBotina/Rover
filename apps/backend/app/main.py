@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.v1 import health
+from app.api.v1 import auth, health
 from app.core.config import settings
 from app.core.database import dispose_engine
 
@@ -29,6 +29,7 @@ def create_app() -> FastAPI:
     """Crea y configura la instancia de FastAPI."""
     app = FastAPI(title=settings.app_name, version=settings.version, lifespan=lifespan)
     app.include_router(health.router, prefix="/v1")
+    app.include_router(auth.router, prefix="/v1")
     return app
 
 
