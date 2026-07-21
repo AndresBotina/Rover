@@ -633,3 +633,248 @@ def test_idempotencia_el_mismo_id_no_duplica_ni_revienta(monkeypatch: pytest.Mon
             return len(filas)
 
     assert asyncio.run(contar_filas()) == 1
+
+
+# =============================================================================
+# HU-1.4 — Login (POST /v1/auth/login)
+# =============================================================================
+
+
+def _mock_sign_in(
+    monkeypatch: pytest.MonkeyPatch, *, user_id: uuid.UUID | None = None
+) -> uuid.UUID:
+    """Reemplaza ``sign_in`` por un éxito fijo; devuelve el id que usará."""
+    resuelto_id = user_id or uuid.uuid4()
+
+    async def fake_sign_in(email: str, password: str) -> auth_service.SignInResult:
+        return auth_service.SignInResult(
+            user_id=str(resuelto_id),
+            email=email,
+            session=auth_service.SupabaseSession(access_token="at-login", refresh_token="rt-login"),
+        )
+
+    monkeypatch.setattr(auth_service, "sign_in", fake_sign_in)
+    return resuelto_id
+
+
+def _mock_sign_in_error(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    async def fake_sign_in(email: str, password: str) -> auth_service.SignInResult:
+        raise error
+
+    monkeypatch.setattr(auth_service, "sign_in", fake_sign_in)
+
+
+def test_login_exitoso_devuelve_usuario_y_sesion(monkeypatch: pytest.MonkeyPatch) -> None:
+    user_id = _mock_sign_in(monkeypatch)
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/login", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "user": {"id": str(user_id), "email": _EMAIL},
+        "session": {
+            "access_token": "at-login",
+            "refresh_token": "rt-login",
+            "token_type": "bearer",
+        },
+    }
+
+
+def test_login_credenciales_invalidas_401_mismo_mensaje_exista_o_no_el_email(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """401 con mensaje idéntico para email inexistente y contraseña incorrecta."""
+    # Supabase devuelve invalid_credentials en AMBOS casos: el backend no puede
+    # (ni debe) distinguirlos, así que la respuesta es idéntica.
+    _mock_sign_in_error(
+        monkeypatch, auth_service.InvalidCredentials("Email o contraseña incorrectos.")
+    )
+
+    with TestClient(app) as client:
+        r_email_inexistente = client.post(
+            "/v1/auth/login", json={"email": "noexiste@example.com", "password": _PASSWORD}
+        )
+        r_password_mala = client.post(
+            "/v1/auth/login", json={"email": _EMAIL, "password": _PASSWORD}
+        )
+
+    assert r_email_inexistente.status_code == 401
+    assert r_password_mala.status_code == 401
+    assert r_email_inexistente.json() == r_password_mala.json()
+    assert r_password_mala.json() == {"detail": "Email o contraseña incorrectos."}
+
+
+def test_login_email_sin_confirmar_403_con_discriminante_explicito(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """403 (no 401): credenciales correctas pero email sin confirmar, distinguible."""
+    _mock_sign_in_error(
+        monkeypatch,
+        auth_service.EmailNotConfirmed("Debes confirmar tu correo antes de iniciar sesión."),
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/login", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 403
+    detail = response.json()["detail"]
+    assert detail["reason"] == "email_not_confirmed"
+    assert "confirmar" in detail["message"].lower()
+
+
+def test_login_rate_limit_responde_429(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_sign_in_error(
+        monkeypatch,
+        auth_service.RateLimited(
+            "Demasiados intentos.",
+            provider_status=429,
+            provider_error_code="over_request_rate_limit",
+        ),
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/login", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 429
+
+
+def test_login_fallo_del_proveedor_responde_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_sign_in_error(
+        monkeypatch,
+        auth_service.AuthProviderError("boom", provider_status=500, provider_error_code="x"),
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/login", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 503
+
+
+def test_login_contrasena_no_aparece_en_el_cuerpo_del_422(monkeypatch: pytest.MonkeyPatch) -> None:
+    """El handler de app/core/errors.py también oculta la contraseña en /login."""
+    _mock_sign_in(monkeypatch)  # no debería llegar a llamarse
+    password_larga = "P" * 130 + "-MARCADOR"  # supera max_length=128
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/login", json={"email": _EMAIL, "password": password_larga})
+
+    assert response.status_code == 422
+    assert "MARCADOR" not in response.text
+    detalle = response.json()["detail"][0]
+    assert detalle["loc"][-1] == "password"
+    assert "input" not in detalle
+
+
+def test_login_fallo_del_proveedor_emite_log_visible(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prueba efectiva: el 503 del login emite una línea con status + error_code."""
+    _mock_sign_in_error(
+        monkeypatch,
+        auth_service.AuthProviderError(
+            "Supabase Auth rechazó la solicitud.",
+            provider_status=500,
+            provider_error_code="unexpected_login_failure",
+            provider_message="internal error",
+        ),
+    )
+    stream = io.StringIO()
+    try:
+        configure_logging(stream=stream)
+        with TestClient(app) as client:
+            response = client.post("/v1/auth/login", json={"email": _EMAIL, "password": _PASSWORD})
+    finally:
+        configure_logging()
+
+    assert response.status_code == 503
+    salida = stream.getvalue()
+    assert "unexpected_login_failure" in salida
+    assert "status=500" in salida
+    assert _PASSWORD not in salida
+
+
+# --- Login end-to-end a través del sign_in REAL, con httpx mockeado ----------
+
+
+def test_login_e2e_formato_token_devuelve_200(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cuerpo real del endpoint de token (usuario anidado + tokens) → 200."""
+    user_id = uuid.uuid4()
+    payload = {
+        "access_token": "at-real",
+        "refresh_token": "rt-real",
+        "token_type": "bearer",
+        "expires_in": 3600,
+        "user": {"id": str(user_id), "email": _EMAIL, "role": "authenticated"},
+    }
+    _mock_signup_http(monkeypatch, 200, payload)
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/login", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 200
+    cuerpo = response.json()
+    assert cuerpo["session"]["access_token"] == "at-real"
+    assert cuerpo["user"]["id"] == str(user_id)
+
+
+def test_login_e2e_invalid_credentials_por_error_code_es_401(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_signup_http(
+        monkeypatch, 400, {"error_code": "invalid_credentials", "msg": "Invalid login credentials"}
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/login", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Email o contraseña incorrectos."}
+
+
+def test_login_e2e_email_not_confirmed_por_error_code_es_403(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_signup_http(
+        monkeypatch, 400, {"error_code": "email_not_confirmed", "msg": "Email not confirmed"}
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/login", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["reason"] == "email_not_confirmed"
+
+
+def test_login_e2e_respuesta_sin_sesion_es_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Un 200 con usuario pero SIN tokens es incoherente para un login → 503."""
+    _mock_signup_http(monkeypatch, 200, {"user": {"id": str(uuid.uuid4()), "email": _EMAIL}})
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/login", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 503
+
+
+# --- Traducción y parseo del login (unidad) ----------------------------------
+
+
+def test_translate_error_codigos_de_login() -> None:
+    invalidas = auth_service._translate_error({"error_code": "invalid_credentials"}, 400)
+    sin_confirmar = auth_service._translate_error({"error_code": "email_not_confirmed"}, 400)
+
+    assert isinstance(invalidas, auth_service.InvalidCredentials)
+    assert isinstance(sin_confirmar, auth_service.EmailNotConfirmed)
+
+
+def test_parse_signin_con_tokens_devuelve_sesion() -> None:
+    result = auth_service._parse_signin(
+        {"user": {"id": "abc", "email": "a@b.com"}, "access_token": "at", "refresh_token": "rt"}
+    )
+
+    assert result.user_id == "abc"
+    assert result.session.access_token == "at"
+
+
+def test_parse_signin_sin_tokens_es_provider_error() -> None:
+    """El login SIEMPRE debe abrir sesión: sin tokens es incoherente, no pending."""
+    with pytest.raises(auth_service.AuthProviderError):
+        auth_service._parse_signin({"user": {"id": "abc", "email": "a@b.com"}})

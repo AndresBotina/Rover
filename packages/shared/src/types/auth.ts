@@ -1,5 +1,5 @@
 /**
- * Tipos del recurso auth (POST /v1/auth/register).
+ * Tipos del recurso auth (POST /v1/auth/register y /v1/auth/login).
  *
  * Definidos A MANO por ahora, espejo de los modelos Pydantic del backend
  * (apps/backend/app/api/v1/auth.py) — mismos nombres de campo, sin inventar
@@ -10,6 +10,12 @@
 
 /** Cuerpo de POST /v1/auth/register. */
 export interface RegisterRequest {
+  email: string;
+  password: string;
+}
+
+/** Cuerpo de POST /v1/auth/login. */
+export interface LoginRequest {
   email: string;
   password: string;
 }
@@ -97,4 +103,27 @@ export function isRegisterResponse(value: unknown): value is RegisterResponse {
     return v["session"] === null || v["session"] === undefined;
   }
   return false;
+}
+
+/**
+ * Respuesta de éxito (200) de POST /v1/auth/login. A diferencia del registro,
+ * el login SIEMPRE abre sesión, así que no es una unión: usuario + sesión.
+ *
+ * Nota sobre errores: credenciales inválidas → 401; email sin confirmar → 403
+ * con `{ detail: { reason: "email_not_confirmed", message } }`; rate limit →
+ * 429; fallo del proveedor → 503. El cliente los recibe como `ApiError` con su
+ * `status` (el 403 se distingue por el status, sin inferir).
+ */
+export interface LoginResponse {
+  user: AuthUser;
+  session: AuthSession;
+}
+
+/** Type guard: valida en runtime que un JSON desconocido es un LoginResponse. */
+export function isLoginResponse(value: unknown): value is LoginResponse {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const v = value as Record<string, unknown>;
+  return isAuthUser(v["user"]) && isAuthSession(v["session"]);
 }

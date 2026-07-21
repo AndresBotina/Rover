@@ -149,6 +149,41 @@ Errores (respuesta genérica; la causa real queda en los logs del servidor):
 intentos (rate limit de Supabase) · `503` fallo del proveedor. La contraseña
 nunca viaja en las respuestas de error (ni siquiera en las de validación).
 
+### `POST /v1/auth/login`
+
+Valida credenciales contra Supabase y devuelve **200** con el usuario y la
+sesión (el login **siempre** abre sesión). El login **no** crea el perfil
+local: si un usuario autenticado aún no tiene perfil, lo materializa el
+middleware de la HU-1.6, por donde pasa toda petición autenticada (así la
+lógica vive en un solo sitio).
+
+```json
+{
+  "user": { "id": "…uuid…", "email": "ana@example.com" },
+  "session": { "access_token": "…", "refresh_token": "…", "token_type": "bearer" }
+}
+```
+
+Errores:
+
+- **`401`** — credenciales inválidas. **Mismo** mensaje (`"Email o contraseña
+  incorrectos."`) tanto si el email no existe como si la contraseña es
+  incorrecta: no se revela si la cuenta existe.
+- **`403`** — el email **no está confirmado** (las credenciales son correctas,
+  pero falta confirmar el correo). Es un estado distinto de "credenciales
+  malas", así que usa otro status **y** un discriminante explícito en el cuerpo
+  para que el cliente muestre "confirma tu correo" sin inferir:
+
+  ```json
+  { "detail": { "reason": "email_not_confirmed", "message": "Debes confirmar tu correo antes de iniciar sesión." } }
+  ```
+
+- **`429`** rate limit · **`503`** fallo del proveedor.
+
+En `@rover/shared`, `ApiClient.login()` devuelve `LoginResponse` (usuario +
+sesión) y lanza `ApiError` con el `status` en los casos de error; el `403` se
+distingue por su status.
+
 ## Migraciones (Alembic)
 
 El esquema se versiona con Alembic (`alembic.ini` + `migrations/`), configurado

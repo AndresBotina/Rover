@@ -130,6 +130,57 @@ test("register (confirmación pendiente) devuelve la variante sin sesión", asyn
   assert.equal(result.session, null);
 });
 
+test("login hace POST a /v1/auth/login y parsea usuario + sesión", async () => {
+  let calledUrl: string | undefined;
+  let calledInit: RequestInit | undefined;
+  globalThis.fetch = async (input, init) => {
+    calledUrl = String(input);
+    calledInit = init;
+    return jsonResponse(
+      {
+        user: { id: "11111111-1111-1111-1111-111111111111", email: "a@b.com" },
+        session: { access_token: "at", refresh_token: "rt", token_type: "bearer" },
+      },
+      200,
+    );
+  };
+
+  const result = await new ApiClient({ baseUrl: "http://api.test" }).login({
+    email: "a@b.com",
+    password: "una-contrasena-larga",
+  });
+
+  assert.equal(calledUrl, "http://api.test/v1/auth/login");
+  assert.equal(calledInit?.method, "POST");
+  assert.equal(result.session.access_token, "at");
+  assert.equal(result.user.id, "11111111-1111-1111-1111-111111111111");
+});
+
+test("login con credenciales inválidas (401) lanza ApiError con ese status", async () => {
+  globalThis.fetch = async () => jsonResponse({ detail: "Email o contraseña incorrectos." }, 401);
+
+  await assert.rejects(
+    new ApiClient({ baseUrl: "http://api.test" }).login({
+      email: "a@b.com",
+      password: "una-contrasena-larga",
+    }),
+    (error: unknown) => error instanceof ApiError && error.status === 401,
+  );
+});
+
+test("login con email sin confirmar (403) lanza ApiError con status 403", async () => {
+  globalThis.fetch = async () =>
+    jsonResponse({ detail: { reason: "email_not_confirmed", message: "…" } }, 403);
+
+  await assert.rejects(
+    new ApiClient({ baseUrl: "http://api.test" }).login({
+      email: "a@b.com",
+      password: "una-contrasena-larga",
+    }),
+    (error: unknown) => error instanceof ApiError && error.status === 403,
+  );
+});
+
 test("register con email duplicado (409) lanza ApiError con ese status", async () => {
   globalThis.fetch = async () =>
     jsonResponse({ detail: "Ya existe una cuenta con ese email." }, 409);

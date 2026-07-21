@@ -78,6 +78,28 @@ class RegisterResponse(BaseModel):
         return self
 
 
+class LoginRequest(BaseModel):
+    """Login: email + contraseña. La validación real de credenciales la hace
+    Supabase; aquí solo se comprueba una forma mínima (email válido, contraseña
+    presente y acotada) — sin imponer la política de longitud del registro,
+    que rechazaría contraseñas válidas más cortas."""
+
+    email: EmailStr
+    password: str = Field(min_length=1, max_length=128)
+
+
+class LoginResponse(BaseModel):
+    """Cuerpo de éxito (200) de POST /v1/auth/login: usuario + sesión de Supabase."""
+
+    user: UserOut
+    session: SessionOut
+
+
+# Discriminante explícito para que el cliente distinga "email sin confirmar" de
+# "credenciales inválidas" sin inferir del status (mismo espíritu que HU-1.3b).
+_EMAIL_NOT_CONFIRMED_REASON = "email_not_confirmed"
+
+
 @router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
 async def register(payload: RegisterRequest) -> RegisterResponse:
     """Registra en Supabase Auth y crea el perfil local (best-effort, ver abajo)."""
@@ -118,6 +140,59 @@ async def register(payload: RegisterRequest) -> RegisterResponse:
     return RegisterResponse(
         status=RegistrationStatus.ACTIVE,
         user=user_out,
+        session=SessionOut(
+            access_token=result.session.access_token,
+            refresh_token=result.session.refresh_token,
+        ),
+    )
+
+
+@router.post("/login", response_model=LoginResponse)
+async def login(payload: LoginRequest) -> LoginResponse:
+    """Inicia sesión delegando en Supabase Auth; devuelve usuario + sesión.
+
+    A diferencia del registro, el login NO crea ni materializa el perfil
+    local: si un usuario puede autenticarse pero aún no tiene perfil, su
+    creación perezosa es responsabilidad del middleware de la HU-1.6 —el punto
+    por el que pasa TODA petición autenticada—. Duplicar esa lógica aquí la
+    pondría en dos sitios.
+    """
+    try:
+        result = await auth_service.sign_in(payload.email, payload.password)
+    except auth_service.InvalidCredentials as exc:
+        _log_provider_failure(logging.WARNING, "credenciales inválidas", exc)
+        # Mismo mensaje para email inexistente y contraseña incorrecta: no se
+        # revela si la cuenta existe (evita enumerar cuentas).
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "Email o contraseña incorrectos."
+        ) from exc
+    except auth_service.EmailNotConfirmed as exc:
+        _log_provider_failure(logging.WARNING, "email sin confirmar", exc)
+        # 403, no 401: las credenciales SON correctas; lo que falta es confirmar
+        # el correo. El cuerpo lleva un discriminante explícito para que el
+        # cliente muestre "confirma tu correo" sin inferir del status.
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={
+                "reason": _EMAIL_NOT_CONFIRMED_REASON,
+                "message": "Debes confirmar tu correo antes de iniciar sesión.",
+            },
+        ) from exc
+    except auth_service.RateLimited as exc:
+        _log_provider_failure(logging.WARNING, "límite de tasa", exc)
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Demasiados intentos; prueba de nuevo en unos minutos.",
+        ) from exc
+    except auth_service.AuthProviderError as exc:
+        _log_provider_failure(logging.ERROR, "fallo del proveedor", exc)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "No se pudo iniciar sesión; intenta de nuevo en unos minutos.",
+        ) from exc
+
+    return LoginResponse(
+        user=UserOut(id=uuid.UUID(result.user_id), email=result.email),
         session=SessionOut(
             access_token=result.session.access_token,
             refresh_token=result.session.refresh_token,

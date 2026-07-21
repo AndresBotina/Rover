@@ -4,9 +4,12 @@
 export { APP_NAME } from "./config.ts";
 
 export {
+  isLoginResponse,
   isRegisterResponse,
   type AuthSession,
   type AuthUser,
+  type LoginRequest,
+  type LoginResponse,
   type RegisterActive,
   type RegisterPendingConfirmation,
   type RegisterRequest,

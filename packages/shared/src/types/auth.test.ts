@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { isRegisterResponse } from "./auth.ts";
+import { isLoginResponse, isRegisterResponse } from "./auth.ts";
 
 const USER = { id: "11111111-1111-1111-1111-111111111111", email: "a@b.com" };
 const SESSION = { access_token: "at", refresh_token: "rt", token_type: "bearer" };
@@ -52,4 +52,18 @@ test("rechaza si el usuario tiene forma inválida", () => {
 test("rechaza valores que no son objeto", () => {
   assert.equal(isRegisterResponse(null), false);
   assert.equal(isRegisterResponse("register"), false);
+});
+
+test("isLoginResponse acepta usuario + sesión válidos", () => {
+  assert.equal(isLoginResponse({ user: USER, session: SESSION }), true);
+});
+
+test("isLoginResponse rechaza si falta la sesión (el login siempre la trae)", () => {
+  assert.equal(isLoginResponse({ user: USER, session: null }), false);
+  assert.equal(isLoginResponse({ user: USER }), false);
+});
+
+test("isLoginResponse rechaza usuario inválido o valores no-objeto", () => {
+  assert.equal(isLoginResponse({ user: { id: "x" }, session: SESSION }), false);
+  assert.equal(isLoginResponse(null), false);
 });

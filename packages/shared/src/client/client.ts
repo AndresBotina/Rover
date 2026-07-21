@@ -7,7 +7,14 @@
  * aparte en ../types y aquí solo hay transporte + validación.
  */
 
-import { isRegisterResponse, type RegisterRequest, type RegisterResponse } from "../types/auth.ts";
+import {
+  isLoginResponse,
+  isRegisterResponse,
+  type LoginRequest,
+  type LoginResponse,
+  type RegisterRequest,
+  type RegisterResponse,
+} from "../types/auth.ts";
 import {
   isDbHealthResponse,
   isHealthResponse,
@@ -77,6 +84,21 @@ export class ApiClient {
     const url = `${this.baseUrl}/v1/auth/register`;
     const { status, data } = await postJson(url, payload);
     if (!isRegisterResponse(data)) {
+      throw new ApiError(`Respuesta de ${url} con forma inesperada`, { url, status });
+    }
+    return data;
+  }
+
+  /**
+   * POST /v1/auth/login — inicia sesión (delegado en Supabase Auth) y devuelve
+   * usuario + sesión (access + refresh token). Credenciales inválidas → 401;
+   * email sin confirmar → 403; rate limit → 429; fallo del proveedor → 503.
+   * En todos esos casos esto lanza ApiError con el status correspondiente.
+   */
+  async login(payload: LoginRequest): Promise<LoginResponse> {
+    const url = `${this.baseUrl}/v1/auth/login`;
+    const { status, data } = await postJson(url, payload);
+    if (!isLoginResponse(data)) {
       throw new ApiError(`Respuesta de ${url} con forma inesperada`, { url, status });
     }
     return data;
