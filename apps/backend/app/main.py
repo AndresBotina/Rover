@@ -7,10 +7,12 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 
 from app.api.v1 import auth, health
 from app.core.config import settings
 from app.core.database import dispose_engine
+from app.core.errors import validation_exception_handler
 
 
 @asynccontextmanager
@@ -28,6 +30,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     """Crea y configura la instancia de FastAPI."""
     app = FastAPI(title=settings.app_name, version=settings.version, lifespan=lifespan)
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
     app.include_router(health.router, prefix="/v1")
     app.include_router(auth.router, prefix="/v1")
     return app

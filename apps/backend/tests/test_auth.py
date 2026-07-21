@@ -211,6 +211,120 @@ def test_fallo_al_crear_el_perfil_local_no_rompe_el_registro(
     assert "perfil local" in caplog.text.lower()
 
 
+def test_rate_limit_de_supabase_responde_429(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Un RateLimited del servicio se mapea a 429 (no a 422 ni 503) y se loguea."""
+    _mock_sign_up_error(
+        monkeypatch,
+        auth_service.RateLimited(
+            "Demasiados intentos; prueba de nuevo en unos minutos.",
+            provider_status=429,
+            provider_error_code="over_email_send_rate_limit",
+            provider_message="email rate limit exceeded",
+        ),
+    )
+
+    with caplog.at_level("WARNING"):
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD}
+            )
+
+    assert response.status_code == 429
+    # El servidor deja rastro de la causa real (status + error_code), sin secretos.
+    assert "over_email_send_rate_limit" in caplog.text
+    assert _PASSWORD not in caplog.text
+
+
+def test_los_logs_de_fallo_no_incluyen_la_contrasena(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """El diagnóstico del proveedor va al log; la contraseña y las llaves nunca."""
+    _mock_sign_up_error(
+        monkeypatch,
+        auth_service.AuthProviderError(
+            "Supabase Auth rechazó la solicitud.",
+            provider_status=500,
+            provider_error_code="unexpected_failure",
+            provider_message="internal error",
+        ),
+    )
+
+    with caplog.at_level("ERROR"):
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD}
+            )
+
+    assert response.status_code == 503
+    assert "unexpected_failure" in caplog.text
+    assert _PASSWORD not in caplog.text
+
+
+def test_contrasena_corta_no_aparece_en_el_cuerpo_del_422(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bug 3: la contraseña rechazada por longitud NO debe viajar en la respuesta."""
+    # sign_up no debe llegar a llamarse; si lo hace, que sea evidente.
+    _mock_sign_up_exitoso(monkeypatch)
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/register", json={"email": _EMAIL, "password": "abc123"})
+
+    assert response.status_code == 422
+    assert "abc123" not in response.text
+    # El resto del error de validación se conserva (tipo y ubicación del campo).
+    detalle = response.json()["detail"][0]
+    assert detalle["loc"][-1] == "password"
+    assert "input" not in detalle
+
+
+# --- Traducción de errores del proveedor (unidad, sin HTTP) ------------------
+
+
+def test_translate_error_mapea_por_error_code_no_por_texto() -> None:
+    """La regresión del Bug 1: un 429 con 'email...' NO debe caer en InvalidEmail."""
+    exc = auth_service._translate_error(
+        {"error_code": "over_email_send_rate_limit", "msg": "email rate limit exceeded"},
+        429,
+    )
+
+    assert isinstance(exc, auth_service.RateLimited)
+    assert exc.provider_error_code == "over_email_send_rate_limit"
+
+
+def test_translate_error_email_duplicado_y_password_debil_por_codigo() -> None:
+    duplicado = auth_service._translate_error(
+        {"error_code": "email_exists", "msg": "cualquier texto"}, 422
+    )
+    otro_duplicado = auth_service._translate_error({"error_code": "user_already_exists"}, 422)
+    password = auth_service._translate_error({"error_code": "weak_password"}, 422)
+    email = auth_service._translate_error({"error_code": "email_address_invalid"}, 400)
+
+    assert isinstance(duplicado, auth_service.EmailAlreadyExists)
+    assert isinstance(otro_duplicado, auth_service.EmailAlreadyExists)
+    assert isinstance(password, auth_service.WeakPassword)
+    assert isinstance(email, auth_service.InvalidEmail)
+
+
+def test_translate_error_codigo_desconocido_cae_en_provider_error() -> None:
+    """Sin error_code reconocible NO se adivina por el texto: AuthProviderError."""
+    exc = auth_service._translate_error(
+        {"error_code": "algo_nuevo_de_supabase", "msg": "password looks weak to me"},
+        400,
+    )
+
+    assert type(exc) is auth_service.AuthProviderError
+    # El error_code se conserva para los logs, aunque no se muestre al cliente.
+    assert exc.provider_error_code == "algo_nuevo_de_supabase"
+
+
+def test_translate_error_429_sin_codigo_conocido_es_rate_limited() -> None:
+    """El status 429 basta para RateLimited aunque no haya error_code mapeado."""
+    exc = auth_service._translate_error({"msg": "too many requests"}, 429)
+
+    assert isinstance(exc, auth_service.RateLimited)
+
+
 def test_idempotencia_el_mismo_id_no_duplica_ni_revienta(monkeypatch: pytest.MonkeyPatch) -> None:
     """Registrar dos veces con el mismo id de Supabase no rompe ni duplica la fila."""
     factory = _sqlite_factory_con_esquema()

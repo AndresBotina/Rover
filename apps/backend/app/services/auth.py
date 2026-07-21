@@ -40,7 +40,27 @@ _TIMEOUT_SECONDS = 10.0
 
 
 class AuthError(Exception):
-    """Error de autenticación ya traducido: la capa de API nunca ve la forma de Supabase."""
+    """Error de autenticación ya traducido a dominio: la API nunca ve la forma de Supabase.
+
+    El mensaje (``str(exc)``) es SEGURO para mostrar al cliente. Los detalles
+    del proveedor —status HTTP, ``error_code`` y su mensaje— viajan aparte y
+    son SOLO para los logs del servidor: nunca deben ir en la respuesta. Son
+    el diagnóstico de GoTrue (p. ej. "email rate limit exceeded"), nunca la
+    contraseña ni las llaves (Supabase no las incluye en sus errores).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_status: int | None = None,
+        provider_error_code: str | None = None,
+        provider_message: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider_status = provider_status
+        self.provider_error_code = provider_error_code
+        self.provider_message = provider_message
 
 
 class EmailAlreadyExists(AuthError):
@@ -55,8 +75,12 @@ class InvalidEmail(AuthError):
     """El email no es válido según Supabase."""
 
 
+class RateLimited(AuthError):
+    """Supabase rechazó por límite de tasa (demasiados intentos o emails)."""
+
+
 class AuthProviderError(AuthError):
-    """Fallo del proveedor: red, 5xx, o una respuesta con forma inesperada."""
+    """Fallo del proveedor: red, 5xx, error desconocido, o forma inesperada."""
 
 
 @dataclass(frozen=True)
@@ -102,42 +126,82 @@ async def sign_up(email: str, password: str) -> SupabaseSession:
     except httpx.HTTPError as exc:
         raise AuthProviderError("No se pudo contactar a Supabase Auth.") from exc
 
-    if response.status_code >= 500:
-        raise AuthProviderError("Supabase Auth respondió con un error del servidor.")
-
     try:
         body: Any = response.json()
-    except ValueError as exc:
-        raise AuthProviderError("Respuesta de Supabase Auth con forma inesperada.") from exc
+    except ValueError:
+        body = None
 
     if response.status_code >= 400:
-        raise _translate_error(body)
+        if isinstance(body, dict):
+            raise _translate_error(body, response.status_code)
+        # Error sin cuerpo JSON (p. ej. un 5xx del gateway): no hay error_code
+        # que traducir; se conserva el status para el log.
+        raise AuthProviderError(
+            "Supabase Auth respondió con un error.", provider_status=response.status_code
+        )
+
+    if body is None:
+        raise AuthProviderError("Respuesta de Supabase Auth con forma inesperada.")
 
     return _parse_session(body)
 
 
-def _translate_error(body: Any) -> AuthError:
-    """Mapea el error de GoTrue (código + mensaje) a una excepción de dominio.
+# error_code de GoTrue → (excepción de dominio, mensaje SEGURO para el cliente).
+# La traducción se basa en ``error_code`` (identificador ESTABLE del proveedor),
+# NUNCA en buscar palabras dentro de ``msg``: ese texto cambia entre versiones,
+# está localizado, y clasificaba mal — un 429 "email rate limit exceeded" caía
+# en InvalidEmail solo por contener la palabra "email".
+_ERROR_CODE_TO_DOMAIN: dict[str, tuple[type[AuthError], str]] = {
+    "email_exists": (EmailAlreadyExists, "Ya existe una cuenta con ese email."),
+    "user_already_exists": (EmailAlreadyExists, "Ya existe una cuenta con ese email."),
+    "weak_password": (WeakPassword, "La contraseña no cumple los requisitos mínimos."),
+    "email_address_invalid": (InvalidEmail, "El email no es válido."),
+    "over_email_send_rate_limit": (
+        RateLimited,
+        "Demasiados intentos; prueba de nuevo en unos minutos.",
+    ),
+    "over_request_rate_limit": (
+        RateLimited,
+        "Demasiados intentos; prueba de nuevo en unos minutos.",
+    ),
+}
 
-    GoTrue no tiene un único formato estable de error entre versiones: unas
-    traen ``error_code`` (p. ej. ``user_already_exists``), otras solo ``msg``.
-    Por eso el matching es por palabras clave sobre ambos campos combinados,
-    no por un código exacto.
+
+def _translate_error(body: dict[str, Any], status_code: int) -> AuthError:
+    """Traduce un error de GoTrue a excepción de dominio por ``error_code`` + status.
+
+    NUNCA adivina por el texto del mensaje. Si el ``error_code`` no se
+    reconoce, cae en el status HTTP (429 → RateLimited) y, en último término,
+    en ``AuthProviderError`` conservando el ``error_code`` para los logs.
     """
-    code = ""
-    message = ""
-    if isinstance(body, dict):
-        code = str(body.get("error_code") or "")
-        message = str(body.get("msg") or body.get("message") or "")
-    texto = f"{code} {message}".lower()
+    error_code = str(body.get("error_code") or body.get("code") or "")
+    provider_message = str(body.get("msg") or body.get("message") or "")
 
-    if "already" in texto or "exists" in texto or "registered" in texto:
-        return EmailAlreadyExists("Ya existe una cuenta con ese email.")
-    if "password" in texto:
-        return WeakPassword("La contraseña no cumple los requisitos mínimos.")
-    if "email" in texto:
-        return InvalidEmail("El email no es válido.")
-    return AuthProviderError("Supabase Auth rechazó la solicitud.")
+    mapped = _ERROR_CODE_TO_DOMAIN.get(error_code)
+    if mapped is not None:
+        exc_class, client_message = mapped
+        return exc_class(
+            client_message,
+            provider_status=status_code,
+            provider_error_code=error_code,
+            provider_message=provider_message,
+        )
+
+    # Sin error_code reconocible: el status es la única otra señal fiable.
+    if status_code == 429:
+        return RateLimited(
+            "Demasiados intentos; prueba de nuevo en unos minutos.",
+            provider_status=status_code,
+            provider_error_code=error_code or None,
+            provider_message=provider_message,
+        )
+
+    return AuthProviderError(
+        "Supabase Auth rechazó la solicitud.",
+        provider_status=status_code,
+        provider_error_code=error_code or None,
+        provider_message=provider_message,
+    )
 
 
 def _parse_session(body: Any) -> SupabaseSession:

@@ -54,15 +54,24 @@ async def register(payload: RegisterRequest) -> RegisterResponse:
     """Registra en Supabase Auth y crea el perfil local (best-effort, ver abajo)."""
     try:
         supabase_session = await auth_service.sign_up(payload.email, payload.password)
+    except auth_service.RateLimited as exc:
+        _log_provider_failure(logging.WARNING, "límite de tasa", exc)
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Demasiados intentos; prueba de nuevo en unos minutos.",
+        ) from exc
     except auth_service.EmailAlreadyExists as exc:
+        _log_provider_failure(logging.WARNING, "email ya registrado", exc)
         # Mensaje genérico: no confirma NI desmiente más de lo estrictamente
         # necesario (evita que un atacante use /register para enumerar emails).
         raise HTTPException(
             status.HTTP_409_CONFLICT, "Ya existe una cuenta con ese email."
         ) from exc
     except (auth_service.WeakPassword, auth_service.InvalidEmail) as exc:
+        _log_provider_failure(logging.WARNING, "datos rechazados por el proveedor", exc)
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
     except auth_service.AuthProviderError as exc:
+        _log_provider_failure(logging.ERROR, "fallo del proveedor", exc)
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "No se pudo completar el registro; intenta de nuevo en unos minutos.",
@@ -77,6 +86,24 @@ async def register(payload: RegisterRequest) -> RegisterResponse:
             access_token=supabase_session.access_token,
             refresh_token=supabase_session.refresh_token,
         ),
+    )
+
+
+def _log_provider_failure(level: int, contexto: str, exc: auth_service.AuthError) -> None:
+    """Deja rastro de la causa REAL del fallo en los logs del servidor.
+
+    Registra SOLO el diagnóstico del proveedor (status, error_code y su
+    mensaje): la respuesta al cliente sigue siendo genérica, pero al depurar
+    la causa es visible. NUNCA la contraseña ni las llaves — no viven en la
+    excepción, así que no pueden colarse aquí.
+    """
+    logger.log(
+        level,
+        "Registro rechazado (%s): status=%s error_code=%s provider_msg=%s",
+        contexto,
+        exc.provider_status,
+        exc.provider_error_code,
+        exc.provider_message,
     )
 
 
