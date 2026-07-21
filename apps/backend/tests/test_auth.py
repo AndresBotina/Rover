@@ -7,14 +7,21 @@ base de datos se sustituye por SQLite async en memoria con el esquema de
 """
 
 import asyncio
+import io
+import logging
 import uuid
+from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core import database
+from app.core.config import settings
+from app.core.logging import configure_logging
 from app.main import app
 from app.models import UserProfile
 from app.services import auth as auth_service
@@ -399,6 +406,39 @@ def test_parse_signup_con_un_solo_token_es_provider_error() -> None:
         )
 
 
+# Cuerpo real de GoTrue cuando "Confirm email" está ACTIVADO: el usuario va en
+# la RAÍZ (sin clave "user" ni tokens). Claves verificadas contra Supabase.
+_CUERPO_RAIZ_SIN_SESION = {
+    "id": "d1e2f3a4-0000-0000-0000-000000000000",
+    "aud": "authenticated",
+    "role": "authenticated",
+    "email": "viajera@example.com",
+    "phone": "",
+    "confirmation_sent_at": "2026-07-21T10:00:00Z",
+    "app_metadata": {"provider": "email", "providers": ["email"]},
+    "user_metadata": {},
+    "identities": [],
+    "created_at": "2026-07-21T10:00:00Z",
+    "updated_at": "2026-07-21T10:00:00Z",
+    "is_anonymous": False,
+}
+
+
+def test_parse_signup_formato_raiz_es_confirmacion_pendiente() -> None:
+    """Usuario en la RAÍZ (sin 'user' ni tokens) → resultado sin sesión (pending)."""
+    result = auth_service._parse_signup(_CUERPO_RAIZ_SIN_SESION)
+
+    assert result.user_id == "d1e2f3a4-0000-0000-0000-000000000000"
+    assert result.email == "viajera@example.com"
+    assert result.session is None
+
+
+def test_parse_signup_user_presente_pero_invalido_no_cae_al_respaldo() -> None:
+    """Si 'user' está pero es inválido, NO se usa la raíz: es incoherente."""
+    with pytest.raises(auth_service.AuthProviderError):
+        auth_service._parse_signup({"user": {"id": 123}, "id": "raiz", "email": "raiz@example.com"})
+
+
 def test_respuesta_incoherente_del_proveedor_responde_503(monkeypatch: pytest.MonkeyPatch) -> None:
     """Si sign_up lanza AuthProviderError por forma inesperada, el endpoint da 503."""
     _mock_sign_up_error(
@@ -409,6 +449,164 @@ def test_respuesta_incoherente_del_proveedor_responde_503(monkeypatch: pytest.Mo
         response = client.post("/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD})
 
     assert response.status_code == 503
+
+
+# --- End-to-end del registro a través del sign_up REAL, con httpx mockeado ---
+
+
+class _FakeResponse:
+    """Respuesta httpx mínima: status + .json() (sin red)."""
+
+    def __init__(self, status_code: int, payload: Any) -> None:
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self) -> Any:
+        return self._payload
+
+
+def _mock_signup_http(monkeypatch: pytest.MonkeyPatch, status_code: int, payload: Any) -> None:
+    """Hace que ``sign_up`` reciba (status_code, payload) sin tocar la red.
+
+    Sustituye ``httpx.AsyncClient`` por un doble que devuelve la respuesta dada
+    en ``.post`` y configura las credenciales mínimas de Supabase.
+    """
+    # settings es un único objeto compartido: auth._require_configured lee el
+    # mismo, así que basta parchear sus atributos aquí.
+    monkeypatch.setattr(settings, "supabase_url", "https://proyecto.supabase.co")
+    monkeypatch.setattr(settings, "supabase_anon_key", SecretStr("anon-de-prueba"))
+
+    response = _FakeResponse(status_code, payload)
+
+    class _FakeAsyncClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+        async def post(self, *args: Any, **kwargs: Any) -> _FakeResponse:
+            return response
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+
+
+def test_e2e_formato_raiz_devuelve_201_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bug 1: cuerpo 200 en formato RAÍZ → 201 pending_email_confirmation (no 503)."""
+    factory = _sqlite_factory_con_esquema()
+    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
+    user_id = uuid.uuid4()
+    payload = {
+        "id": str(user_id),
+        "aud": "authenticated",
+        "role": "authenticated",
+        "email": _EMAIL,
+        "app_metadata": {"provider": "email"},
+        "user_metadata": {},
+        "identities": [],
+        "created_at": "2026-07-21T10:00:00Z",
+        "updated_at": "2026-07-21T10:00:00Z",
+        "is_anonymous": False,
+    }
+    _mock_signup_http(monkeypatch, 200, payload)
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 201
+    assert response.json() == {
+        "status": "pending_email_confirmation",
+        "user": {"id": str(user_id), "email": _EMAIL},
+        "session": None,
+    }
+    # El perfil se crea igual en el caso pendiente.
+    perfil = _leer_perfil(factory, user_id)
+    assert perfil.email == _EMAIL
+
+
+def test_e2e_formato_anidado_devuelve_201_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    """El formato ANIDADO (con 'user' y ambos tokens) sigue dando active con sesión."""
+    factory = _sqlite_factory_con_esquema()
+    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
+    user_id = uuid.uuid4()
+    payload = {
+        "access_token": "at-real",
+        "refresh_token": "rt-real",
+        "token_type": "bearer",
+        "user": {"id": str(user_id), "email": _EMAIL, "role": "authenticated"},
+    }
+    _mock_signup_http(monkeypatch, 200, payload)
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 201
+    cuerpo = response.json()
+    assert cuerpo["status"] == "active"
+    assert cuerpo["session"]["access_token"] == "at-real"
+    assert cuerpo["user"]["id"] == str(user_id)
+
+
+def test_e2e_cuerpo_sin_usuario_identificable_es_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Un 200 sin usuario en ninguna forma sigue siendo incoherente → 503."""
+    _mock_signup_http(monkeypatch, 200, {"algo": "inesperado"})
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 503
+
+
+# --- Logging: los fallos deben EMITIRSE de verdad, no solo llamar al logger ---
+
+
+def test_configure_logging_emite_mensajes_de_la_app_por_su_stream() -> None:
+    """Prueba efectiva: un log de un logger app.* llega al stream configurado."""
+    stream = io.StringIO()
+    try:
+        configure_logging(stream=stream)
+        logging.getLogger("app.servicio.prueba").error("linea-visible-xyz")
+    finally:
+        configure_logging()  # restaura la salida estándar para el resto de tests
+
+    salida = stream.getvalue()
+    assert "linea-visible-xyz" in salida
+    assert "ERROR" in salida
+    assert "[app.servicio.prueba]" in salida
+
+
+def test_fallo_del_proveedor_emite_una_linea_con_status_y_codigo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """El 503 produce una línea REAL en la salida con status + error_code, sin secretos."""
+    _mock_sign_up_error(
+        monkeypatch,
+        auth_service.AuthProviderError(
+            "Supabase Auth rechazó la solicitud.",
+            provider_status=500,
+            provider_error_code="unexpected_failure",
+            provider_message="internal error",
+        ),
+    )
+    stream = io.StringIO()
+    try:
+        configure_logging(stream=stream)
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD}
+            )
+    finally:
+        configure_logging()
+
+    assert response.status_code == 503
+    salida = stream.getvalue()
+    assert "unexpected_failure" in salida
+    assert "status=500" in salida
+    assert _PASSWORD not in salida
+    assert "anon" not in salida.lower()
 
 
 def test_idempotencia_el_mismo_id_no_duplica_ni_revienta(monkeypatch: pytest.MonkeyPatch) -> None:

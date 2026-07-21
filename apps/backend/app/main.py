@@ -13,6 +13,7 @@ from app.api.v1 import auth, health
 from app.core.config import settings
 from app.core.database import dispose_engine
 from app.core.errors import validation_exception_handler
+from app.core.logging import configure_logging
 
 
 @asynccontextmanager
@@ -29,6 +30,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     """Crea y configura la instancia de FastAPI."""
+    # Enruta los logs de la app a stdout antes de servir peticiones (si no,
+    # los diagnósticos de los endpoints no se verían junto a los de uvicorn).
+    configure_logging()
     app = FastAPI(title=settings.app_name, version=settings.version, lifespan=lifespan)
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
     app.include_router(health.router, prefix="/v1")

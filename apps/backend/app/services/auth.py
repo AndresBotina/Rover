@@ -220,26 +220,49 @@ def _translate_error(body: dict[str, Any], status_code: int) -> AuthError:
     )
 
 
+def _extract_user(candidate: Any) -> dict[str, Any] | None:
+    """Devuelve ``candidate`` si tiene la forma mínima de un usuario de GoTrue
+    (``id`` + ``email`` como strings); si no, ``None``."""
+    if (
+        isinstance(candidate, dict)
+        and isinstance(candidate.get("id"), str)
+        and isinstance(candidate.get("email"), str)
+    ):
+        return candidate
+    return None
+
+
 def _parse_signup(body: Any) -> SignUpResult:
     """Extrae el resultado del cuerpo 2xx de ``/auth/v1/signup``.
 
-    El USUARIO es obligatorio: sin él la respuesta es incoherente y se trata
-    como ``AuthProviderError``. La SESIÓN es opcional: si vienen ambos tokens,
-    hay sesión; si no viene ninguno, es una alta con confirmación de email
-    pendiente (estado válido). Un solo token (uno sí y otro no) es una
-    respuesta incoherente, no un estado del negocio.
+    La forma de la respuesta cambia según el modo del proyecto:
+
+    - CON sesión (Confirm email desactivado): el usuario va anidado bajo
+      ``"user"``, junto a ``access_token`` / ``refresh_token``.
+    - SIN sesión (Confirm email activado): el objeto del usuario va
+      DIRECTAMENTE EN LA RAÍZ (``id``, ``email``, ``aud``, ``role``, …), sin
+      clave ``"user"`` ni tokens.
+
+    El discriminante PRIMARIO es la presencia de ``"user"``; la forma de la
+    raíz (al menos ``id`` + ``email``) es el respaldo. Si no se identifica un
+    usuario en ninguna de las dos formas, la respuesta es genuinamente
+    incoherente → ``AuthProviderError``.
+
+    La SESIÓN es opcional: ambos tokens → sesión (active); ningún token con
+    usuario válido → sin sesión (confirmación pendiente); un solo token →
+    respuesta incoherente.
     """
     if not isinstance(body, dict):
         raise AuthProviderError("Respuesta de Supabase Auth con forma inesperada.")
 
-    user = body.get("user")
-    if not isinstance(user, dict):
+    # Presencia de "user" = discriminante primario; la raíz es el respaldo. Si
+    # "user" está pero es inválido, NO se cae al respaldo: es incoherente.
+    raw_user = body.get("user") if "user" in body else body
+    user = _extract_user(raw_user)
+    if user is None:
         raise AuthProviderError("Respuesta de Supabase Auth sin usuario.")
-
-    user_id = user.get("id")
-    email = user.get("email")
-    if not isinstance(user_id, str) or not isinstance(email, str):
-        raise AuthProviderError("Respuesta de Supabase Auth con forma inesperada.")
+    user_id = user["id"]
+    email = user["email"]
 
     access_token = body.get("access_token")
     refresh_token = body.get("refresh_token")
