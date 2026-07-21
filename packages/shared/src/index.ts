@@ -7,6 +7,8 @@ export {
   isRegisterResponse,
   type AuthSession,
   type AuthUser,
+  type RegisterActive,
+  type RegisterPendingConfirmation,
   type RegisterRequest,
   type RegisterResponse,
 } from "./types/auth.ts";

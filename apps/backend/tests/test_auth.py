@@ -35,26 +35,35 @@ def _sqlite_factory_con_esquema() -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(engine, expire_on_commit=False)
 
 
-def _mock_sign_up_exitoso(
-    monkeypatch: pytest.MonkeyPatch, *, user_id: uuid.UUID | None = None
+def _mock_sign_up(
+    monkeypatch: pytest.MonkeyPatch, *, user_id: uuid.UUID | None = None, con_sesion: bool = True
 ) -> uuid.UUID:
-    """Reemplaza ``sign_up`` por un éxito fijo; devuelve el id que usará."""
+    """Reemplaza ``sign_up`` por un éxito fijo (con o sin sesión); devuelve el id."""
     resuelto_id = user_id or uuid.uuid4()
 
-    async def fake_sign_up(email: str, password: str) -> auth_service.SupabaseSession:
-        return auth_service.SupabaseSession(
-            user_id=str(resuelto_id),
-            email=email,
-            access_token="access-de-prueba",
-            refresh_token="refresh-de-prueba",
+    async def fake_sign_up(email: str, password: str) -> auth_service.SignUpResult:
+        session = (
+            auth_service.SupabaseSession(
+                access_token="access-de-prueba", refresh_token="refresh-de-prueba"
+            )
+            if con_sesion
+            else None
         )
+        return auth_service.SignUpResult(user_id=str(resuelto_id), email=email, session=session)
 
     monkeypatch.setattr(auth_service, "sign_up", fake_sign_up)
     return resuelto_id
 
 
+def _mock_sign_up_exitoso(
+    monkeypatch: pytest.MonkeyPatch, *, user_id: uuid.UUID | None = None
+) -> uuid.UUID:
+    """Alta CON sesión (confirmación de email desactivada)."""
+    return _mock_sign_up(monkeypatch, user_id=user_id, con_sesion=True)
+
+
 def _mock_sign_up_error(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
-    async def fake_sign_up(email: str, password: str) -> auth_service.SupabaseSession:
+    async def fake_sign_up(email: str, password: str) -> auth_service.SignUpResult:
         raise error
 
     monkeypatch.setattr(auth_service, "sign_up", fake_sign_up)
@@ -70,18 +79,20 @@ def _leer_perfil(factory: async_sessionmaker[AsyncSession], user_id: uuid.UUID) 
     return asyncio.run(consulta())
 
 
-def test_registro_exitoso_crea_el_perfil_y_devuelve_la_sesion_de_supabase(
+def test_registro_con_confirmacion_desactivada_devuelve_sesion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Alta CON sesión: 201, status 'active', sesión presente, perfil creado."""
     factory = _sqlite_factory_con_esquema()
     monkeypatch.setattr(database, "get_session_factory", lambda: factory)
-    user_id = _mock_sign_up_exitoso(monkeypatch)
+    user_id = _mock_sign_up(monkeypatch, con_sesion=True)
 
     with TestClient(app) as client:
         response = client.post("/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD})
 
     assert response.status_code == 201
     assert response.json() == {
+        "status": "active",
         "user": {"id": str(user_id), "email": _EMAIL},
         "session": {
             "access_token": "access-de-prueba",
@@ -90,6 +101,30 @@ def test_registro_exitoso_crea_el_perfil_y_devuelve_la_sesion_de_supabase(
         },
     }
 
+    perfil = _leer_perfil(factory, user_id)
+    assert perfil.email == _EMAIL
+    assert perfil.plan.value == "free"
+
+
+def test_registro_con_confirmacion_pendiente_no_devuelve_sesion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Alta SIN sesión: 201 (no 503), status pendiente, sin sesión, perfil creado."""
+    factory = _sqlite_factory_con_esquema()
+    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
+    user_id = _mock_sign_up(monkeypatch, con_sesion=False)
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 201
+    assert response.json() == {
+        "status": "pending_email_confirmation",
+        "user": {"id": str(user_id), "email": _EMAIL},
+        "session": None,
+    }
+
+    # El perfil se crea igual que en el caso con sesión.
     perfil = _leer_perfil(factory, user_id)
     assert perfil.email == _EMAIL
     assert perfil.plan.value == "free"
@@ -323,6 +358,57 @@ def test_translate_error_429_sin_codigo_conocido_es_rate_limited() -> None:
     exc = auth_service._translate_error({"msg": "too many requests"}, 429)
 
     assert isinstance(exc, auth_service.RateLimited)
+
+
+# --- Parseo del 2xx de signup: con sesión, sin sesión, e incoherente ---------
+
+
+def test_parse_signup_con_tokens_devuelve_sesion() -> None:
+    result = auth_service._parse_signup(
+        {
+            "user": {"id": "abc", "email": "a@b.com"},
+            "access_token": "at",
+            "refresh_token": "rt",
+        }
+    )
+
+    assert result.user_id == "abc"
+    assert result.session is not None
+    assert result.session.access_token == "at"
+
+
+def test_parse_signup_sin_tokens_es_confirmacion_pendiente() -> None:
+    """Usuario presente y sin tokens NO es error: es confirmación pendiente."""
+    result = auth_service._parse_signup({"user": {"id": "abc", "email": "a@b.com"}})
+
+    assert result.user_id == "abc"
+    assert result.session is None
+
+
+def test_parse_signup_sin_usuario_es_provider_error() -> None:
+    """Respuesta genuinamente incoherente (sin usuario) → AuthProviderError."""
+    with pytest.raises(auth_service.AuthProviderError):
+        auth_service._parse_signup({"access_token": "at", "refresh_token": "rt"})
+
+
+def test_parse_signup_con_un_solo_token_es_provider_error() -> None:
+    """Un token sí y el otro no es incoherente, no un estado del negocio."""
+    with pytest.raises(auth_service.AuthProviderError):
+        auth_service._parse_signup(
+            {"user": {"id": "abc", "email": "a@b.com"}, "access_token": "at"}
+        )
+
+
+def test_respuesta_incoherente_del_proveedor_responde_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Si sign_up lanza AuthProviderError por forma inesperada, el endpoint da 503."""
+    _mock_sign_up_error(
+        monkeypatch, auth_service.AuthProviderError("Respuesta de Supabase Auth sin usuario.")
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD})
+
+    assert response.status_code == 503
 
 
 def test_idempotencia_el_mismo_id_no_duplica_ni_revienta(monkeypatch: pytest.MonkeyPatch) -> None:

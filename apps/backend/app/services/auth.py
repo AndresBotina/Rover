@@ -85,12 +85,26 @@ class AuthProviderError(AuthError):
 
 @dataclass(frozen=True)
 class SupabaseSession:
-    """Sesión que Supabase entrega tras un alta o login exitosos."""
+    """Tokens que Supabase entrega cuando el alta o el login abren sesión."""
+
+    access_token: str
+    refresh_token: str
+
+
+@dataclass(frozen=True)
+class SignUpResult:
+    """Resultado de un alta exitosa en Supabase Auth.
+
+    El usuario SIEMPRE se crea; la sesión es opcional: con "Confirm email"
+    activado, Supabase no abre sesión hasta que el usuario confirme el correo.
+    ``session is None`` es, por tanto, un estado LEGÍTIMO (confirmación
+    pendiente), no un error — la distinción entre ambos casos se hace por la
+    presencia de la sesión, sin ambigüedad.
+    """
 
     user_id: str
     email: str
-    access_token: str
-    refresh_token: str
+    session: SupabaseSession | None
 
 
 def _require_configured() -> tuple[str, str]:
@@ -103,9 +117,11 @@ def _require_configured() -> tuple[str, str]:
     return settings.supabase_url, settings.supabase_anon_key.get_secret_value()
 
 
-async def sign_up(email: str, password: str) -> SupabaseSession:
-    """Registra un usuario en Supabase Auth (ANON key) y devuelve su sesión.
+async def sign_up(email: str, password: str) -> SignUpResult:
+    """Registra un usuario en Supabase Auth (ANON key) y devuelve el resultado.
 
+    El resultado distingue el alta CON sesión (confirmación desactivada) del
+    alta SIN sesión (confirmación de email pendiente) — ambos son éxitos.
     Traduce los errores conocidos de GoTrue a las excepciones de arriba;
     cualquier otra cosa (red caída, 5xx, forma de respuesta inesperada) se
     convierte en ``AuthProviderError`` SIN filtrar el cuerpo crudo de
@@ -143,7 +159,7 @@ async def sign_up(email: str, password: str) -> SupabaseSession:
     if body is None:
         raise AuthProviderError("Respuesta de Supabase Auth con forma inesperada.")
 
-    return _parse_session(body)
+    return _parse_signup(body)
 
 
 # error_code de GoTrue → (excepción de dominio, mensaje SEGURO para el cliente).
@@ -204,37 +220,40 @@ def _translate_error(body: dict[str, Any], status_code: int) -> AuthError:
     )
 
 
-def _parse_session(body: Any) -> SupabaseSession:
-    """Extrae la sesión del cuerpo 2xx de ``/auth/v1/signup``."""
+def _parse_signup(body: Any) -> SignUpResult:
+    """Extrae el resultado del cuerpo 2xx de ``/auth/v1/signup``.
+
+    El USUARIO es obligatorio: sin él la respuesta es incoherente y se trata
+    como ``AuthProviderError``. La SESIÓN es opcional: si vienen ambos tokens,
+    hay sesión; si no viene ninguno, es una alta con confirmación de email
+    pendiente (estado válido). Un solo token (uno sí y otro no) es una
+    respuesta incoherente, no un estado del negocio.
+    """
     if not isinstance(body, dict):
         raise AuthProviderError("Respuesta de Supabase Auth con forma inesperada.")
 
     user = body.get("user")
-    access_token = body.get("access_token")
-    refresh_token = body.get("refresh_token")
-
-    if (
-        not isinstance(user, dict)
-        or not isinstance(access_token, str)
-        or not isinstance(refresh_token, str)
-    ):
-        # Con "Confirm email" activado en el proyecto, Supabase crea el
-        # usuario pero NO abre sesión hasta que confirme el correo (el 2xx
-        # llega sin tokens). Fuera de alcance de esta HU: asume esa opción
-        # desactivada. Lo tratamos como fallo del proveedor en vez de
-        # inventar una sesión que no existe.
-        raise AuthProviderError(
-            "Supabase Auth no devolvió una sesión (¿confirmación de email activada?)."
-        )
+    if not isinstance(user, dict):
+        raise AuthProviderError("Respuesta de Supabase Auth sin usuario.")
 
     user_id = user.get("id")
     email = user.get("email")
     if not isinstance(user_id, str) or not isinstance(email, str):
         raise AuthProviderError("Respuesta de Supabase Auth con forma inesperada.")
 
-    return SupabaseSession(
-        user_id=user_id,
-        email=email,
-        access_token=access_token,
-        refresh_token=refresh_token,
-    )
+    access_token = body.get("access_token")
+    refresh_token = body.get("refresh_token")
+
+    if isinstance(access_token, str) and isinstance(refresh_token, str):
+        session: SupabaseSession | None = SupabaseSession(
+            access_token=access_token, refresh_token=refresh_token
+        )
+    elif not access_token and not refresh_token:
+        # "Confirm email" activado: usuario creado, sesión pendiente de que
+        # confirme el correo. Estado LEGÍTIMO del negocio (HU-1.3b).
+        session = None
+    else:
+        # Un token sí y el otro no: la respuesta del proveedor es incoherente.
+        raise AuthProviderError("Supabase Auth devolvió una sesión incompleta.")
+
+    return SignUpResult(user_id=user_id, email=email, session=session)

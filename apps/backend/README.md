@@ -102,6 +102,53 @@ contener credenciales); el detalle queda en los logs del servidor. Los tests
 NO tocan Supabase: sustituyen la fábrica de sesiones por SQLite async en
 memoria (ver `tests/test_database.py`), así el CI pasa sin secretos.
 
+## Autenticación (Supabase Auth)
+
+La identidad se delega en **Supabase Auth**: el backend no firma JWT propios,
+sino que valida los de Supabase. Toda la interacción con el proveedor vive en
+`app/services/auth.py` (HTTP directo contra GoTrue); ningún otro módulo habla
+con Supabase.
+
+### `POST /v1/auth/register`
+
+Registra un usuario (email + contraseña) y crea su fila de **perfil** local de
+forma idempotente. Responde **201** en dos casos, que el cliente distingue por
+el campo `status` (nunca inspeccionando si `session` es nula):
+
+- **`status: "active"`** — la confirmación de email está desactivada; la
+  respuesta incluye `session` (access + refresh token de Supabase). El cliente
+  guarda la sesión y **entra directo**.
+
+  ```json
+  {
+    "status": "active",
+    "user": { "id": "…uuid…", "email": "ana@example.com" },
+    "session": { "access_token": "…", "refresh_token": "…", "token_type": "bearer" }
+  }
+  ```
+
+- **`status: "pending_email_confirmation"`** — con "Confirm email" activado en
+  Supabase (lo deseable en producción), el usuario se crea pero **aún no hay
+  sesión**. `session` es `null`. El cliente muestra **"revisa tu correo"** y no
+  intenta iniciar sesión hasta que el usuario confirme.
+
+  ```json
+  {
+    "status": "pending_email_confirmation",
+    "user": { "id": "…uuid…", "email": "ana@example.com" },
+    "session": null
+  }
+  ```
+
+En web y móvil, usa el cliente tipado de `@rover/shared`: `RegisterResponse` es
+una unión discriminada por `status`, así que `if (res.status === "active")`
+estrecha el tipo y da acceso a `res.session` sin castings.
+
+Errores (respuesta genérica; la causa real queda en los logs del servidor):
+`409` email ya registrado · `422` email/contraseña inválidos · `429` demasiados
+intentos (rate limit de Supabase) · `503` fallo del proveedor. La contraseña
+nunca viaja en las respuestas de error (ni siquiera en las de validación).
+
 ## Migraciones (Alembic)
 
 El esquema se versiona con Alembic (`alembic.ini` + `migrations/`), configurado

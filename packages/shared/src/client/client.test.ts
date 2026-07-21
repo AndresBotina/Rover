@@ -78,7 +78,7 @@ test("un cuerpo con forma inesperada lanza ApiError (no devuelve algo mal tipado
   );
 });
 
-test("register hace POST a /v1/auth/register y parsea la sesión", async () => {
+test("register (con sesión) hace POST a /v1/auth/register y parsea la respuesta active", async () => {
   let calledUrl: string | undefined;
   let calledInit: RequestInit | undefined;
   globalThis.fetch = async (input, init) => {
@@ -86,6 +86,7 @@ test("register hace POST a /v1/auth/register y parsea la sesión", async () => {
     calledInit = init;
     return jsonResponse(
       {
+        status: "active",
         user: { id: "11111111-1111-1111-1111-111111111111", email: "a@b.com" },
         session: { access_token: "at", refresh_token: "rt", token_type: "bearer" },
       },
@@ -104,10 +105,29 @@ test("register hace POST a /v1/auth/register y parsea la sesión", async () => {
     email: "a@b.com",
     password: "una-contrasena-larga",
   });
-  assert.deepEqual(result, {
-    user: { id: "11111111-1111-1111-1111-111111111111", email: "a@b.com" },
-    session: { access_token: "at", refresh_token: "rt", token_type: "bearer" },
+  assert.equal(result.status, "active");
+  // El discriminante permite estrechar sin castings: en 'active' hay sesión.
+  assert.equal(result.status === "active" ? result.session.access_token : null, "at");
+});
+
+test("register (confirmación pendiente) devuelve la variante sin sesión", async () => {
+  globalThis.fetch = async () =>
+    jsonResponse(
+      {
+        status: "pending_email_confirmation",
+        user: { id: "11111111-1111-1111-1111-111111111111", email: "a@b.com" },
+        session: null,
+      },
+      201,
+    );
+
+  const result = await new ApiClient({ baseUrl: "http://api.test" }).register({
+    email: "a@b.com",
+    password: "una-contrasena-larga",
   });
+
+  assert.equal(result.status, "pending_email_confirmation");
+  assert.equal(result.session, null);
 });
 
 test("register con email duplicado (409) lanza ApiError con ese status", async () => {

@@ -12,7 +12,7 @@
   "scripts": {
     "lint": "eslint .",
     "type-check": "tsc --noEmit",
-    "test": "node --test src/client/client.test.ts"
+    "test": "node --test 'src/**/*.test.ts'"
   },
   "devDependencies": {
     "typescript": "^5.7.2"
