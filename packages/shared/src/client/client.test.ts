@@ -213,6 +213,60 @@ test("getMe con token inválido (401) lanza ApiError con status 401", async () =
   );
 });
 
+const PROFILE = {
+  id: "11111111-1111-1111-1111-111111111111",
+  email: "a@b.com",
+  plan: "free",
+  preferences: { idioma: "es" },
+  created_at: "2026-01-01T00:00:00Z",
+  updated_at: "2026-01-02T00:00:00Z",
+};
+
+test("getProfile envía el token y parsea el perfil completo", async () => {
+  let calledUrl: string | undefined;
+  let calledHeaders: Headers | undefined;
+  globalThis.fetch = async (input, init) => {
+    calledUrl = String(input);
+    calledHeaders = new Headers(init?.headers);
+    return jsonResponse(PROFILE, 200);
+  };
+
+  const profile = await new ApiClient({ baseUrl: "http://api.test" }).getProfile("tok");
+
+  assert.equal(calledUrl, "http://api.test/v1/users/me");
+  assert.equal(calledHeaders?.get("Authorization"), "Bearer tok");
+  assert.deepEqual(profile, PROFILE);
+});
+
+test("updateProfile hace PATCH con el token y el cuerpo, y parsea el perfil", async () => {
+  let calledUrl: string | undefined;
+  let calledInit: RequestInit | undefined;
+  globalThis.fetch = async (input, init) => {
+    calledUrl = String(input);
+    calledInit = init;
+    return jsonResponse({ ...PROFILE, preferences: { idioma: "en" } }, 200);
+  };
+
+  const profile = await new ApiClient({ baseUrl: "http://api.test" }).updateProfile("tok", {
+    preferences: { idioma: "en" },
+  });
+
+  assert.equal(calledUrl, "http://api.test/v1/users/me");
+  assert.equal(calledInit?.method, "PATCH");
+  assert.equal(new Headers(calledInit?.headers).get("Authorization"), "Bearer tok");
+  assert.deepEqual(JSON.parse(String(calledInit?.body)), { preferences: { idioma: "en" } });
+  assert.deepEqual(profile.preferences, { idioma: "en" });
+});
+
+test("getProfile con perfil de forma inesperada lanza ApiError", async () => {
+  globalThis.fetch = async () => jsonResponse({ id: "x" }, 200);
+
+  await assert.rejects(
+    new ApiClient({ baseUrl: "http://api.test" }).getProfile("tok"),
+    (error: unknown) => error instanceof ApiError && error.status === 200,
+  );
+});
+
 test("register con email duplicado (409) lanza ApiError con ese status", async () => {
   globalThis.fetch = async () =>
     jsonResponse({ detail: "Ya existe una cuenta con ese email." }, 409);

@@ -215,6 +215,37 @@ revelar cuál falló; el motivo real solo va al **log** del servidor. Un problem
 de infraestructura (JWKS o base de datos no disponibles) responde **`503`**. En
 `@rover/shared`, `ApiClient.getMe(accessToken)` devuelve `MeResponse`.
 
+## Perfil de usuario (`/v1/users/me`)
+
+Router por dominio (`users`, aparte de `auth`), protegido por el mismo
+middleware. El id del usuario **siempre** sale del token, nunca del cuerpo ni
+de la URL (por eso es `/me`, no `/users/{id}`): un usuario no puede leer ni
+tocar el perfil de otro.
+
+- **`GET /v1/users/me`** → perfil completo: `id`, `email`, `plan`,
+  `preferences` y timestamps.
+- **`PATCH /v1/users/me`** → actualiza **solo `preferences`**.
+  - **Merge superficial** (no reemplazo): las claves de primer nivel enviadas
+    se fijan, las no mencionadas se conservan. Elegido porque web y móvil
+    envían actualizaciones parciales; con reemplazo tendrían que
+    leer-modificar-escribir el objeto entero (y dos clientes se pisarían).
+  - `preferences` debe ser un **objeto** JSON (un array/número/string → `422`)
+    y su tamaño se acota (**8 KB** del JSON resultante → `422`), para no
+    guardar payloads enormes.
+  - **Solo `preferences` es editable.** Un intento de cambiar `plan`, `id` o
+    `email` responde **`422`** (campos desconocidos rechazados, no ignorados):
+    exponer campos de más en un PATCH es una vía clásica de escalada de
+    privilegios (ascenderse a un plan de pago). `plan`/`id`/`email` los
+    gobiernan Supabase y la monetización.
+
+En `@rover/shared`: `getProfile(accessToken)` y `updateProfile(accessToken,
+{ preferences })`; el tipo `ProfileUpdate` impide, a nivel de tipos, enviar
+campos no editables.
+
+> **Nota (HU-1.9):** este router por dominio y `GET /v1/auth/me` (verificación
+> del middleware, que devuelve solo la identidad mínima) conviven; reconciliar
+> en la HU-1.9 si `/auth/me` queda redundante con `/users/me`.
+
 ## Migraciones (Alembic)
 
 El esquema se versiona con Alembic (`alembic.ini` + `migrations/`), configurado

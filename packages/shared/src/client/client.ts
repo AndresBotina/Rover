@@ -17,6 +17,7 @@ import {
   type RegisterRequest,
   type RegisterResponse,
 } from "../types/auth.ts";
+import { isProfile, type Profile, type ProfileUpdate } from "../types/profile.ts";
 import {
   isDbHealthResponse,
   isHealthResponse,
@@ -120,6 +121,36 @@ export class ApiClient {
     }
     return data;
   }
+
+  /**
+   * GET /v1/users/me — perfil completo del usuario (id, email, plan,
+   * preferences, timestamps). Requiere el access token en Authorization; sin
+   * él o con token inválido responde 401 y esto lanza ApiError.
+   */
+  async getProfile(accessToken: string): Promise<Profile> {
+    const url = `${this.baseUrl}/v1/users/me`;
+    const { status, data } = await getJson(url, { Authorization: `Bearer ${accessToken}` });
+    if (!isProfile(data)) {
+      throw new ApiError(`Respuesta de ${url} con forma inesperada`, { url, status });
+    }
+    return data;
+  }
+
+  /**
+   * PATCH /v1/users/me — actualiza SOLO `preferences` (merge superficial en el
+   * backend) y devuelve el perfil. El tipo `ProfileUpdate` impide enviar
+   * `plan`/`email`/`id`; el backend responde 422 si aun así llegan.
+   */
+  async updateProfile(accessToken: string, update: ProfileUpdate): Promise<Profile> {
+    const url = `${this.baseUrl}/v1/users/me`;
+    const { status, data } = await patchJson(url, update, {
+      Authorization: `Bearer ${accessToken}`,
+    });
+    if (!isProfile(data)) {
+      throw new ApiError(`Respuesta de ${url} con forma inesperada`, { url, status });
+    }
+    return data;
+  }
 }
 
 /** GET de un JSON con errores normalizados a ApiError. Devuelve el cuerpo SIN tipar. */
@@ -147,13 +178,18 @@ async function getJson(
   return { status: response.status, data };
 }
 
-/** POST de un JSON con errores normalizados a ApiError. Devuelve el cuerpo SIN tipar. */
-async function postJson(url: string, body: unknown): Promise<{ status: number; data: unknown }> {
+/** Envía un cuerpo JSON con el método dado; errores normalizados a ApiError. */
+async function sendJson(
+  method: "POST" | "PATCH",
+  url: string,
+  body: unknown,
+  headers: Record<string, string> = {},
+): Promise<{ status: number; data: unknown }> {
   let response: Response;
   try {
     response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      method,
+      headers: { "Content-Type": "application/json", Accept: "application/json", ...headers },
       body: JSON.stringify(body),
     });
   } catch (cause) {
@@ -171,4 +207,18 @@ async function postJson(url: string, body: unknown): Promise<{ status: number; d
     throw new ApiError(`Cuerpo no-JSON en ${url}`, { url, status: response.status, cause });
   }
   return { status: response.status, data };
+}
+
+/** POST de un JSON. Devuelve el cuerpo SIN tipar. */
+function postJson(url: string, body: unknown): Promise<{ status: number; data: unknown }> {
+  return sendJson("POST", url, body);
+}
+
+/** PATCH de un JSON (con headers, p. ej. Authorization). Devuelve el cuerpo SIN tipar. */
+function patchJson(
+  url: string,
+  body: unknown,
+  headers: Record<string, string> = {},
+): Promise<{ status: number; data: unknown }> {
+  return sendJson("PATCH", url, body, headers);
 }

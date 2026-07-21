@@ -19,6 +19,8 @@ export {
   type RegisterResponse,
 } from "./types/auth.ts";
 
+export { isProfile, type Profile, type ProfileUpdate } from "./types/profile.ts";
+
 export {
   isDbHealthResponse,
   isHealthResponse,
