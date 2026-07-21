@@ -206,20 +206,27 @@ Una HU está **Done** solo cuando:
 
 ---
 
-### HU-1.3b — Registro con confirmación de email pendiente
+### ✅ HU-1.3b — Registro con confirmación de email pendiente
 *Como* usuario que se registra, *quiero* saber que debo confirmar mi correo, *para* entender por qué aún no tengo sesión iniciada.
 
-Contexto: con **"Confirm email" activado** en Supabase (lo deseable en producción), el alta crea el usuario pero **no** devuelve sesión. Hoy el endpoint traduce esa ausencia a un `503` de "fallo del proveedor", que es incorrecto: es un estado legítimo del negocio, no un error de infraestructura.
+Contexto: con **"Confirm email" activado** en Supabase (lo deseable en producción), el alta crea el usuario pero **no** devuelve sesión. Antes el endpoint traducía esa ausencia a un `503` de "fallo del proveedor", que es incorrecto: es un estado legítimo del negocio, no un error de infraestructura.
 
-**Criterios de aceptación:**
-- Con la confirmación de email activada, `POST /v1/auth/register` responde `201` (no `503`) con el usuario creado, **sin sesión**, y con un indicador explícito de que la confirmación está pendiente.
-- La respuesta permite a web y móvil distinguir **sin ambigüedad** los dos casos: registro con sesión (confirmación desactivada) y registro pendiente de confirmación.
-- El perfil local se crea igualmente de forma **idempotente** en ambos casos.
-- El caso de rate limit de envío de correos (`over_email_send_rate_limit`) sigue devolviendo `429`.
-- El cliente compartido (`@rover/shared`) refleja el nuevo contrato de respuesta.
-- Tests sin Supabase real que cubran ambos casos (con y sin sesión).
+**Criterios de aceptación (como se construyó):**
+- `POST /v1/auth/register` responde `201` en **ambos modos** de Supabase, con un contrato de **unión discriminada** por un campo **`status` tipado** (no un booleano): `active` (con sesión) y `pending_email_confirmation` (`session` es `null`). El literal habilita **narrowing en TypeScript sin castings** y es extensible a futuros estados.
+- El `RegisterResponse` valida **en el borde** con un `model_validator` que rechaza combinaciones incoherentes (`active` sin sesión, o pendiente con sesión): el cliente **nunca** recibe algo ambiguo.
+- El servicio distingue las **dos formas** de respuesta de GoTrue, verificadas contra el proveedor real: con sesión, el usuario viene **anidado** bajo la clave `"user"`; sin sesión (confirmación activada), el usuario viene **directamente en la raíz** (`id`, `email`, `confirmation_sent_at`, …). La **presencia de `"user"` es el discriminante primario**; la raíz es el respaldo. Si `"user"` existe pero es inválido **no** se cae al respaldo (es incoherente, no otro caso).
+- Reglas de sesión: ambos tokens → `active`; ningún token con usuario válido → `pending`; un solo token → `AuthProviderError` (`503`). Sin usuario identificable → `AuthProviderError`.
+- El **perfil local** se crea de forma **idempotente** en ambos caminos, con el mismo tratamiento de fallos (no rompe el registro, se loguea).
+- `over_email_send_rate_limit` sigue devolviendo `429`.
+- `@rover/shared` expone `RegisterResponse` como **unión discriminada**, con **type guard de runtime** que valida ambas formas y rechaza incoherencias.
+- Flujo **documentado** para web/móvil en el README del backend (qué mostrar en cada `status`).
+- **Verificado end-to-end** contra Supabase real en ambos modos.
 
-**Tareas técnicas:** ajustar el parseo de la respuesta de signup para tratar la ausencia de sesión como estado válido · modelo de respuesta que distinga ambos casos · actualizar el cliente compartido · tests de ambos caminos · documentar el flujo para los clientes.
+**Tareas técnicas (como se hizo):** `_parse_signup` soporta las dos formas de GoTrue · `SignUpResult` (usuario siempre, sesión opcional) · `RegisterResponse` como unión discriminada con validador de coherencia · cliente compartido con unión + type guard · `configure_logging` para ver los diagnósticos (ver nota 2) · tests de ambos caminos con httpx mockeado · flujo documentado en el README.
+
+> **Aprendizaje 1 — los mocks valen lo que vale el conocimiento del sistema que imitan.** La forma de la respuesta de GoTrue **cambia según el modo de confirmación**. Los tests iniciales pasaban porque estaban escritos contra una respuesta *imaginada* (usuario siempre bajo `"user"`); solo la verificación manual contra el proveedor real reveló la forma con el **usuario en la raíz**. El mock daba una falsa sensación de cobertura.
+>
+> **Aprendizaje 2 — el logging de la app no era visible.** uvicorn configura solo sus propios loggers y deja el root sin handler, así que los loggers `app.*` dependían del `lastResort` de `logging` (frágil: solo `WARNING`+, sin formato, y desaparece si cualquier librería añade un handler en la cadena). Se resolvió con `app/core/logging.py` (`configure_logging`, llamado desde `create_app`), que engancha un `StreamHandler` a **stdout** en el logger raíz `app`. Esto **adelanta parte de la HU-1.12** (ver esa HU).
 
 ---
 
@@ -340,6 +347,8 @@ Contexto: con **"Confirm email" activado** en Supabase (lo deseable en producci�
 - No se loguean secretos ni datos sensibles (contraseñas, tokens).
 
 **Tareas técnicas:** configurar logging estructurado · middleware de request id · correlación con el manejador de errores · revisar que no se filtren secretos.
+
+> **Ya adelantado (HU-1.3b):** el **logging básico ya está resuelto** — `app/core/logging.py` (`configure_logging`, llamado desde `create_app`) enruta los loggers `app.*` a **stdout** con formato consistente y sin filtrar secretos, así que los diagnósticos de la app son visibles junto a los de uvicorn. **Pendiente de esta HU:** el logging **estructurado** (JSON), el **request id** y la **correlación** entre la línea de entrada/salida de cada request y el id de error de la HU-1.8.
 
 ---
 
