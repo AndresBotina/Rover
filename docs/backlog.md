@@ -247,7 +247,7 @@ Contexto: con **"Confirm email" activado** en Supabase (lo deseable en producci�
 
 **Tareas técnicas (como se hizo):** `_gotrue_post` + `_parse_user_and_session` compartidos con el alta · `sign_in` + `_parse_signin` (sesión obligatoria) · excepciones `InvalidCredentials` / `EmailNotConfirmed` mapeadas por `error_code` · endpoint con mapeo `401/403/429/503` · cliente compartido con tipos + método + type guard · tests con httpx/servicio mockeados · flujo documentado en el README.
 
-> **Deuda técnica (infra de tests):** la suite emite 4 warnings de *teardown* de aiosqlite (engines de SQLite async que los tests de registro no cierran; solo afloran al correr el **conjunto completo**, por timing del GC). **No son fallos** y el CI no los trata como error, pero conviene una limpieza más adelante: cerrar los engines explícitamente en los fixtures/ayudantes de test (p. ej. un fixture que haga `engine.dispose()`). No es urgente ni bloquea nada.
+> **Deuda técnica (infra de tests):** los tests de **registro/login** dejan engines de SQLite async sin cerrar, lo que emite warnings de *teardown* de aiosqlite al correr el **conjunto completo** (por timing del GC). **No son fallos** y el CI no los trata como error. La **HU-1.6 ya resolvió el patrón** en sus propios tests (SQLite en **fichero temporal**, no `:memory:`, con `engine.dispose()` en el teardown del fixture — lo que además evita el `no such table` que daba `StaticPool` bajo carga). Queda **pendiente aplicar el mismo patrón** a los tests de registro/login, que no se tocaron. No es urgente ni bloquea nada.
 
 ---
 
@@ -263,16 +263,24 @@ Contexto: con **"Confirm email" activado** en Supabase (lo deseable en producci�
 
 ---
 
-### HU-1.6 — Middleware de autenticación (validación del JWT de Supabase)
+### ✅ HU-1.6 — Middleware de autenticación (validación del JWT de Supabase)
 *Como* sistema, *quiero* proteger rutas que requieren sesión, *para* que solo usuarios autenticados accedan a recursos privados.
 
-**Criterios de aceptación:**
-- Existe una dependencia `get_current_user` que **valida el JWT emitido por Supabase** (verificación de firma y expiración) y resuelve el **perfil local** a partir del id que trae el token.
-- Rutas protegidas sin token o con token inválido/expirado responden `401`.
-- El `user_id` y el plan quedan disponibles en el contexto del request.
-- Tests con tokens de prueba, sin depender de Supabase real.
+**Criterios de aceptación (como se construyó):**
+- Validación **local** del JWT de Supabase (no remota): se evita una llamada de red al proveedor en el camino crítico de cada petición, y la dependencia dura que eso implicaría.
+- Librería **PyJWT** (extra `crypto`): soporta ES256 y JWKS, y lanza una excepción distinta por cada motivo de fallo (lo que permite loguear la causa real). El fetch **async** del JWKS y su **caché** se controlan en el proyecto (httpx), no con el cliente síncrono de la librería.
+- **Caché del JWKS** en memoria con **TTL de 10 min**; ante un `kid` desconocido (rotación de claves) se fuerza un refresco, con **cooldown** mínimo entre refrescos forzados para que una lluvia de tokens con `kid` inválido no golpee el endpoint del JWKS en cada petición.
+- Se verifican **firma** (ES256, clave seleccionada por `kid`), **expiración**, **issuer** (`{SUPABASE_URL}/auth/v1`) y **audiencia** (`"authenticated"`); `require` de `exp` y `sub`.
+- Los fallos del token se traducen a `TokenError` con motivo **preciso** (`expired`, `invalid_signature`, `invalid_issuer`, `invalid_audience`, `unknown_kid`, `malformed`, `invalid_scheme`…). Un fallo al obtener el JWKS es `JWKSUnavailable` → **`503`, no `401`**: es un fallo de infraestructura propio, no un problema con las credenciales del cliente.
+- `get_current_user` (`app/api/deps.py`) extrae el Bearer, valida el token y resuelve el **perfil local**; si no existe, lo **crea de forma perezosa e idempotente**. Este es el **único punto de materialización** del perfil (registro y login lo delegan aquí a propósito). La carrera se maneja releyendo la fila tras un `IntegrityError`.
+- Deja `id`, `email` y `plan` en el contexto del request (`CurrentUser`).
+- Todos los fallos de autenticación → **`401` uniforme** (mismo cuerpo, `WWW-Authenticate: Bearer`); el motivo real solo va al log. Un `503` por fallo de base de datos **no** loguea el error crudo (podría contener la URL con credenciales).
+- Ruta protegida de verificación **`GET /v1/auth/me`** (los endpoints completos de perfil siguen siendo la HU-1.10b).
+- `@rover/shared` actualizado con tipo (`MeResponse`), método (`getMe`) y type guard; envío **tipado** del header `Authorization`.
+- Tests que firman tokens ES256 propios e inyectan el JWKS (sin credenciales reales): cubren los motivos de fallo, el **cuerpo idéntico** del `401`, que el motivo **sí** aparece en el log y el token **no**, la creación perezosa y la carrera.
+- **Verificado end-to-end** contra Supabase real: `200` con identidad resuelta; `401` uniforme sin header, con esquema incorrecto y con firma alterada, con el motivo real visible solo en los logs.
 
-**Tareas técnicas:** dependency de auth (verificación de firma y expiración del JWT de Supabase) · resolución del perfil local · manejo de token expirado/inválido · tests con tokens de prueba · marcar rutas protegidas.
+**Tareas técnicas (como se hizo):** `app/core/security.py` (PyJWT + JWKS async cacheado, verificación de firma/exp/iss/aud, `TokenError`/`JWKSUnavailable`) · `app/api/deps.py` (`get_current_user` + creación perezosa idempotente del perfil + `CurrentUser`) · endpoint `GET /v1/auth/me` · cliente compartido (tipo + `getMe` + type guard) · tests con tokens ES256 de prueba y JWKS inyectado.
 
 ---
 
