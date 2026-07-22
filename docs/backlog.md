@@ -275,8 +275,8 @@ Contexto: con **"Confirm email" activado** en Supabase (lo deseable en producci�
 - `get_current_user` (`app/api/deps.py`) extrae el Bearer, valida el token y resuelve el **perfil local**; si no existe, lo **crea de forma perezosa e idempotente**. Este es el **único punto de materialización** del perfil (registro y login lo delegan aquí a propósito). La carrera se maneja releyendo la fila tras un `IntegrityError`.
 - Deja `id`, `email` y `plan` en el contexto del request (`CurrentUser`).
 - Todos los fallos de autenticación → **`401` uniforme** (mismo cuerpo, `WWW-Authenticate: Bearer`); el motivo real solo va al log. Un `503` por fallo de base de datos **no** loguea el error crudo (podría contener la URL con credenciales).
-- Ruta protegida de verificación **`GET /v1/auth/me`** (los endpoints completos de perfil siguen siendo la HU-1.10b).
-- `@rover/shared` actualizado con tipo (`MeResponse`), método (`getMe`) y type guard; envío **tipado** del header `Authorization`.
+- Ruta protegida de verificación **`GET /v1/auth/me`** (los endpoints completos de perfil siguen siendo la HU-1.10b). *(Retirada en la HU-1.9: era andamio y se consolidó en `GET /v1/users/me`; los tests del middleware se ejercen ahora contra esa ruta.)*
+- `@rover/shared` actualizado con tipo (`MeResponse`), método (`getMe`) y type guard; envío **tipado** del header `Authorization`. *(También retirados en la HU-1.9; los sustituye `getProfile`/`Profile`.)*
 - Tests que firman tokens ES256 propios e inyectan el JWKS (sin credenciales reales): cubren los motivos de fallo, el **cuerpo idéntico** del `401`, que el motivo **sí** aparece en el log y el token **no**, la creación perezosa y la carrera.
 - **Verificado end-to-end** contra Supabase real: `200` con identidad resuelta; `401` uniforme sin header, con esquema incorrecto y con firma alterada, con el motivo real visible solo en los logs.
 
@@ -312,22 +312,26 @@ Contexto: con **"Confirm email" activado** en Supabase (lo deseable en producci�
 
 ---
 
-### HU-1.9 — Estructura de API versionada `/v1`
+### ✅ HU-1.9 — Estructura de API versionada `/v1` y documentación OpenAPI
 *Como* equipo, *quiero* versionar la API desde el inicio, *para* poder evolucionar sin romper clientes existentes (web/móvil).
 
-**Criterios de aceptación:**
-- Todos los endpoints cuelgan de `/v1`.
-- La documentación automática (OpenAPI/Swagger) está disponible y refleja `/v1`.
-- La estructura de routers está organizada por dominio (`auth`, `users`, …).
-- El cliente compartido apunta a `/v1`.
+> Dos criterios ya se cumplían al llegar aquí: todos los endpoints cuelgan de `/v1` desde la HU-0.4 y el cliente compartido apunta a `/v1` desde la HU-0.7. Esta HU consolidó la **organización de routers** (que la HU-1.10b había arrancado con el router `users`) y añadió la **documentación**.
 
-**Tareas técnicas:** router raíz `/v1` · organización de routers · habilitar docs OpenAPI · wiring del cliente compartido.
+**Criterios de aceptación (como se construyó):**
+- **Un único agregador** (`app/api/v1/router.py`) aplica el prefijo `/v1` en **un solo sitio** e incluye los routers de dominio; `main.py` lo monta con **un solo `include_router`**. Los routers de dominio (`health`, `auth`, `users`) declaran **solo su dominio, nunca la versión**. Antes el prefijo `/v1` se repetía en cada `include_router` de `main.py`: publicar una `/v2` (o mover la versión a un header) obligaba a tocar cada línea sin olvidar ninguna. Ahora es **añadir otro agregador**, sin tocar los routers.
+- **Tags de OpenAPI por dominio** (`health`, `auth`, `users`) **con descripción**, declarados junto al agregador —donde ya se decide la forma de `/v1`— y en el orden en que aparecen las secciones en `/docs`.
+- **Metadatos de la app:** título `"Rover API"`, **versión desde `app.__version__`** (vía `settings`: una sola fuente de verdad) y descripción de portada.
+- `summary` + `description` en **cada operación**, **ejemplos** en los cuerpos de entrada y salida (`json_schema_extra` de Pydantic v2) y **códigos de respuesta documentados** (`401`, `403`, `409`, `422`, `429`, `503`) que describen **cuándo** ocurren, nunca el motivo concreto de un rechazo de auth: el `401` sigue siendo uniforme y la documentación no insinúa lo contrario. Las respuestas comunes a toda ruta protegida se comparten en `deps.AUTH_RESPONSES` en vez de repetirse.
+- **`/docs`, `/redoc` y `/openapi.json` desactivables**, decididos por `Settings.docs_enabled`: **activas** en `local`/`test`, **404** en `production`, y `ROVER_ENABLE_DOCS` (`true`/`false`) **fuerza** cualquiera de los dos en cualquier ambiente. Se apagan con **`openapi_url=None`**, que desmonta también el **esquema crudo** y no solo la UI (apagar la UI dejando `/openapi.json` no oculta nada). Criterio: el esquema es el **mapa completo** de la API —rutas, cuerpos, errores— y publicarlo regala trabajo de reconocimiento a quien busque superficie de ataque, mientras los clientes propios consumen `@rover/shared`, no la UI. El default es **por ambiente** para que no se pueda *olvidar* apagarlas: exponerlas en producción exige pedirlo explícitamente.
+- **Esquema Bearer reflejado en OpenAPI** (`deps.bearer_scheme`, `HTTPBearer` con `auto_error=False`): las rutas protegidas salen marcadas con candado y `/docs` ofrece **Authorize**. Es **solo representación**: el token se sigue leyendo del header crudo con código propio, porque `auto_error=True` respondería con el cuerpo de la librería (rompiendo el `401` uniforme y saltándose el log) y `auto_error=False` colapsa "sin header" e "esquema inválido" en el mismo `None`, perdiendo el **motivo preciso** en el log. Leerlo del `Request` evita además que `Authorization` aparezca duplicado en la UI como parámetro suelto.
+- Tests de **contrato** (`tests/test_openapi.py`): todas las rutas bajo `/v1`, cada operación con tag de dominio + `summary`/`description`, tags descritos, **solo** las rutas protegidas declaran seguridad, ejemplos presentes, y docs **activas en local / 404 en producción** (y la variable dedicada mandando sobre el ambiente).
+- **Verificado en `/docs`:** endpoints agrupados por sección, rutas protegidas marcadas y **Authorize** funcional enviando el token.
 
-> **Nota (estado real):** dos criterios YA se cumplen desde la Épica 0 — todos los endpoints cuelgan de `/v1` (HU-0.4) y el cliente compartido apunta a `/v1` (HU-0.7). Lo **pendiente** de esta HU es: organizar los routers por dominio (`auth`, `users`, …) y habilitar/documentar las docs OpenAPI. No duplicar el trabajo ya hecho.
+**Tareas técnicas (como se hizo):** `app/api/v1/router.py` (agregador `/v1` + `TAGS_METADATA`) · `main.py` con metadatos, `openapi_tags` y URLs de docs condicionales · `Settings.enable_docs` + propiedad `docs_enabled` · `deps.bearer_scheme` + `AUTH_RESPONSES` · `summary`/`description`/`responses`/ejemplos en `health`, `auth` y `users` · `tests/test_openapi.py` · README (organización de la API, tabla de la desactivación de docs) y `.env.example`.
+
+> **Decisión: `GET /v1/auth/me` se ELIMINÓ, consolidado en `GET /v1/users/me`.** La premisa de "check ligero de identidad" que traía la HU-1.10b era **falsa en la implementación**: `/v1/auth/me` hacía la **misma** validación del JWT y la **misma** lectura de `user_profiles` que `/v1/users/me` (el middleware carga esa fila igual, porque ahí materializa el perfil), y solo serializaba menos campos. No ahorraba red, ni consulta, ni JWKS. Lo que sí costaba: **dos contratos** que mantener sincronizados, **dos métodos** en `@rover/shared` y una duda para el cliente ("¿cuál llamo?") justo antes de las Épicas 3 y 4. Había nacido como **andamio** para verificar el middleware cuando aún no existían los endpoints de perfil; con el edificio en pie, el andamio se retira.
 >
-> **Ya iniciado (HU-1.10b):** la **organización por dominio ya arrancó** — el router `users` se creó aparte (`app/api/v1/users.py`, montado bajo `/v1`) en vez de colgar los endpoints de perfil del router de `auth`. **Pendiente de esta HU:** consolidar el resto de routers con el mismo criterio y habilitar/documentar OpenAPI.
->
-> **A decidir aquí:** `GET /v1/auth/me` (check ligero de identidad del middleware: `id`, `email`, `plan`) y `GET /v1/users/me` (perfil completo) tienen **solape parcial**. Conviven a propósito porque responden a preguntas distintas; en esta HU se decide si se consolidan en uno solo o se mantienen separados y documentados como tales.
+> Consecuencias: `getProfile()` responde ahora "¿quién soy?" leyendo `id`/`email`/`plan`; se eliminaron `getMe`, `MeResponse` e `isMeResponse` de `@rover/shared` (los cubre `Profile`/`isProfile`, un superconjunto); los tests del middleware pasaron a ejercerse contra `/v1/users/me` —una ruta protegida **real**, no una que existía para ser probada— en `tests/test_auth_middleware.py`; y un test verifica que `/v1/auth/me` **no está en el esquema** y responde `404`.
 
 ---
 
@@ -365,7 +369,7 @@ La HU original juntaba **modelo + migración** y **endpoints**. Se dividió para
 - **Semántica del PATCH: merge superficial** (`{**actuales, **entrantes}`), **no** reemplazo total. Razón: web y móvil envían actualizaciones **parciales**; con reemplazo tendrían que hacer read-modify-write del objeto entero y dos clientes concurrentes se pisarían. Es predecible: las claves de primer nivel enviadas se fijan y los objetos anidados se **reemplazan en su clave** (sin merge profundo, para evitar ambigüedad). Test explícito de la semántica.
 - **Límite de tamaño:** se acota el **resultado del merge** (lo que se guarda), no solo el payload entrante, a **8 KB** de JSON serializado → `422` si se excede. Acotar el resultado evita el crecimiento **acumulado** entre PATCHes sucesivos. Que `preferences` sea un **objeto** (y no array, número o string) lo garantiza el tipo `dict[str, Any]` → `422` por tipo.
 - `@rover/shared` actualizado: tipos del perfil y métodos `getProfile` / `updateProfile` con **type guards**; el tipo de actualización impide **a nivel de tipos** enviar campos no editables (`plan`, `email`, `id`).
-- **`GET /v1/auth/me` se mantiene:** es el check **ligero de identidad** (`id`, `email`, `plan`) del middleware, distinto del **perfil completo** de `/v1/users/me`. Hay **solape parcial anotado** para decidir en la HU-1.9 si se consolidan.
+- **`GET /v1/auth/me` convivió al principio** como check de identidad del middleware (`id`, `email`, `plan`), con el solape anotado para resolverlo en la HU-1.9. **Ya resuelto: se eliminó** y quedó consolidado en `/v1/users/me`, que es el único endpoint de identidad y perfil (ver HU-1.9: el supuesto "check ligero" hacía exactamente el mismo trabajo).
 - **Verificado end-to-end** contra Supabase real: lectura del perfil, merge (el idioma se conserva al cambiar solo la moneda) y **escalada rechazada** (`PATCH plan=pro` → `422`, con el plan intacto en `free`).
 
 **Tareas técnicas (como se hizo):** router `app/api/v1/users.py` por dominio · schemas `ProfileResponse` / `ProfileUpdateRequest` (`extra="forbid"`) · merge superficial + tope de 8 KB del resultado · cliente compartido (tipos + `getProfile`/`updateProfile` + type guard) · tests de lectura, persistencia, merge, campos desconocidos, tipo, tope de tamaño, `updated_at` y aislamiento entre usuarios · helpers de firma de tokens extraídos a `tests/auth_utils.py`.
