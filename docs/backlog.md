@@ -196,7 +196,7 @@ Una HU está **Done** solo cuando:
 - Los errores del proveedor se traducen a excepciones de dominio (`EmailAlreadyExists`, `WeakPassword`, `InvalidEmail`, `RateLimited`, `AuthProviderError`) por el campo **`error_code` estable** de Supabase + el status HTTP, **nunca** buscando palabras en el texto del mensaje. Mapeo a HTTP: `409` / `422` / `429` / `503`. Un `error_code` desconocido cae en `AuthProviderError`, conservando el código original solo para logs.
 - El **perfil local** se crea de forma **idempotente** tras el alta y su fallo **no rompe el registro** (se materializa después, HU-1.6). La sesión de base se gestiona a mano en vez de con `Depends(get_db)`, para que un fallo de la dependencia no aborte el request antes de poder contenerlo; un `IntegrityError` por id repetido se trata como idempotencia esperada, no como error.
 - Los fallos quedan **logueados** en servidor con status + `error_code` + mensaje del proveedor (warning para esperables, error para inesperados), **sin contraseñas ni llaves**; la respuesta al cliente sigue siendo genérica.
-- La contraseña **no aparece** en las respuestas de error de validación (handler propio en `app/core/errors.py` que elimina el campo `input` de errores sobre campos sensibles; se verificó que `SecretStr` por sí solo no lo evitaba).
+- La contraseña **no aparece** en las respuestas de error de validación (handler propio en `app/core/errors.py` que elimina el campo `input` de errores sobre campos sensibles; se verificó que `SecretStr` por sí solo no lo evitaba). *(El saneo sigue igual desde la HU-1.8; lo que cambió es dónde viaja: bajo `details.errors` del formato único.)*
 - Cliente compartido (`@rover/shared`) actualizado con los tipos y el método del registro. Tests que **no** dependen de Supabase real (cliente mockeado): caso feliz, `409`, `422`, `429`, `503`, fallo del perfil sin romper el registro e idempotencia.
 - **Verificado end-to-end** contra Supabase real: `201` con sesión, usuario en `auth.users` y fila en `user_profiles` con el mismo id y `plan='free'`.
 
@@ -299,16 +299,23 @@ Contexto: con **"Confirm email" activado** en Supabase (lo deseable en producci�
 
 ---
 
-### HU-1.8 — Manejo centralizado de errores
+### ✅ HU-1.8 — Manejo centralizado de errores
 *Como* consumidor de la API, *quiero* errores consistentes y predecibles, *para* manejarlos bien en web y móvil.
 
-**Criterios de aceptación:**
-- Existe un formato único de error (código, mensaje, detalle opcional).
-- Excepciones no controladas devuelven `500` con un id de error para rastrear en logs, sin filtrar stack traces al cliente.
-- Errores de validación (`422`), auth (`401/403`), no encontrado (`404`) y rate limit (`429`) siguen el formato único.
-- Test verifica el formato en al menos dos tipos de error.
+**Criterios de aceptación (como se construyó):**
+- **Formato único** para **toda** respuesta no-2xx, con envoltorio `error`: `code` (código estable legible por máquina, de un catálogo propio `ErrorCode`), `message` (texto presentable al usuario, y respaldo cuando el cliente no conoce el código), `details` (objeto extensible; en un `422` lleva `errors` campo a campo) y `error_id` (solo en los `500`). El **envoltorio** permite a web/móvil distinguir "esto es un error" de "esto es un dato" sin mirar el status ni adivinar por las claves: **un único type guard** para toda la API.
+- **`code`, no solo el status.** El status agrupa demasiado: un `422` cubre contraseña débil, email inválido, campo desconocido y payload demasiado grande. El cliente ramifica por `code`, que es **estable** frente a reescribir o traducir el `message`. Los `error_code` **crudos de Supabase NO se exponen**: se traducen al catálogo propio, igual que ya se hacía con las excepciones — así el acoplamiento al proveedor sigue contenido en `services/auth.py` y no se filtra a los clientes.
+- **Los contratos previos quedaron DENTRO del formato, no como excepciones a él:** el `403` de email sin confirmar es `code: "email_not_confirmed"` (deja de ser un `detail.reason` especial); el **`401` sigue siendo uniforme** como `code: "unauthenticated"` —mismo cuerpo y mismo `WWW-Authenticate` para todos los motivos, con la causa solo en el log—; y el `422` **saneado** (sin el valor de campos sensibles) va bajo `details.errors`.
+- Los endpoints lanzan **`ApiError(status, code, message)`** —semántica, no respuestas—; **ya no queda ninguna `HTTPException` a mano**. La FORMA se decide en un solo sitio: handlers centralizados registrados en `create_app()` para `ApiError`, `RequestValidationError` (422 saneado), la `HTTPException` **del framework** (404 de ruta inexistente, 405 de método no permitido — con mensaje propio, porque los suyos vienen en inglés) y `Exception`.
+- **Blindaje de los `500`:** el cliente recibe **siempre** el mismo mensaje genérico más un **`error_id` opaco**; **nunca** el tipo de la excepción, su mensaje ni la traza — que es justo donde aparecerían la URL de la base con su contraseña, una llave o un token. Ese **mismo** `error_id` se loguea a nivel `error` junto a la causa real y al **método y ruta** de la petición, y **no** la query string ni las cabeceras, para que el token de `Authorization` no acabe en los logs. **Verificado** con una excepción que contiene una URL con contraseña: no aparece en el cuerpo (ni el esquema, ni el host, ni la clave), sí en el log, junto al id que vio el cliente.
+- **`GET /v1/health/db` se pasó al formato común:** su `503` tenía un cuerpo propio (`status: "error"` + `detail`), lo que habría dejado una excepción a la regla justo en el criterio que dice "un solo type guard para toda la API". Ahora el fallo es un error como cualquier otro y el `200` queda en `{"status": "ok"}`.
+- **OpenAPI al día (HU-1.9):** todos los errores documentados referencian el esquema `ErrorResponse` —incluido el `422` que FastAPI añade solo, declarado a mano para que su `HTTPValidationError` desaparezca del esquema—, con un test que lo verifica operación por operación.
+- **`@rover/shared`:** `ApiErrorResponse` + `isApiErrorResponse` (**un solo** type guard para cualquier error), y `ApiError` gana `code`, `details` y `errorId` parseados del cuerpo. El tipo de `code` admite strings desconocidos **a propósito**: un cliente ya publicado debe poder parsear un error con un código que aún no conocía.
+- Tests del contrato (`tests/test_errors.py`): la forma común en cada familia (`401`, `403`, `404`, `405`, `409`, `422`, `429`, `503`), el `401` uniforme dentro del nuevo formato, la contraseña ausente del `422`, y el `500` sin traza ni credenciales con su `error_id` presente en el log.
 
-**Tareas técnicas:** exception handlers globales · modelo de error · mapping de excepciones comunes · tests.
+**Tareas técnicas (como se hizo):** `app/core/errors.py` (catálogo `ErrorCode`, excepción `ApiError`, modelos `ErrorResponse`/`ErrorBody`, los cuatro handlers y `register_exception_handlers`) · migración de todos los endpoints y dependencias de `HTTPException` a `ApiError` · helper `error_doc` para documentar cada error en OpenAPI · `health/db` al formato común · `@rover/shared` (`types/error.ts` + `ApiError` enriquecido + parseo en el cliente) · tests nuevos y ajuste de los 9 que asertaban el cuerpo viejo · README (§ Formato de errores).
+
+> **Deuda deliberada:** el catálogo `ErrorCode` y el tipo `KnownApiErrorCode` de `@rover/shared` se mantienen **a mano** en los dos lados. Es duplicación consciente y barata (una línea por código); si se generan los tipos desde el esquema OpenAPI —la idea anotada en el cliente compartido desde la HU-0.7— desaparece sola.
 
 ---
 
@@ -399,7 +406,9 @@ La HU original juntaba **modelo + migración** y **endpoints**. Se dividió para
 
 **Tareas técnicas:** configurar logging estructurado · middleware de request id · correlación con el manejador de errores · revisar que no se filtren secretos.
 
-> **Ya adelantado (HU-1.3b):** el **logging básico ya está resuelto** — `app/core/logging.py` (`configure_logging`, llamado desde `create_app`) enruta los loggers `app.*` a **stdout** con formato consistente y sin filtrar secretos, así que los diagnósticos de la app son visibles junto a los de uvicorn. **Pendiente de esta HU:** el logging **estructurado** (JSON), el **request id** y la **correlación** entre la línea de entrada/salida de cada request y el id de error de la HU-1.8.
+> **Ya adelantado (HU-1.3b):** el **logging básico ya está resuelto** — `app/core/logging.py` (`configure_logging`, llamado desde `create_app`) enruta los loggers `app.*` a **stdout** con formato consistente y sin filtrar secretos, así que los diagnósticos de la app son visibles junto a los de uvicorn.
+>
+> **Ya adelantado (HU-1.8):** el **`error_id` de los `500` ya existe** y se loguea a nivel `error` con la causa real, el método y la ruta; el cliente lo recibe en el cuerpo. **Pendiente de esta HU:** el logging **estructurado** (JSON), el **request id**, y **correlacionar** ambos — que la línea de entrada/salida de cada request y el `error_id` compartan identificador, hoy inconexos.
 
 ---
 
