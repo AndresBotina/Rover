@@ -157,7 +157,7 @@ Una HU está **Done** solo cuando:
 
 **Objetivo:** el backend permanente y bien construido. API versionada, conexión async a Supabase, migraciones, autenticación delegada en Supabase Auth, rate limiting por plan, manejo de errores centralizado y observabilidad básica. Esto no se bota cuando crezcas; solo le pones más máquinas detrás.
 
-> **Decisión de arquitectura: Supabase Auth como proveedor de identidad.** El backend **no emite JWT propios**: delega registro y login en Supabase Auth y **valida** los tokens que este emite. Motivos: el login social con Google/Apple que exigen las stores viene resuelto de serie, la seguridad de credenciales (hashing, rotación de refresh tokens, recuperación de contraseña) queda en un servicio probado en vez de código propio, y es coherente con el Postgres de Supabase que ya usamos (HU-1.1). Trade-off asumido: **acoplamiento al proveedor** — migrar de Supabase Auth tendría costo; se mitiga concentrando la integración en el servicio de auth del backend. Consecuencia en el modelo de datos: la tabla local de usuarios pasa a ser un **perfil** que referencia el id de Supabase (`auth.users`), no una fuente de identidad (ver HU-1.10).
+> **Decisión de arquitectura: Supabase Auth como proveedor de identidad.** El backend **no emite JWT propios**: delega registro y login en Supabase Auth y **valida** los tokens que este emite. Motivos: el login social con Google/Apple que exigen las stores viene resuelto de serie, la seguridad de credenciales (hashing, rotación de refresh tokens, recuperación de contraseña) queda en un servicio probado en vez de código propio, y es coherente con el Postgres de Supabase que ya usamos (HU-1.1). Trade-off asumido: **acoplamiento al proveedor** — migrar de Supabase Auth tendría costo; se mitiga concentrando la integración en el servicio de auth del backend. Consecuencia en el modelo de datos: la tabla local de usuarios pasa a ser un **perfil** que referencia el id de Supabase (`auth.users`), no una fuente de identidad (ver HU-1.10a).
 
 ### ✅ HU-1.1 — Conexión async a base de datos
 *Como* sistema, *quiero* conectarme a Supabase Postgres de forma asíncrona, *para* no bloquear el event loop bajo carga.
@@ -178,10 +178,10 @@ Una HU está **Done** solo cuando:
 **Criterios de aceptación (como se construyó):**
 - Alembic configurado sobre el **mismo engine async** del proyecto: `migrations/env.py` reutiliza la construcción del engine de `app.core.database` (`build_async_url` + `engine_kwargs`, detección del Transaction Pooler de Supabase incluida) y resuelve la URL desde `ROVER_DATABASE_URL`; la URL **nunca** se escribe en `alembic.ini` (ese archivo se versiona y la URL es un secreto — un test lo garantiza).
 - `alembic upgrade head` y `downgrade` verificados desde local contra Supabase.
-- La primera migración es una **baseline que ancla el versionado sin crear tablas** (solo aparece la tabla de control `alembic_version`): los modelos de dominio —incluida la tabla de usuarios— corresponden a la HU-1.10, y crearlos aquí habría adelantado ese diseño.
+- La primera migración es una **baseline que ancla el versionado sin crear tablas** (solo aparece la tabla de control `alembic_version`): los modelos de dominio —incluida la tabla de usuarios— corresponden a la HU-1.10a, y crearlos aquí habría adelantado ese diseño.
 - La estrategia de migración en producción (manual desde local; por qué no está automatizada en el plan free de Render) está documentada en `docs/deploy.md`, y los comandos del día a día en el README del backend.
 
-> **Nota:** la tabla de usuarios y su migración llegan con la HU-1.10 (modelos de dominio).
+> **Nota:** la tabla de usuarios y su migración llegan con la HU-1.10a (modelos de dominio).
 
 **Tareas técnicas (como se hizo):** init de Alembic · `env.py` async reutilizando la config real del backend · migración baseline · hooks de ruff (fix + format) para las migraciones autogeneradas · tests de configuración sin base real · documentar en README y `docs/deploy.md`.
 
@@ -247,7 +247,7 @@ Contexto: con **"Confirm email" activado** en Supabase (lo deseable en producci�
 
 **Tareas técnicas (como se hizo):** `_gotrue_post` + `_parse_user_and_session` compartidos con el alta · `sign_in` + `_parse_signin` (sesión obligatoria) · excepciones `InvalidCredentials` / `EmailNotConfirmed` mapeadas por `error_code` · endpoint con mapeo `401/403/429/503` · cliente compartido con tipos + método + type guard · tests con httpx/servicio mockeados · flujo documentado en el README.
 
-> **Deuda técnica (infra de tests):** los tests de **registro/login** dejan engines de SQLite async sin cerrar, lo que emite warnings de *teardown* de aiosqlite al correr el **conjunto completo** (por timing del GC). **No son fallos** y el CI no los trata como error. La **HU-1.6 ya resolvió el patrón** en sus propios tests (SQLite en **fichero temporal**, no `:memory:`, con `engine.dispose()` en el teardown del fixture — lo que además evita el `no such table` que daba `StaticPool` bajo carga). Queda **pendiente aplicar el mismo patrón** a los tests de registro/login, que no se tocaron. No es urgente ni bloquea nada.
+> **Deuda técnica (infra de tests):** los tests de **registro/login** dejan engines de SQLite async sin cerrar, lo que emite warnings de *teardown* de aiosqlite al correr el **conjunto completo** (por timing del GC). **No son fallos** y el CI no los trata como error. El **patrón limpio ya está establecido** desde la HU-1.6 y lo siguen también los tests de la HU-1.10b: SQLite en **fichero temporal** (no `:memory:`) con `engine.dispose()` en el teardown del fixture — lo que además evita el `no such table` que daba `StaticPool` bajo carga — más los **helpers de firma de tokens** extraídos a `tests/auth_utils.py`. La deuda queda **acotada a los tests de registro/login**, los únicos que no se han migrado. No es urgente ni bloquea nada.
 
 ---
 
@@ -324,20 +324,51 @@ Contexto: con **"Confirm email" activado** en Supabase (lo deseable en producci�
 **Tareas técnicas:** router raíz `/v1` · organización de routers · habilitar docs OpenAPI · wiring del cliente compartido.
 
 > **Nota (estado real):** dos criterios YA se cumplen desde la Épica 0 — todos los endpoints cuelgan de `/v1` (HU-0.4) y el cliente compartido apunta a `/v1` (HU-0.7). Lo **pendiente** de esta HU es: organizar los routers por dominio (`auth`, `users`, …) y habilitar/documentar las docs OpenAPI. No duplicar el trabajo ya hecho.
+>
+> **Ya iniciado (HU-1.10b):** la **organización por dominio ya arrancó** — el router `users` se creó aparte (`app/api/v1/users.py`, montado bajo `/v1`) en vez de colgar los endpoints de perfil del router de `auth`. **Pendiente de esta HU:** consolidar el resto de routers con el mismo criterio y habilitar/documentar OpenAPI.
+>
+> **A decidir aquí:** `GET /v1/auth/me` (check ligero de identidad del middleware: `id`, `email`, `plan`) y `GET /v1/users/me` (perfil completo) tienen **solape parcial**. Conviven a propósito porque responden a preguntas distintas; en esta HU se decide si se consolidan en uno solo o se mantienen separados y documentados como tales.
 
 ---
 
-### HU-1.10 — Modelo de usuario y perfil
-*Como* usuario, *quiero* tener un perfil con mis datos y preferencias de viaje, *para* que el agente me dé respuestas personalizadas más adelante.
+### HU-1.10 — Modelo de usuario y perfil *(dividida en 1.10a + 1.10b)*
 
-**Criterios de aceptación:**
-- Modelo de **perfil** de usuario con: id (el de Supabase `auth.users`, que lo referencia como clave), email, plan, fecha de creación, preferencias (json). No es fuente de identidad ni almacena contraseñas: eso vive en Supabase Auth.
-- `GET /v1/users/me` devuelve el perfil del usuario autenticado.
-- `PATCH /v1/users/me` actualiza preferencias con validación.
-- Migración Alembic asociada.
-- Test cubre lectura y actualización del perfil.
+La HU original juntaba **modelo + migración** y **endpoints**. Se dividió para poder cerrar el modelo antes que la auth (la creación perezosa del perfil de la HU-1.6 ya lo necesitaba) y dejar los endpoints para cuando existiera el middleware que los protege:
 
-**Tareas técnicas:** modelo SQLAlchemy · schema Pydantic · endpoints `me` · migración · tests · actualizar cliente compartido.
+- **HU-1.10a — Modelo de perfil y migración** ✅ completada
+- **HU-1.10b — Endpoints de perfil (`/v1/users/me`)** ✅ completada
+
+---
+
+### ✅ HU-1.10a — Modelo de perfil de usuario y migración
+*Como* sistema, *quiero* una tabla local de perfil ligada al usuario de Supabase, *para* guardar plan y preferencias sin duplicar la identidad.
+
+**Criterios de aceptación (como se construyó):**
+- Modelo `UserProfile` (`app/models/user.py`) de **perfil**, no de identidad: `id` (el **mismo** UUID de `auth.users`, **sin default propio** — olvidar pasarlo debe fallar, no inventar una identidad que Supabase no conoce), `email` (copia de conveniencia; la fuente de verdad es Supabase), `plan`, `preferences` (JSONB con default `{}`, nunca NULL) y timestamps `timestamptz` puestos por la base. **No guarda contraseñas ni credenciales.**
+- **Sin ForeignKey cross-schema a `auth.users` a propósito:** acoplaría nuestras migraciones al esquema interno de Supabase (que su tooling puede recrear) y rompería en cualquier base sin ese esquema (SQLite en tests). La integridad la garantiza la aplicación: el perfil se crea de forma idempotente sobre un usuario que **ya existe** en Supabase (HU-1.3 / HU-1.6).
+- `plan` como **VARCHAR + CHECK** en vez del ENUM nativo de Postgres: añadir un plan es reemplazar la constraint en una migración normal (el ENUM nativo exige `ALTER TYPE` y no deja quitar valores) y el CHECK funciona igual en SQLite. `JSONB` en Postgres con `with_variant(JSON)` para SQLite.
+- Migración Alembic `8a85e1e7b420` (autogenerada y revisada): crea `user_profiles` con índice por email; el `downgrade` la elimina limpiamente. `migrations/env.py` importa `app/models` para que el `--autogenerate` vea las tablas.
+- Tests sin base real: declaración de la tabla, CHECK del plan, alta/lectura sobre SQLite async y defaults del lado de la base. `test_migrations` pasó a validar **historia lineal** (una head, una raíz sin padre), ya que la head dejó de ser la baseline.
+
+**Tareas técnicas (como se hizo):** paquete `app/models/` · `UserProfile` + enum `Plan` · `env.py` importando los modelos · migración revisada a mano · tests de modelo y de historia de migraciones.
+
+> **Reconciliación:** la HU-1.10 original hablaba del modelo como fuente de verdad/identidad. Con Supabase Auth como proveedor de identidad (decisión al inicio de esta épica), quedó reconciliado como **perfil** que referencia el id de `auth.users`. No queda contradicción en el documento.
+
+---
+
+### ✅ HU-1.10b — Endpoints de perfil (`/v1/users/me`)
+*Como* usuario, *quiero* leer y actualizar mis preferencias de viaje, *para* que el agente me dé respuestas personalizadas más adelante.
+
+**Criterios de aceptación (como se construyó):**
+- `GET /v1/users/me` y `PATCH /v1/users/me` en un **router por dominio** (`app/api/v1/users.py`) bajo `/v1`, protegidos por `get_current_user` (HU-1.6). El id del usuario **siempre** proviene del token: por eso la ruta es `/me` y **nunca** `/users/{id}` — no hay forma de nombrar el recurso de otro. Test explícito de que un token de A no lee ni toca el perfil de B.
+- **Solo `preferences` es editable.** El schema de entrada usa `extra="forbid"`: un PATCH que incluya `plan`, `id` o `email` responde **`422`** (no se ignora en silencio) y **ni siquiera la parte válida del cuerpo se aplica**. Criterio: exponer campos de más en un PATCH es una vía de **escalada de privilegios** (auto-ascenso a un plan de pago); `plan`, `id` y `email` los gobiernan Supabase (identidad) y la monetización (Épica 5), nunca el cliente. Test parametrizado que verifica el `422` **y** que el perfil no cambió.
+- **Semántica del PATCH: merge superficial** (`{**actuales, **entrantes}`), **no** reemplazo total. Razón: web y móvil envían actualizaciones **parciales**; con reemplazo tendrían que hacer read-modify-write del objeto entero y dos clientes concurrentes se pisarían. Es predecible: las claves de primer nivel enviadas se fijan y los objetos anidados se **reemplazan en su clave** (sin merge profundo, para evitar ambigüedad). Test explícito de la semántica.
+- **Límite de tamaño:** se acota el **resultado del merge** (lo que se guarda), no solo el payload entrante, a **8 KB** de JSON serializado → `422` si se excede. Acotar el resultado evita el crecimiento **acumulado** entre PATCHes sucesivos. Que `preferences` sea un **objeto** (y no array, número o string) lo garantiza el tipo `dict[str, Any]` → `422` por tipo.
+- `@rover/shared` actualizado: tipos del perfil y métodos `getProfile` / `updateProfile` con **type guards**; el tipo de actualización impide **a nivel de tipos** enviar campos no editables (`plan`, `email`, `id`).
+- **`GET /v1/auth/me` se mantiene:** es el check **ligero de identidad** (`id`, `email`, `plan`) del middleware, distinto del **perfil completo** de `/v1/users/me`. Hay **solape parcial anotado** para decidir en la HU-1.9 si se consolidan.
+- **Verificado end-to-end** contra Supabase real: lectura del perfil, merge (el idioma se conserva al cambiar solo la moneda) y **escalada rechazada** (`PATCH plan=pro` → `422`, con el plan intacto en `free`).
+
+**Tareas técnicas (como se hizo):** router `app/api/v1/users.py` por dominio · schemas `ProfileResponse` / `ProfileUpdateRequest` (`extra="forbid"`) · merge superficial + tope de 8 KB del resultado · cliente compartido (tipos + `getProfile`/`updateProfile` + type guard) · tests de lectura, persistencia, merge, campos desconocidos, tipo, tope de tamaño, `updated_at` y aislamiento entre usuarios · helpers de firma de tokens extraídos a `tests/auth_utils.py`.
 
 ---
 
