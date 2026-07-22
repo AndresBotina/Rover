@@ -1,4 +1,5 @@
-"""Endpoints de autenticación, versionados bajo /v1/auth.
+"""Endpoints de autenticación, versionados bajo /v1/auth (el prefijo lo pone
+el agregador ``app.api.v1.router``).
 
 Delegan la identidad en Supabase Auth (app.services.auth): el backend NO
 firma JWT propios (decisión de arquitectura, ver docs/backlog.md § Épica 1).
@@ -7,15 +8,14 @@ firma JWT propios (decisión de arquitectura, ver docs/backlog.md § Épica 1).
 import logging
 import uuid
 from enum import StrEnum
-from typing import Annotated, Self
+from typing import Self
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from fastapi import APIRouter, HTTPException, status
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 from sqlalchemy.exc import IntegrityError
 
-from app.api.deps import CurrentUser, get_current_user
 from app.core.database import get_db
-from app.models import Plan, UserProfile
+from app.models import UserProfile
 from app.services import auth as auth_service
 
 logger = logging.getLogger(__name__)
@@ -25,6 +25,12 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 class RegisterRequest(BaseModel):
     """Alta de usuario: email + contraseña. La política fuerte la aplica Supabase."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [{"email": "ana@example.com", "password": "un-secreto-largo"}]
+        }
+    )
 
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
@@ -65,6 +71,33 @@ class RegisterResponse(BaseModel):
     ambigua (p. ej. ``active`` sin sesión).
     """
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "status": "active",
+                    "user": {
+                        "id": "0f6c2f9e-1f2a-4c3b-9d5e-8a7b6c5d4e3f",
+                        "email": "ana@example.com",
+                    },
+                    "session": {
+                        "access_token": "eyJhbGciOiJFUzI1NiIs…",
+                        "refresh_token": "v1.MRq8…",
+                        "token_type": "bearer",
+                    },
+                },
+                {
+                    "status": "pending_email_confirmation",
+                    "user": {
+                        "id": "0f6c2f9e-1f2a-4c3b-9d5e-8a7b6c5d4e3f",
+                        "email": "ana@example.com",
+                    },
+                    "session": None,
+                },
+            ]
+        }
+    )
+
     status: RegistrationStatus
     user: UserOut
     session: SessionOut | None = None
@@ -85,6 +118,12 @@ class LoginRequest(BaseModel):
     presente y acotada) — sin imponer la política de longitud del registro,
     que rechazaría contraseñas válidas más cortas."""
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [{"email": "ana@example.com", "password": "un-secreto-largo"}]
+        }
+    )
+
     email: EmailStr
     password: str = Field(min_length=1, max_length=128)
 
@@ -101,9 +140,39 @@ class LoginResponse(BaseModel):
 _EMAIL_NOT_CONFIRMED_REASON = "email_not_confirmed"
 
 
-@router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/register",
+    response_model=RegisterResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Registrar un usuario",
+    responses={
+        201: {
+            "description": (
+                "Usuario creado. Con sesión (`active`) o sin ella si Supabase "
+                "exige confirmar el correo (`pending_email_confirmation`)."
+            )
+        },
+        409: {"description": "Ya existe una cuenta con ese email."},
+        422: {"description": "Email inválido o contraseña rechazada por la política de Supabase."},
+        429: {"description": "Demasiados intentos de registro; reintentar más tarde."},
+        503: {"description": "Supabase Auth no respondió o falló de forma inesperada."},
+    },
+)
 async def register(payload: RegisterRequest) -> RegisterResponse:
-    """Registra en Supabase Auth y crea el perfil local (best-effort, ver abajo)."""
+    """Da de alta al usuario en **Supabase Auth** y crea su perfil local.
+
+    La respuesta es una **unión discriminada por `status`**, no un booleano:
+
+    - **`active`** — la confirmación de email está desactivada: el usuario ya
+      viene con `session` (access + refresh token) y puede llamar a las rutas
+      protegidas.
+    - **`pending_email_confirmation`** — hay que confirmar el correo: `session`
+      es `null` y el cliente debe mostrar "revisa tu correo".
+
+    El perfil local se crea de forma idempotente y su fallo **no** rompe el
+    registro: si no se consigue, lo materializa el middleware en el primer
+    acceso autenticado.
+    """
     try:
         result = await auth_service.sign_up(payload.email, payload.password)
     except auth_service.RateLimited as exc:
@@ -148,15 +217,39 @@ async def register(payload: RegisterRequest) -> RegisterResponse:
     )
 
 
-@router.post("/login", response_model=LoginResponse)
+@router.post(
+    "/login",
+    response_model=LoginResponse,
+    summary="Iniciar sesión",
+    responses={
+        200: {"description": "Credenciales correctas: usuario y sesión de Supabase."},
+        401: {
+            "description": (
+                "Email o contraseña incorrectos. El cuerpo es **idéntico** en "
+                "ambos casos: no se revela si la cuenta existe."
+            )
+        },
+        403: {
+            "description": (
+                "Credenciales correctas pero el email no está confirmado. El "
+                'cuerpo trae `reason: "email_not_confirmed"`.'
+            )
+        },
+        429: {"description": "Demasiados intentos de login; reintentar más tarde."},
+        503: {"description": "Supabase Auth no respondió o falló de forma inesperada."},
+    },
+)
 async def login(payload: LoginRequest) -> LoginResponse:
-    """Inicia sesión delegando en Supabase Auth; devuelve usuario + sesión.
+    """Valida las credenciales contra **Supabase Auth** y devuelve la sesión.
 
-    A diferencia del registro, el login NO crea ni materializa el perfil
+    El `access_token` de la sesión es el que viaja en
+    `Authorization: Bearer <token>` hacia las rutas protegidas.
+
+    A diferencia del registro, el login **no** crea ni materializa el perfil
     local: si un usuario puede autenticarse pero aún no tiene perfil, su
-    creación perezosa es responsabilidad del middleware de la HU-1.6 —el punto
-    por el que pasa TODA petición autenticada—. Duplicar esa lógica aquí la
-    pondría en dos sitios.
+    creación perezosa es responsabilidad del middleware (`get_current_user`),
+    el punto por el que pasa TODA petición autenticada. Duplicar esa lógica
+    aquí la pondría en dos sitios.
     """
     try:
         result = await auth_service.sign_in(payload.email, payload.password)
@@ -201,23 +294,13 @@ async def login(payload: LoginRequest) -> LoginResponse:
     )
 
 
-class MeResponse(BaseModel):
-    """Identidad del usuario autenticado (verificación del middleware, HU-1.6).
-
-    Los endpoints completos de perfil (`/v1/users/me` con actualización de
-    preferencias) llegan en la HU-1.10b; esto solo confirma que el middleware
-    resuelve la identidad de punta a punta.
-    """
-
-    id: uuid.UUID
-    email: str
-    plan: Plan
-
-
-@router.get("/me", response_model=MeResponse)
-async def me(user: Annotated[CurrentUser, Depends(get_current_user)]) -> MeResponse:
-    """Devuelve la identidad resuelta por el middleware para el token del request."""
-    return MeResponse(id=user.id, email=user.email, plan=user.plan)
+# NOTA (HU-1.9): aquí vivía `GET /v1/auth/me`, la ruta con la que se verificó
+# el middleware antes de que existieran los endpoints de perfil. Devolvía
+# (id, email, plan): un SUBCONJUNTO estricto de `GET /v1/users/me`, obtenido
+# con exactamente el mismo trabajo (validar el token + leer la fila del
+# perfil). Se retiró al consolidar: dos rutas que responden "quién soy" con el
+# mismo costo son dos contratos que mantener y una duda para el cliente.
+# `GET /v1/users/me` es ahora el único endpoint de identidad/perfil.
 
 
 def _log_provider_failure(level: int, contexto: str, exc: auth_service.AuthError) -> None:

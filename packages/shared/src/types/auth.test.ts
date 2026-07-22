@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { isLoginResponse, isMeResponse, isRegisterResponse } from "./auth.ts";
+import { isLoginResponse, isRegisterResponse } from "./auth.ts";
 
 const USER = { id: "11111111-1111-1111-1111-111111111111", email: "a@b.com" };
 const SESSION = { access_token: "at", refresh_token: "rt", token_type: "bearer" };
@@ -68,13 +68,6 @@ test("isLoginResponse rechaza usuario inválido o valores no-objeto", () => {
   assert.equal(isLoginResponse(null), false);
 });
 
-test("isMeResponse acepta identidad con plan válido", () => {
-  assert.equal(isMeResponse({ id: "u1", email: "a@b.com", plan: "free" }), true);
-  assert.equal(isMeResponse({ id: "u1", email: "a@b.com", plan: "pro" }), true);
-});
-
-test("isMeResponse rechaza plan desconocido o campos faltantes", () => {
-  assert.equal(isMeResponse({ id: "u1", email: "a@b.com", plan: "enterprise" }), false);
-  assert.equal(isMeResponse({ id: "u1", email: "a@b.com" }), false);
-  assert.equal(isMeResponse(null), false);
-});
+// Los tests de isMeResponse se retiraron con GET /v1/auth/me (consolidado en
+// GET /v1/users/me, HU-1.9): el guard equivalente es isProfile, cubierto en
+// types/profile.test.ts.

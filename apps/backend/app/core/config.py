@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     # La versión tiene una sola fuente de verdad: app.__version__.
     version: str = __version__
 
+    # --- Documentación interactiva (HU-1.9) ----------------------------------
+    # ``None`` = decide el ambiente (ver la propiedad ``docs_enabled``); un
+    # booleano explícito en ROVER_ENABLE_DOCS manda sobre esa regla.
+    enable_docs: bool | None = None
+
     # --- Secretos (Épica 1) --------------------------------------------------
     # PATRÓN para añadir un secreto:
     #   1. Campo tipado ``SecretStr | None = None`` (opcional: local/test deben
@@ -89,6 +94,26 @@ class Settings(BaseSettings):
         "supabase_anon_key",
         "supabase_service_role_key",
     )
+
+    @property
+    def docs_enabled(self) -> bool:
+        """Si se sirven ``/docs``, ``/redoc`` y ``/openapi.json``.
+
+        Por defecto: SÍ fuera de producción, NO en producción. El esquema
+        OpenAPI es el mapa completo de la API (rutas, cuerpos, códigos de
+        error); publicárselo a cualquiera en producción regala trabajo de
+        reconocimiento a quien busque superficie de ataque, sin dar nada a
+        cambio: los clientes propios (web/móvil) consumen `@rover/shared`, no
+        la UI interactiva.
+
+        ``ROVER_ENABLE_DOCS`` fuerza el valor en cualquier ambiente (p. ej.
+        activarlas temporalmente en producción para depurar, o apagarlas en
+        local). El default por ambiente evita que se olvide apagarlas: para
+        exponerlas en producción hay que pedirlo explícitamente.
+        """
+        if self.enable_docs is not None:
+            return self.enable_docs
+        return self.env != "production"
 
     @model_validator(mode="after")
     def _fail_fast_if_missing_required(self) -> Self:

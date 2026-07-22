@@ -9,11 +9,9 @@
 
 import {
   isLoginResponse,
-  isMeResponse,
   isRegisterResponse,
   type LoginRequest,
   type LoginResponse,
-  type MeResponse,
   type RegisterRequest,
   type RegisterResponse,
 } from "../types/auth.ts";
@@ -108,24 +106,13 @@ export class ApiClient {
   }
 
   /**
-   * GET /v1/auth/me — identidad del usuario autenticado. Envía el access token
-   * de Supabase en el header `Authorization: Bearer`. Un token ausente,
-   * inválido o expirado responde 401 (uniforme) y esto lanza ApiError con ese
-   * status.
-   */
-  async getMe(accessToken: string): Promise<MeResponse> {
-    const url = `${this.baseUrl}/v1/auth/me`;
-    const { status, data } = await getJson(url, { Authorization: `Bearer ${accessToken}` });
-    if (!isMeResponse(data)) {
-      throw new ApiError(`Respuesta de ${url} con forma inesperada`, { url, status });
-    }
-    return data;
-  }
-
-  /**
    * GET /v1/users/me — perfil completo del usuario (id, email, plan,
    * preferences, timestamps). Requiere el access token en Authorization; sin
    * él o con token inválido responde 401 y esto lanza ApiError.
+   *
+   * Es también el "¿quién soy?" del cliente: desde la HU-1.9 no hay un
+   * endpoint aparte de identidad (`/v1/auth/me` se consolidó aquí), porque
+   * costaba lo mismo y devolvía un subconjunto de esto.
    */
   async getProfile(accessToken: string): Promise<Profile> {
     const url = `${this.baseUrl}/v1/users/me`;

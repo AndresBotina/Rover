@@ -8,9 +8,11 @@ materialización— lo crea de forma perezosa e idempotente si aún no existe.
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import Header, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
+from fastapi.security import HTTPBearer
+from fastapi.security.http import HTTPAuthorizationCredentials
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.core.database import get_db
@@ -19,11 +21,50 @@ from app.models import Plan, UserProfile
 
 logger = logging.getLogger(__name__)
 
+# Esquema de seguridad SOLO para la documentación (HU-1.9): declararlo hace que
+# OpenAPI marque las rutas protegidas como tales y que /docs muestre el botón
+# "Authorize" para mandar el token. NO valida nada: el token lo sigue leyendo y
+# verificando este módulo.
+#
+# Por qué no se usa su valor de retorno para extraer el token:
+#   - con ``auto_error=True`` la librería respondería 403 con SU propio cuerpo
+#     cuando falta el header, saltándose el 401 uniforme y el log de esta capa;
+#   - con ``auto_error=False`` devuelve ``None`` tanto si no hay header como si
+#     el esquema no es Bearer, y perderíamos el motivo preciso en el log
+#     (``missing_authorization_header`` vs ``invalid_scheme``).
+# El header crudo se lee del Request y lo parsea ``_extract_bearer``.
+bearer_scheme = HTTPBearer(
+    scheme_name="SupabaseAccessToken",
+    description="Access token de Supabase (`session.access_token` de /v1/auth/login).",
+    auto_error=False,
+)
+
 # Cuerpo y cabecera UNIFORMES para cualquier fallo de autenticación: no se
 # revela el motivo (expirado, firma, usuario inexistente…). El motivo real va
 # al log del servidor.
 _UNAUTHORIZED_DETAIL = "No autenticado."
 _SERVICE_UNAVAILABLE_DETAIL = "Servicio no disponible temporalmente."
+
+
+# Respuestas comunes a TODA ruta protegida, para documentarlas sin repetirlas
+# en cada endpoint. Describen el CUÁNDO, nunca el motivo concreto del rechazo:
+# el cuerpo del 401 es uniforme a propósito y la documentación no debe sugerir
+# lo contrario.
+AUTH_RESPONSES: dict[int | str, dict[str, Any]] = {
+    401: {
+        "description": (
+            "Falta el token, o no es válido (formato, firma, expiración, "
+            "issuer o audiencia). El cuerpo es **uniforme** para todos los "
+            "motivos; el motivo real solo va al log del servidor."
+        )
+    },
+    503: {
+        "description": (
+            "Fallo de infraestructura propia (el JWKS de Supabase o la base de "
+            "datos no están disponibles). No implica que el token sea inválido."
+        )
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -106,7 +147,10 @@ async def _resolve_or_create_profile(*, user_id: uuid.UUID, email: str) -> UserP
 
 
 async def get_current_user(
-    authorization: Annotated[str | None, Header()] = None,
+    request: Request,
+    # Dependencia declarativa: su único efecto es documentar el esquema Bearer
+    # en OpenAPI (ver ``bearer_scheme``). Su valor se ignora a propósito.
+    _scheme: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)] = None,
 ) -> CurrentUser:
     """Valida el JWT de Supabase y resuelve (o crea) el perfil local del usuario.
 
@@ -116,7 +160,7 @@ async def get_current_user(
     inválido.
     """
     try:
-        token = _extract_bearer(authorization)
+        token = _extract_bearer(request.headers.get("Authorization"))
         claims = await validate_access_token(token)
         user_id, email = _identity_from_claims(claims)
     except TokenError as exc:

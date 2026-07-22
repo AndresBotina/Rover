@@ -27,13 +27,35 @@ class DbHealthResponse(BaseModel):
     detail: str | None = None
 
 
-@router.get("/health", response_model=HealthResponse)
+@router.get(
+    "/health",
+    response_model=HealthResponse,
+    summary="Estado del servicio",
+    responses={200: {"description": "El servicio está vivo; devuelve versión y ambiente."}},
+)
 def get_health() -> HealthResponse:
-    """Reporta que el servicio está vivo y su versión/entorno."""
+    """Sonda de vida del proceso: **no** toca la base ni servicios externos.
+
+    Es el `healthCheckPath` del Blueprint de Render: un deploy solo se marca
+    sano si esto responde 200.
+    """
     return HealthResponse(status="ok", version=settings.version, env=settings.env)
 
 
-@router.get("/health/db", response_model=DbHealthResponse)
+@router.get(
+    "/health/db",
+    response_model=DbHealthResponse,
+    summary="Conectividad con la base de datos",
+    responses={
+        200: {"description": "La base respondió al `SELECT 1`."},
+        503: {
+            "description": (
+                "No se pudo conectar. El detalle es genérico a propósito: la "
+                "causa real (URL o error del driver) puede contener credenciales."
+            )
+        },
+    },
+)
 async def get_db_health(response: Response) -> DbHealthResponse:
     """Verifica la conexión a la base con un ``SELECT 1`` async.
 

@@ -1,8 +1,14 @@
-"""Tests del middleware de auth (HU-1.6) y GET /v1/auth/me — SIN Supabase real.
+"""Tests del middleware de auth (``get_current_user``, HU-1.6) — SIN Supabase real.
+
+Se ejercen a través de ``GET /v1/users/me``, una ruta protegida REAL: hasta la
+HU-1.9 existía ``GET /v1/auth/me`` solo para verificar el middleware, y al
+consolidarse en ``/v1/users/me`` estos tests apuntan ahí. Lo que se comprueba
+no es el endpoint (eso es test_users_me.py) sino la dependencia: motivos de
+rechazo, uniformidad del 401 y creación perezosa del perfil.
 
 Se generan pares de claves ES256 de prueba y se firman tokens en el propio
 test; el JWKS se inyecta parcheando ``app.core.security._fetch_jwks``, sin
-tocar el JWKS real. La base es SQLite async en memoria (como en el resto).
+tocar el JWKS real. La base es SQLite async en fichero temporal.
 """
 
 import asyncio
@@ -149,10 +155,17 @@ def test_token_valido_devuelve_identidad_y_crea_el_perfil(monkeypatch: pytest.Mo
     token = _token(sub=str(user_id), email="ana@example.com")
 
     with TestClient(app) as client:
-        response = client.get("/v1/auth/me", headers=_auth(token))
+        response = client.get("/v1/users/me", headers=_auth(token))
 
     assert response.status_code == 200
-    assert response.json() == {"id": str(user_id), "email": "ana@example.com", "plan": "free"}
+    # La identidad resuelta por el middleware (el resto del perfil lo cubre
+    # test_users_me.py; aquí solo importa a QUIÉN resolvió el token).
+    cuerpo = response.json()
+    assert (cuerpo["id"], cuerpo["email"], cuerpo["plan"]) == (
+        str(user_id),
+        "ana@example.com",
+        "free",
+    )
     # Creación perezosa: el perfil no existía y el middleware lo materializó.
     assert _contar_perfiles(factory, user_id) == 1
 
@@ -163,8 +176,8 @@ def test_perfil_existente_se_reutiliza_sin_duplicar(monkeypatch: pytest.MonkeyPa
     token = _token(sub=str(user_id))
 
     with TestClient(app) as client:
-        primera = client.get("/v1/auth/me", headers=_auth(token))
-        segunda = client.get("/v1/auth/me", headers=_auth(token))
+        primera = client.get("/v1/users/me", headers=_auth(token))
+        segunda = client.get("/v1/users/me", headers=_auth(token))
 
     assert primera.status_code == 200
     assert segunda.status_code == 200
@@ -230,13 +243,13 @@ def test_creacion_perezosa_carrera_integrityerror_relee(monkeypatch: pytest.Monk
 
 
 def _get_me(client: TestClient, headers: dict[str, str]) -> object:
-    return client.get("/v1/auth/me", headers=headers)
+    return client.get("/v1/users/me", headers=headers)
 
 
 def test_sin_header_responde_401(monkeypatch: pytest.MonkeyPatch) -> None:
     _usar_sqlite(monkeypatch)
     with TestClient(app) as client:
-        response = client.get("/v1/auth/me")
+        response = client.get("/v1/users/me")
     assert response.status_code == 401
 
 
@@ -244,14 +257,14 @@ def test_esquema_incorrecto_responde_401(monkeypatch: pytest.MonkeyPatch) -> Non
     _usar_sqlite(monkeypatch)
     token = _token(sub=str(uuid.uuid4()))
     with TestClient(app) as client:
-        response = client.get("/v1/auth/me", headers={"Authorization": f"Basic {token}"})
+        response = client.get("/v1/users/me", headers={"Authorization": f"Basic {token}"})
     assert response.status_code == 401
 
 
 def test_token_malformado_responde_401(monkeypatch: pytest.MonkeyPatch) -> None:
     _usar_sqlite(monkeypatch)
     with TestClient(app) as client:
-        response = client.get("/v1/auth/me", headers=_auth("esto-no-es-un-jwt"))
+        response = client.get("/v1/users/me", headers=_auth("esto-no-es-un-jwt"))
     assert response.status_code == 401
 
 
@@ -260,7 +273,7 @@ def test_firma_invalida_responde_401(monkeypatch: pytest.MonkeyPatch) -> None:
     _usar_sqlite(monkeypatch)
     token = _token(sub=str(uuid.uuid4()), key=_IMPOSTOR_KEY)  # mismo kid, otra clave
     with TestClient(app) as client:
-        response = client.get("/v1/auth/me", headers=_auth(token))
+        response = client.get("/v1/users/me", headers=_auth(token))
     assert response.status_code == 401
 
 
@@ -268,7 +281,7 @@ def test_token_expirado_responde_401(monkeypatch: pytest.MonkeyPatch) -> None:
     _usar_sqlite(monkeypatch)
     token = _token(sub=str(uuid.uuid4()), exp_delta=-10)
     with TestClient(app) as client:
-        response = client.get("/v1/auth/me", headers=_auth(token))
+        response = client.get("/v1/users/me", headers=_auth(token))
     assert response.status_code == 401
 
 
@@ -276,7 +289,7 @@ def test_issuer_incorrecto_responde_401(monkeypatch: pytest.MonkeyPatch) -> None
     _usar_sqlite(monkeypatch)
     token = _token(sub=str(uuid.uuid4()), iss="https://otro-proyecto.supabase.co/auth/v1")
     with TestClient(app) as client:
-        response = client.get("/v1/auth/me", headers=_auth(token))
+        response = client.get("/v1/users/me", headers=_auth(token))
     assert response.status_code == 401
 
 
@@ -284,7 +297,7 @@ def test_audiencia_incorrecta_responde_401(monkeypatch: pytest.MonkeyPatch) -> N
     _usar_sqlite(monkeypatch)
     token = _token(sub=str(uuid.uuid4()), aud="otra-audiencia")
     with TestClient(app) as client:
-        response = client.get("/v1/auth/me", headers=_auth(token))
+        response = client.get("/v1/users/me", headers=_auth(token))
     assert response.status_code == 401
 
 
@@ -304,7 +317,7 @@ def test_kid_desconocido_responde_401_tras_refrescar(monkeypatch: pytest.MonkeyP
     token = _token(sub=str(uuid.uuid4()), kid="kid-que-no-existe")
 
     with TestClient(app) as client:
-        response = client.get("/v1/auth/me", headers=_auth(token))
+        response = client.get("/v1/users/me", headers=_auth(token))
 
     assert response.status_code == 401
     # Se intentó traer el JWKS al menos dos veces (carga inicial + refresco).
@@ -328,7 +341,7 @@ def test_todos_los_401_tienen_el_mismo_cuerpo(monkeypatch: pytest.MonkeyPatch) -
     with TestClient(app) as client:
         for token in tokens.values():
             headers = _auth(token) if token is not None else {}
-            r = client.get("/v1/auth/me", headers=headers)
+            r = client.get("/v1/users/me", headers=headers)
             assert r.status_code == 401
             cuerpos.append(r.json())
 
@@ -344,7 +357,7 @@ def test_el_motivo_real_del_401_aparece_en_los_logs(monkeypatch: pytest.MonkeyPa
     try:
         configure_logging(stream=stream)
         with TestClient(app) as client:
-            response = client.get("/v1/auth/me", headers=_auth(token))
+            response = client.get("/v1/users/me", headers=_auth(token))
     finally:
         configure_logging()
 

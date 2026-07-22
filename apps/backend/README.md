@@ -11,18 +11,30 @@ Las features (DB, auth, agente) llegan en HUs posteriores.
 
 ```
 app/
-├── main.py            # crea la app FastAPI (lifespan: dispose de la DB al apagar)
+├── main.py            # crea la app FastAPI (metadatos OpenAPI, lifespan)
 ├── core/config.py     # Settings por ambiente (pydantic-settings) + fail-fast
 ├── core/database.py   # SQLAlchemy 2.0 async + asyncpg: engine, get_db, Base
-└── api/v1/health.py   # GET /v1/health y GET /v1/health/db
+├── core/security.py   # validación local del JWT de Supabase (JWKS cacheado)
+├── api/deps.py        # get_current_user (middleware de auth) + esquema Bearer
+└── api/v1/
+    ├── router.py      # AGREGADOR: monta /v1 y describe los tags de OpenAPI
+    ├── health.py      # GET /v1/health y /v1/health/db
+    ├── auth.py        # POST /v1/auth/register y /v1/auth/login
+    └── users.py       # GET y PATCH /v1/users/me
 tests/
 ├── test_health.py     # test del healthcheck
+├── test_openapi.py    # estructura de la API y docs (tags, seguridad, /docs)
 ├── test_config.py     # tests de config por ambiente y fail-fast
 └── test_database.py   # tests de la capa DB SIN base real (SQLite en memoria)
 .env.example           # plantilla de variables (el .env real NUNCA se commitea)
 Dockerfile             # imagen de producción (Python 3.12 slim + uv, no-root)
 docker-compose.yml     # servicio de desarrollo (hot-reload + puerto 8000)
 ```
+
+**Organización de la API.** Cada dominio tiene su router (`health`, `auth`,
+`users`) declarado **sin** prefijo de versión; `api/v1/router.py` los agrega y
+pone `/v1` en un único sitio, y `main.py` monta solo ese agregador. Publicar una
+`/v2` es añadir otro agregador, no editar cada `include_router`.
 
 ## Healthcheck
 
@@ -42,6 +54,7 @@ docker-compose.yml     # servicio de desarrollo (hot-reload + puerto 8000)
 | `ROVER_APP_NAME` | `Rover` | Nombre de la app.                    |
 | `ROVER_ENV`      | `local` | Ambiente (`local`/`test`/`production`). |
 | `ROVER_VERSION`  | `0.1.0` | Versión (origen: `app.__version__`). |
+| `ROVER_ENABLE_DOCS` | según ambiente | Fuerza el encendido/apagado de `/docs`, `/redoc` y `/openapi.json`. |
 | `ROVER_DATABASE_URL` | — | **SECRETO.** URL directa de Supabase Postgres, tal cual la da Supabase (`postgresql://…`). Obligatoria en producción. |
 
 **Desarrollo local** — copia la plantilla y ajusta lo que necesites:
@@ -184,7 +197,7 @@ En `@rover/shared`, `ApiClient.login()` devuelve `LoginResponse` (usuario +
 sesión) y lanza `ApiError` con el `status` en los casos de error; el `403` se
 distingue por su status.
 
-### Middleware de auth y `GET /v1/auth/me`
+### Middleware de auth (rutas protegidas)
 
 Las rutas protegidas validan el **access token de Supabase** (un JWT) con la
 dependencia `get_current_user`. La validación es **local**, no remota: no se
@@ -197,23 +210,24 @@ resuelve el **perfil local** del usuario y, si no existe, lo **crea de forma
 perezosa e idempotente** — este es el único punto donde el perfil se
 materializa (lo que el registro y el login posponen).
 
-`GET /v1/auth/me` es la verificación mínima del middleware: devuelve la
-identidad resuelta. El envío del token va en el header:
+El token va en el header:
 
 ```
 Authorization: Bearer <access_token>
-```
-
-```json
-{ "id": "…uuid…", "email": "ana@example.com", "plan": "free" }
 ```
 
 Cualquier fallo de autenticación (sin token, esquema incorrecto, malformado,
 firma inválida, expirado, issuer/audiencia incorrectos, `kid` desconocido)
 responde un **`401` uniforme** — mismo cuerpo para todos los motivos, para no
 revelar cuál falló; el motivo real solo va al **log** del servidor. Un problema
-de infraestructura (JWKS o base de datos no disponibles) responde **`503`**. En
-`@rover/shared`, `ApiClient.getMe(accessToken)` devuelve `MeResponse`.
+de infraestructura (JWKS o base de datos no disponibles) responde **`503`**.
+
+El esquema **Bearer** está declarado en OpenAPI (`bearer_scheme` en
+`api/deps.py`), así que `/docs` marca las rutas protegidas y su botón
+**Authorize** manda el token. Es **solo documentación**: la validación sigue
+siendo la de `get_current_user` — la librería no se usa para extraer el token
+porque colapsaría "sin header" e "esquema inválido" en el mismo caso y
+perderíamos el motivo preciso en el log.
 
 ## Perfil de usuario (`/v1/users/me`)
 
@@ -223,7 +237,8 @@ de la URL (por eso es `/me`, no `/users/{id}`): un usuario no puede leer ni
 tocar el perfil de otro.
 
 - **`GET /v1/users/me`** → perfil completo: `id`, `email`, `plan`,
-  `preferences` y timestamps.
+  `preferences` y timestamps. Es también el endpoint de **identidad** ("¿quién
+  soy?", "¿sigue válida mi sesión?"): ver la nota de consolidación al final.
 - **`PATCH /v1/users/me`** → actualiza **solo `preferences`**.
   - **Merge superficial** (no reemplazo): las claves de primer nivel enviadas
     se fijan, las no mencionadas se conservan. Elegido porque web y móvil
@@ -242,9 +257,39 @@ En `@rover/shared`: `getProfile(accessToken)` y `updateProfile(accessToken,
 { preferences })`; el tipo `ProfileUpdate` impide, a nivel de tipos, enviar
 campos no editables.
 
-> **Nota (HU-1.9):** este router por dominio y `GET /v1/auth/me` (verificación
-> del middleware, que devuelve solo la identidad mínima) conviven; reconciliar
-> en la HU-1.9 si `/auth/me` queda redundante con `/users/me`.
+> **Consolidación (HU-1.9): `/v1/auth/me` se retiró.** Existía como
+> verificación del middleware antes de que hubiera endpoints de perfil, y
+> devolvía `(id, email, plan)`: un **subconjunto estricto** de `/v1/users/me`
+> obtenido con **exactamente el mismo trabajo** (validar el token y leer la
+> fila del perfil, que el middleware carga igual para materializarla). No era
+> un "check ligero": solo era la misma respuesta con menos campos. Mantener dos
+> rutas para la misma pregunta costaba dos contratos, dos métodos en
+> `@rover/shared` y una duda para el cliente ("¿cuál llamo?"), sin ganar nada.
+> Quien solo quiera la identidad usa `getProfile()` y lee `id`/`email`/`plan`.
+
+## Documentación de la API (OpenAPI)
+
+`/docs` (Swagger UI), `/redoc` y `/openapi.json`. El esquema lleva título,
+versión (de `app.__version__`, una sola fuente de verdad), descripción,
+**tags por dominio** con su explicación, `summary`/`description` por operación,
+ejemplos de cuerpo y los **códigos de error** documentados (`401`, `403`,
+`409`, `422`, `429`, `503`) con el *cuándo* de cada uno — nunca el motivo
+concreto de un rechazo de auth, que sigue siendo uniforme.
+
+**En producción están apagadas por defecto.** El esquema es el mapa completo de
+la API (rutas, cuerpos, errores): publicarlo regala trabajo de reconocimiento a
+quien busque superficie de ataque, y los clientes propios consumen
+`@rover/shared`, no la UI. La regla vive en `Settings.docs_enabled`:
+
+| `ROVER_ENV`  | `ROVER_ENABLE_DOCS` | `/docs`, `/redoc`, `/openapi.json` |
+| ------------ | ------------------- | ---------------------------------- |
+| `local`/`test` | sin definir       | **activas**                        |
+| `production` | sin definir         | **404** (apagadas)                 |
+| cualquiera   | `true` / `false`    | manda la variable                  |
+
+Apagarlas desmonta también `/openapi.json` (sin esquema no hay nada que
+renderizar). El default es por ambiente para que no se pueda *olvidar*
+apagarlas: exponerlas en producción exige pedirlo explícitamente.
 
 ## Migraciones (Alembic)
 
