@@ -7,13 +7,12 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.exceptions import RequestValidationError
 
 from app.api.v1.router import TAGS_METADATA
 from app.api.v1.router import router as api_v1_router
 from app.core.config import settings
 from app.core.database import dispose_engine
-from app.core.errors import validation_exception_handler
+from app.core.errors import register_exception_handlers
 from app.core.logging import configure_logging
 
 # Descripción que encabeza /docs. Corta a propósito: lo específico de cada
@@ -63,7 +62,8 @@ def create_app() -> FastAPI:
         openapi_url="/openapi.json" if docs else None,
         lifespan=lifespan,
     )
-    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    # Todos los errores salen con el mismo contrato (app/core/errors.py).
+    register_exception_handlers(app)
     # Un único punto de montaje: el agregador ya trae el prefijo /v1.
     app.include_router(api_v1_router)
     return app

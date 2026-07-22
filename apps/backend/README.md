@@ -15,6 +15,7 @@ app/
 ├── core/config.py     # Settings por ambiente (pydantic-settings) + fail-fast
 ├── core/database.py   # SQLAlchemy 2.0 async + asyncpg: engine, get_db, Base
 ├── core/security.py   # validación local del JWT de Supabase (JWKS cacheado)
+├── core/errors.py     # formato ÚNICO de error + handlers centralizados
 ├── api/deps.py        # get_current_user (middleware de auth) + esquema Bearer
 └── api/v1/
     ├── router.py      # AGREGADOR: monta /v1 y describe los tags de OpenAPI
@@ -24,6 +25,7 @@ app/
 tests/
 ├── test_health.py     # test del healthcheck
 ├── test_openapi.py    # estructura de la API y docs (tags, seguridad, /docs)
+├── test_errors.py     # formato único de error y blindaje de los 500
 ├── test_config.py     # tests de config por ambiente y fail-fast
 └── test_database.py   # tests de la capa DB SIN base real (SQLite en memoria)
 .env.example           # plantilla de variables (el .env real NUNCA se commitea)
@@ -106,8 +108,8 @@ por defecto (prepared statements + pool propio con `pool_pre_ping`).
 ```bash
 uv run uvicorn app.main:app          # terminal 1
 curl http://127.0.0.1:8000/v1/health/db   # terminal 2
-# ok:    {"status":"ok","detail":null}
-# fallo: 503 {"status":"error","detail":"No se pudo conectar a la base de datos."}
+# ok:    {"status":"ok"}
+# fallo: 503 {"error":{"code":"service_unavailable","message":"No se pudo conectar a la base de datos.","details":null,"error_id":null}}
 ```
 
 El error nunca incluye la causa real (la URL o el mensaje del driver podrían
@@ -184,18 +186,26 @@ Errores:
   incorrecta: no se revela si la cuenta existe.
 - **`403`** — el email **no está confirmado** (las credenciales son correctas,
   pero falta confirmar el correo). Es un estado distinto de "credenciales
-  malas", así que usa otro status **y** un discriminante explícito en el cuerpo
-  para que el cliente muestre "confirma tu correo" sin inferir:
+  malas", así que usa otro status **y** un código explícito para que el cliente
+  muestre "confirma tu correo" sin inferir:
 
   ```json
-  { "detail": { "reason": "email_not_confirmed", "message": "Debes confirmar tu correo antes de iniciar sesión." } }
+  {
+    "error": {
+      "code": "email_not_confirmed",
+      "message": "Debes confirmar tu correo antes de iniciar sesión.",
+      "details": null,
+      "error_id": null
+    }
+  }
   ```
 
-- **`429`** rate limit · **`503`** fallo del proveedor.
+- **`429`** rate limit (`rate_limited`) · **`503`** fallo del proveedor
+  (`service_unavailable`).
 
 En `@rover/shared`, `ApiClient.login()` devuelve `LoginResponse` (usuario +
-sesión) y lanza `ApiError` con el `status` en los casos de error; el `403` se
-distingue por su status.
+sesión) y lanza `ApiError` en los casos de error, con `status` **y** `code`
+(por el `code` es por donde se ramifica, ver [Formato de errores](#formato-de-errores)).
 
 ### Middleware de auth (rutas protegidas)
 
@@ -290,6 +300,71 @@ quien busque superficie de ataque, y los clientes propios consumen
 Apagarlas desmonta también `/openapi.json` (sin esquema no hay nada que
 renderizar). El default es por ambiente para que no se pueda *olvidar*
 apagarlas: exponerlas en producción exige pedirlo explícitamente.
+
+## Formato de errores
+
+**Toda** respuesta no-2xx de la API —de un endpoint, de la validación o de un
+fallo inesperado— tiene la misma forma (`app/core/errors.py`):
+
+```json
+{
+  "error": {
+    "code": "email_already_exists",
+    "message": "Ya existe una cuenta con ese email.",
+    "details": null,
+    "error_id": null
+  }
+}
+```
+
+- **`code`** — estable y legible por máquina. **Por aquí se ramifica**, no por
+  el status: un `422` puede ser `validation_error`, `weak_password`,
+  `invalid_email` o `preferences_too_large`, y el cliente necesita
+  distinguirlos sin leer mensajes (que cambian y se traducen). Los `error_code`
+  **crudos de Supabase nunca se exponen**: se traducen a códigos de dominio,
+  igual que las excepciones — atar los clientes al proveedor sería revivir el
+  acoplamiento que `services/auth.py` existe para contener.
+- **`message`** — seguro de mostrar al usuario; nunca lleva diagnóstico del
+  proveedor, de la base ni de la excepción.
+- **`details`** — objeto opcional. En un `422` de validación trae `errors` con
+  los fallos campo a campo (**sin** el valor de campos sensibles: la contraseña
+  jamás viaja de vuelta).
+- **`error_id`** — solo en los `500`. Ver más abajo.
+
+Los discriminantes que antes eran casos especiales viven ahora **dentro** del
+formato: el "email sin confirmar" del `403` ya no es un `detail.reason`, es
+`code: "email_not_confirmed"`. Y el **`401` uniforme se mantiene**: todos los
+fallos de token dan exactamente el mismo cuerpo (`unauthenticated`), sin pistas
+sobre cuál falló.
+
+Los endpoints **lanzan `ApiError(status, code, mensaje)`** —semántica—; la forma
+la deciden los handlers, registrados en `create_app()`:
+
+| Excepción | Handler | Resultado |
+| --------- | ------- | --------- |
+| `ApiError` | `api_error_handler` | su status, código y mensaje |
+| `RequestValidationError` | `validation_exception_handler` | `422` `validation_error` + `details.errors` saneados |
+| `HTTPException` (framework) | `http_exception_handler` | código por status (404, 405…) |
+| `Exception` | `unhandled_exception_handler` | `500` blindado |
+
+**Los 500 no filtran nada.** El cliente recibe siempre el mismo mensaje
+genérico más un `error_id` opaco de 12 caracteres; **nunca** el tipo de la
+excepción, su mensaje ni la traza (ahí es donde aparecerían la URL de la base
+con su contraseña, una llave o un token). Ese mismo `error_id` se registra a
+nivel `error` junto a la causa real y el método y ruta de la petición —no la
+query string ni las cabeceras, para que un token en `Authorization` no acabe en
+los logs—. Es el único puente entre lo que ve el usuario y lo que ve quien
+depura:
+
+```
+ERROR app.core.errors: Error no controlado [error_id=9f2c1ab4e77d] en GET /v1/users/me
+Traceback (most recent call last): …
+```
+
+En `@rover/shared`: `isApiErrorResponse` parsea **cualquier** error de la API, y
+`ApiClient` lo convierte en un `ApiError` con `status`, `code`, `details` y
+`errorId`. El tipo de `code` admite strings desconocidos a propósito: un cliente
+ya publicado debe poder parsear un error cuyo código aún no conocía.
 
 ## Migraciones (Alembic)
 

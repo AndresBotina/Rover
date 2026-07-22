@@ -16,12 +16,13 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import AUTH_RESPONSES, CurrentUser, get_current_user
 from app.core.database import get_db
+from app.core.errors import ApiError, ErrorCode, error_doc
 from app.models import Plan, UserProfile
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -86,7 +87,7 @@ async def _cargar_perfil(db: AsyncSession, user_id: uuid.UUID) -> UserProfile:
     """Carga el perfil del usuario; get_current_user garantiza que ya existe."""
     profile = await db.get(UserProfile, user_id)
     if profile is None:  # pragma: no cover - get_current_user ya lo materializa
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Perfil no encontrado.")
+        raise ApiError(status.HTTP_404_NOT_FOUND, ErrorCode.NOT_FOUND, "Perfil no encontrado.")
     return profile
 
 
@@ -118,14 +119,12 @@ async def get_profile(
     summary="Actualizar las preferencias del usuario",
     responses={
         200: {"description": "Perfil ya actualizado (con las preferencias fusionadas)."},
-        422: {
-            "description": (
-                "El cuerpo trae un campo que no es `preferences` (p. ej. `plan`: "
-                "no se ignora, se rechaza y **nada** del cuerpo se aplica), "
-                "`preferences` no es un objeto JSON, o el resultado del merge "
-                "supera el tope de 8 KB."
-            )
-        },
+        422: error_doc(
+            "`validation_error` — el cuerpo trae un campo que no es "
+            "`preferences` (p. ej. `plan`: no se ignora, se rechaza y **nada** "
+            "del cuerpo se aplica) o `preferences` no es un objeto JSON. "
+            "`preferences_too_large` — el resultado del merge supera los 8 KB."
+        ),
         **AUTH_RESPONSES,
     },
 )
@@ -151,8 +150,9 @@ async def update_profile(
 
     merged = {**profile.preferences, **payload.preferences}
     if len(json.dumps(merged).encode("utf-8")) > _MAX_PREFERENCES_BYTES:
-        raise HTTPException(
+        raise ApiError(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
+            ErrorCode.PREFERENCES_TOO_LARGE,
             f"preferences supera el máximo de {_MAX_PREFERENCES_BYTES} bytes.",
         )
 

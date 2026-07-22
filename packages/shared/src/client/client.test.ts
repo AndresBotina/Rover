@@ -51,13 +51,13 @@ test("getDbHealth parsea la respuesta de /v1/health/db", async () => {
   let calledUrl: string | undefined;
   globalThis.fetch = async (input) => {
     calledUrl = String(input);
-    return jsonResponse({ status: "ok", detail: null });
+    return jsonResponse({ status: "ok" });
   };
 
   const dbHealth = await new ApiClient({ baseUrl: "http://api.test" }).getDbHealth();
 
   assert.equal(calledUrl, "http://api.test/v1/health/db");
-  assert.deepEqual(dbHealth, { status: "ok", detail: null });
+  assert.deepEqual(dbHealth, { status: "ok" });
 });
 
 test("un status no-2xx lanza ApiError con el status", async () => {
@@ -156,28 +156,109 @@ test("login hace POST a /v1/auth/login y parsea usuario + sesión", async () => 
   assert.equal(result.user.id, "11111111-1111-1111-1111-111111111111");
 });
 
-test("login con credenciales inválidas (401) lanza ApiError con ese status", async () => {
-  globalThis.fetch = async () => jsonResponse({ detail: "Email o contraseña incorrectos." }, 401);
+test("login con credenciales inválidas (401) lanza ApiError con código y mensaje", async () => {
+  globalThis.fetch = async () =>
+    jsonResponse(
+      {
+        error: {
+          code: "invalid_credentials",
+          message: "Email o contraseña incorrectos.",
+          details: null,
+          error_id: null,
+        },
+      },
+      401,
+    );
 
   await assert.rejects(
     new ApiClient({ baseUrl: "http://api.test" }).login({
       email: "a@b.com",
       password: "una-contrasena-larga",
     }),
-    (error: unknown) => error instanceof ApiError && error.status === 401,
+    (error: unknown) =>
+      error instanceof ApiError &&
+      error.status === 401 &&
+      error.code === "invalid_credentials" &&
+      // El mensaje del servidor se conserva: es seguro de mostrar.
+      error.message === "Email o contraseña incorrectos.",
   );
 });
 
-test("login con email sin confirmar (403) lanza ApiError con status 403", async () => {
+test("login con email sin confirmar se distingue por el code, no por el status", async () => {
   globalThis.fetch = async () =>
-    jsonResponse({ detail: { reason: "email_not_confirmed", message: "…" } }, 403);
+    jsonResponse(
+      {
+        error: {
+          code: "email_not_confirmed",
+          message: "Debes confirmar tu correo antes de iniciar sesión.",
+          details: null,
+          error_id: null,
+        },
+      },
+      403,
+    );
 
   await assert.rejects(
     new ApiClient({ baseUrl: "http://api.test" }).login({
       email: "a@b.com",
       password: "una-contrasena-larga",
     }),
-    (error: unknown) => error instanceof ApiError && error.status === 403,
+    (error: unknown) =>
+      error instanceof ApiError && error.status === 403 && error.code === "email_not_confirmed",
+  );
+});
+
+test("un 500 expone el error_id para reportarlo, sin detalles internos", async () => {
+  globalThis.fetch = async () =>
+    jsonResponse(
+      {
+        error: {
+          code: "internal_error",
+          message: "Ocurrió un error inesperado.",
+          details: null,
+          error_id: "9f2c1ab4e77d",
+        },
+      },
+      500,
+    );
+
+  await assert.rejects(
+    new ApiClient({ baseUrl: "http://api.test" }).getHealth(),
+    (error: unknown) =>
+      error instanceof ApiError &&
+      error.code === "internal_error" &&
+      error.errorId === "9f2c1ab4e77d",
+  );
+});
+
+test("un 422 llega con los errores campo a campo en details", async () => {
+  globalThis.fetch = async () =>
+    jsonResponse(
+      {
+        error: {
+          code: "validation_error",
+          message: "Hay campos inválidos en la petición.",
+          details: { errors: [{ loc: ["body", "email"], type: "value_error" }] },
+          error_id: null,
+        },
+      },
+      422,
+    );
+
+  await assert.rejects(
+    new ApiClient({ baseUrl: "http://api.test" }).login({ email: "malo", password: "x" }),
+    (error: unknown) =>
+      error instanceof ApiError && error.code === "validation_error" && error.details !== null,
+  );
+});
+
+test("un error que NO sigue el formato único sigue dando ApiError con el status", async () => {
+  // P. ej. un 502 de un proxy delante de la API: no hay cuerpo que parsear.
+  globalThis.fetch = async () => new Response("<html>Bad Gateway</html>", { status: 502 });
+
+  await assert.rejects(
+    new ApiClient({ baseUrl: "http://api.test" }).getHealth(),
+    (error: unknown) => error instanceof ApiError && error.status === 502 && error.code === null,
   );
 });
 

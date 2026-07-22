@@ -15,6 +15,7 @@ import {
   type RegisterRequest,
   type RegisterResponse,
 } from "../types/auth.ts";
+import { isApiErrorResponse, type ApiErrorCode } from "../types/error.ts";
 import { isProfile, type Profile, type ProfileUpdate } from "../types/profile.ts";
 import {
   isDbHealthResponse,
@@ -27,19 +28,61 @@ import { resolveBaseUrl, type ApiClientConfig } from "./config.ts";
 /**
  * Error tipado del cliente. Cubre los tres fallos posibles de una llamada:
  * red caída (status null), respuesta no-2xx, o cuerpo con forma inesperada.
+ *
+ * Cuando el backend responde con su formato único de error, `code`, `details`
+ * y `errorId` vienen rellenos y `message` es el del servidor (seguro de
+ * mostrar). Si la respuesta no lo trae —un proxy, un balanceador, un fallo de
+ * red— quedan en `null` y solo hay `status`.
  */
 export class ApiError extends Error {
   /** URL que se estaba llamando. */
   readonly url: string;
   /** Status HTTP de la respuesta, o null si la petición no llegó (fallo de red). */
   readonly status: number | null;
+  /** Código estable del backend; null si la respuesta no siguió el formato. */
+  readonly code: ApiErrorCode | null;
+  /** Detalles estructurados (p. ej. los errores campo a campo de un 422). */
+  readonly details: Record<string, unknown> | null;
+  /** Identificador de un 500, para reportarlo y cruzarlo con los logs. */
+  readonly errorId: string | null;
 
-  constructor(message: string, options: { url: string; status: number | null; cause?: unknown }) {
+  constructor(
+    message: string,
+    options: {
+      url: string;
+      status: number | null;
+      code?: ApiErrorCode | null;
+      details?: Record<string, unknown> | null;
+      errorId?: string | null;
+      cause?: unknown;
+    },
+  ) {
     super(message, { cause: options.cause });
     this.name = "ApiError";
     this.url = options.url;
     this.status = options.status;
+    this.code = options.code ?? null;
+    this.details = options.details ?? null;
+    this.errorId = options.errorId ?? null;
   }
+}
+
+/**
+ * Convierte una respuesta no-2xx en ApiError, aprovechando el formato único
+ * del backend cuando está presente. Un solo type guard para toda la API.
+ */
+async function toApiError(url: string, response: Response): Promise<ApiError> {
+  let body: unknown;
+  try {
+    body = (await response.json()) as unknown;
+  } catch {
+    body = undefined; // cuerpo vacío o no-JSON (p. ej. un error de proxy)
+  }
+  if (isApiErrorResponse(body)) {
+    const { code, message, details, error_id: errorId } = body.error;
+    return new ApiError(message, { url, status: response.status, code, details, errorId });
+  }
+  return new ApiError(`HTTP ${response.status} en ${url}`, { url, status: response.status });
 }
 
 /** Cliente de la API de Rover. Un método tipado por endpoint. */
@@ -153,7 +196,7 @@ async function getJson(
   }
 
   if (!response.ok) {
-    throw new ApiError(`HTTP ${response.status} en ${url}`, { url, status: response.status });
+    throw await toApiError(url, response);
   }
 
   let data: unknown;
@@ -184,7 +227,7 @@ async function sendJson(
   }
 
   if (!response.ok) {
-    throw new ApiError(`HTTP ${response.status} en ${url}`, { url, status: response.status });
+    throw await toApiError(url, response);
   }
 
   let data: unknown;

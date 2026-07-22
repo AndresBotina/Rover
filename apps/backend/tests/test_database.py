@@ -115,7 +115,7 @@ def test_health_db_ok_con_base_sustituta(monkeypatch: pytest.MonkeyPatch) -> Non
         response = client.get("/v1/health/db")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "detail": None}
+    assert response.json() == {"status": "ok"}
 
 
 def test_health_db_error_responde_503_sin_filtrar_secretos(
@@ -134,8 +134,14 @@ def test_health_db_error_responde_503_sin_filtrar_secretos(
         response = client.get("/v1/health/db")
 
     assert response.status_code == 503
+    # Desde la HU-1.8 el fallo sale con el formato ÚNICO de error, no con un
+    # cuerpo propio de la sonda: el cliente parsea todos los errores igual.
     assert response.json() == {
-        "status": "error",
-        "detail": "No se pudo conectar a la base de datos.",
+        "error": {
+            "code": "service_unavailable",
+            "message": "No se pudo conectar a la base de datos.",
+            "details": None,
+            "error_id": None,
+        }
     }
     assert "password-secreta" not in response.text

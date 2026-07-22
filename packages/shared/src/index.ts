@@ -20,6 +20,14 @@ export {
 export { isProfile, type Profile, type ProfileUpdate } from "./types/profile.ts";
 
 export {
+  isApiErrorResponse,
+  type ApiErrorBody,
+  type ApiErrorCode,
+  type ApiErrorResponse,
+  type KnownApiErrorCode,
+} from "./types/error.ts";
+
+export {
   isDbHealthResponse,
   isHealthResponse,
   type DbHealthResponse,

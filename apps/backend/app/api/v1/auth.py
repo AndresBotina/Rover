@@ -10,11 +10,12 @@ import uuid
 from enum import StrEnum
 from typing import Self
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 from sqlalchemy.exc import IntegrityError
 
 from app.core.database import get_db
+from app.core.errors import ApiError, ErrorCode, error_doc
 from app.models import UserProfile
 from app.services import auth as auth_service
 
@@ -135,9 +136,11 @@ class LoginResponse(BaseModel):
     session: SessionOut
 
 
-# Discriminante explícito para que el cliente distinga "email sin confirmar" de
-# "credenciales inválidas" sin inferir del status (mismo espíritu que HU-1.3b).
-_EMAIL_NOT_CONFIRMED_REASON = "email_not_confirmed"
+# NOTA (HU-1.8): el discriminante que distingue "email sin confirmar" de
+# "credenciales inválidas" ya no es un campo `reason` dentro del `detail`: es el
+# `code` del formato único de error (`email_not_confirmed`), que TODOS los
+# errores traen. El contrato no cambia de fondo —el cliente sigue sin inferir
+# nada del status—, cambia de sitio: deja de ser un caso especial.
 
 
 @router.post(
@@ -152,10 +155,13 @@ _EMAIL_NOT_CONFIRMED_REASON = "email_not_confirmed"
                 "exige confirmar el correo (`pending_email_confirmation`)."
             )
         },
-        409: {"description": "Ya existe una cuenta con ese email."},
-        422: {"description": "Email inválido o contraseña rechazada por la política de Supabase."},
-        429: {"description": "Demasiados intentos de registro; reintentar más tarde."},
-        503: {"description": "Supabase Auth no respondió o falló de forma inesperada."},
+        409: error_doc("`email_already_exists` — ya existe una cuenta con ese email."),
+        422: error_doc(
+            "`validation_error` (forma del cuerpo), `weak_password` o "
+            "`invalid_email` (rechazo de la política de Supabase)."
+        ),
+        429: error_doc("`rate_limited` — demasiados intentos de registro."),
+        503: error_doc("`service_unavailable` — Supabase Auth no respondió o falló."),
     },
 )
 async def register(payload: RegisterRequest) -> RegisterResponse:
@@ -177,24 +183,35 @@ async def register(payload: RegisterRequest) -> RegisterResponse:
         result = await auth_service.sign_up(payload.email, payload.password)
     except auth_service.RateLimited as exc:
         _log_provider_failure(logging.WARNING, "límite de tasa", exc)
-        raise HTTPException(
+        raise ApiError(
             status.HTTP_429_TOO_MANY_REQUESTS,
+            ErrorCode.RATE_LIMITED,
             "Demasiados intentos; prueba de nuevo en unos minutos.",
         ) from exc
     except auth_service.EmailAlreadyExists as exc:
         _log_provider_failure(logging.WARNING, "email ya registrado", exc)
         # Mensaje genérico: no confirma NI desmiente más de lo estrictamente
         # necesario (evita que un atacante use /register para enumerar emails).
-        raise HTTPException(
-            status.HTTP_409_CONFLICT, "Ya existe una cuenta con ese email."
+        raise ApiError(
+            status.HTTP_409_CONFLICT,
+            ErrorCode.EMAIL_ALREADY_EXISTS,
+            "Ya existe una cuenta con ese email.",
         ) from exc
     except (auth_service.WeakPassword, auth_service.InvalidEmail) as exc:
         _log_provider_failure(logging.WARNING, "datos rechazados por el proveedor", exc)
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+        # El mensaje del proveedor SÍ se muestra (explica qué falta en la
+        # contraseña); su error_code crudo NO: se traduce al código de dominio.
+        codigo = (
+            ErrorCode.WEAK_PASSWORD
+            if isinstance(exc, auth_service.WeakPassword)
+            else ErrorCode.INVALID_EMAIL
+        )
+        raise ApiError(status.HTTP_422_UNPROCESSABLE_CONTENT, codigo, str(exc)) from exc
     except auth_service.AuthProviderError as exc:
         _log_provider_failure(logging.ERROR, "fallo del proveedor", exc)
-        raise HTTPException(
+        raise ApiError(
             status.HTTP_503_SERVICE_UNAVAILABLE,
+            ErrorCode.SERVICE_UNAVAILABLE,
             "No se pudo completar el registro; intenta de nuevo en unos minutos.",
         ) from exc
 
@@ -223,20 +240,19 @@ async def register(payload: RegisterRequest) -> RegisterResponse:
     summary="Iniciar sesión",
     responses={
         200: {"description": "Credenciales correctas: usuario y sesión de Supabase."},
-        401: {
-            "description": (
-                "Email o contraseña incorrectos. El cuerpo es **idéntico** en "
-                "ambos casos: no se revela si la cuenta existe."
-            )
-        },
-        403: {
-            "description": (
-                "Credenciales correctas pero el email no está confirmado. El "
-                'cuerpo trae `reason: "email_not_confirmed"`.'
-            )
-        },
-        429: {"description": "Demasiados intentos de login; reintentar más tarde."},
-        503: {"description": "Supabase Auth no respondió o falló de forma inesperada."},
+        401: error_doc(
+            "`invalid_credentials` — email o contraseña incorrectos. El cuerpo "
+            "es **idéntico** en ambos casos: no se revela si la cuenta existe."
+        ),
+        403: error_doc(
+            "`email_not_confirmed` — las credenciales son correctas, pero falta "
+            "confirmar el correo. El propio `code` es el discriminante."
+        ),
+        # Declarado a mano para sustituir el 422 automático de FastAPI, cuyo
+        # esquema (HTTPValidationError) ya no es el que devuelve la API.
+        422: error_doc("`validation_error` — el cuerpo no tiene la forma esperada."),
+        429: error_doc("`rate_limited` — demasiados intentos de login."),
+        503: error_doc("`service_unavailable` — Supabase Auth no respondió o falló."),
     },
 )
 async def login(payload: LoginRequest) -> LoginResponse:
@@ -257,31 +273,33 @@ async def login(payload: LoginRequest) -> LoginResponse:
         _log_provider_failure(logging.WARNING, "credenciales inválidas", exc)
         # Mismo mensaje para email inexistente y contraseña incorrecta: no se
         # revela si la cuenta existe (evita enumerar cuentas).
-        raise HTTPException(
-            status.HTTP_401_UNAUTHORIZED, "Email o contraseña incorrectos."
+        raise ApiError(
+            status.HTTP_401_UNAUTHORIZED,
+            ErrorCode.INVALID_CREDENTIALS,
+            "Email o contraseña incorrectos.",
         ) from exc
     except auth_service.EmailNotConfirmed as exc:
         _log_provider_failure(logging.WARNING, "email sin confirmar", exc)
         # 403, no 401: las credenciales SON correctas; lo que falta es confirmar
         # el correo. El cuerpo lleva un discriminante explícito para que el
         # cliente muestre "confirma tu correo" sin inferir del status.
-        raise HTTPException(
+        raise ApiError(
             status.HTTP_403_FORBIDDEN,
-            detail={
-                "reason": _EMAIL_NOT_CONFIRMED_REASON,
-                "message": "Debes confirmar tu correo antes de iniciar sesión.",
-            },
+            ErrorCode.EMAIL_NOT_CONFIRMED,
+            "Debes confirmar tu correo antes de iniciar sesión.",
         ) from exc
     except auth_service.RateLimited as exc:
         _log_provider_failure(logging.WARNING, "límite de tasa", exc)
-        raise HTTPException(
+        raise ApiError(
             status.HTTP_429_TOO_MANY_REQUESTS,
+            ErrorCode.RATE_LIMITED,
             "Demasiados intentos; prueba de nuevo en unos minutos.",
         ) from exc
     except auth_service.AuthProviderError as exc:
         _log_provider_failure(logging.ERROR, "fallo del proveedor", exc)
-        raise HTTPException(
+        raise ApiError(
             status.HTTP_503_SERVICE_UNAVAILABLE,
+            ErrorCode.SERVICE_UNAVAILABLE,
             "No se pudo iniciar sesión; intenta de nuevo en unos minutos.",
         ) from exc
 

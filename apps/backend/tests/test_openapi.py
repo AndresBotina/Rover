@@ -74,7 +74,26 @@ def test_las_rutas_protegidas_documentan_401_y_503(spec: dict[str, Any]) -> None
 def test_los_errores_del_login_estan_documentados(spec: dict[str, Any]) -> None:
     """Los códigos que el cliente debe manejar aparecen en el esquema."""
     respuestas = spec["paths"]["/v1/auth/login"]["post"]["responses"]
-    assert {"200", "401", "403", "429", "503"} <= respuestas.keys()
+    assert {"200", "401", "403", "422", "429", "503"} <= respuestas.keys()
+
+
+def test_todos_los_errores_documentados_usan_el_formato_unico(spec: dict[str, Any]) -> None:
+    """Ningún error puede quedar documentado con otro esquema (HU-1.8).
+
+    Incluye el 422 que FastAPI añade solo: su `HTTPValidationError` ya no es lo
+    que devuelve la API, así que se declara a mano donde aparece.
+    """
+    for path, operaciones in spec["paths"].items():
+        for metodo, operacion in operaciones.items():
+            for code, respuesta in operacion["responses"].items():
+                if int(code) < 400:
+                    continue
+                esquema = respuesta["content"]["application/json"]["schema"]
+                assert esquema["$ref"].endswith("/ErrorResponse"), (
+                    f"{metodo} {path} → {code} no documenta el formato único"
+                )
+    # Y el esquema viejo desaparece del componente: nada lo referencia ya.
+    assert "HTTPValidationError" not in spec["components"]["schemas"]
 
 
 def test_hay_ejemplos_en_los_cuerpos_de_entrada(spec: dict[str, Any]) -> None:

@@ -2,12 +2,13 @@
 
 from typing import Literal
 
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, status
 from pydantic import BaseModel
 from sqlalchemy import text
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.errors import ApiError, ErrorCode, error_doc
 
 router = APIRouter(tags=["health"])
 
@@ -21,10 +22,15 @@ class HealthResponse(BaseModel):
 
 
 class DbHealthResponse(BaseModel):
-    """Estado de la conectividad con la base de datos."""
+    """Conectividad con la base de datos: solo la forma del CASO SANO.
 
-    status: Literal["ok", "error"]
-    detail: str | None = None
+    El fallo NO se reporta aquí con un ``status: "error"``: desde la HU-1.8 un
+    503 sale con el formato único de error, como cualquier otro error de la
+    API. Así el cliente parsea todos los fallos igual (un solo type guard) en
+    vez de tener un caso especial para la sonda.
+    """
+
+    status: Literal["ok"]
 
 
 @router.get(
@@ -48,15 +54,14 @@ def get_health() -> HealthResponse:
     summary="Conectividad con la base de datos",
     responses={
         200: {"description": "La base respondió al `SELECT 1`."},
-        503: {
-            "description": (
-                "No se pudo conectar. El detalle es genérico a propósito: la "
-                "causa real (URL o error del driver) puede contener credenciales."
-            )
-        },
+        503: error_doc(
+            "`service_unavailable` — no se pudo conectar. El mensaje es "
+            "genérico a propósito: la causa real (la URL o el error del driver) "
+            "puede contener credenciales."
+        ),
     },
 )
-async def get_db_health(response: Response) -> DbHealthResponse:
+async def get_db_health() -> DbHealthResponse:
     """Verifica la conexión a la base con un ``SELECT 1`` async.
 
     Itera ``get_db`` directamente (el mismo camino que usará cualquier
@@ -67,7 +72,10 @@ async def get_db_health(response: Response) -> DbHealthResponse:
     try:
         async for session in get_db():
             await session.execute(text("SELECT 1"))
-    except Exception:
-        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return DbHealthResponse(status="error", detail="No se pudo conectar a la base de datos.")
-    return DbHealthResponse(status="ok", detail=None)
+    except Exception as exc:
+        raise ApiError(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            ErrorCode.SERVICE_UNAVAILABLE,
+            "No se pudo conectar a la base de datos.",
+        ) from exc
+    return DbHealthResponse(status="ok")

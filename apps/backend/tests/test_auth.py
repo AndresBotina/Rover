@@ -155,7 +155,14 @@ def test_email_duplicado_responde_409_sin_revelar_de_mas(monkeypatch: pytest.Mon
         response = client.post("/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD})
 
     assert response.status_code == 409
-    assert response.json() == {"detail": "Ya existe una cuenta con ese email."}
+    assert response.json() == {
+        "error": {
+            "code": "email_already_exists",
+            "message": "Ya existe una cuenta con ese email.",
+            "details": None,
+            "error_id": None,
+        }
+    }
 
 
 def test_contrasena_rechazada_por_supabase_responde_422(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -165,6 +172,9 @@ def test_contrasena_rechazada_por_supabase_responde_422(monkeypatch: pytest.Monk
         response = client.post("/v1/auth/register", json={"email": _EMAIL, "password": _PASSWORD})
 
     assert response.status_code == 422
+    # Código propio (no `validation_error`): el cliente distingue "la política
+    # de Supabase la rechazó" de "el cuerpo tiene mala forma".
+    assert response.json()["error"]["code"] == "weak_password"
 
 
 def test_email_rechazado_por_supabase_responde_422(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -229,6 +239,8 @@ def test_fallo_del_proveedor_responde_503_sin_filtrar_detalles_internos(
 
     assert response.status_code == 503
     assert "secreta-interna" not in response.text
+    # El código crudo del proveedor NUNCA se expone: sale el de dominio.
+    assert response.json()["error"]["code"] == "service_unavailable"
 
 
 def test_fallo_al_crear_el_perfil_local_no_rompe_el_registro(
@@ -274,6 +286,9 @@ def test_rate_limit_de_supabase_responde_429(
             )
 
     assert response.status_code == 429
+    assert response.json()["error"]["code"] == "rate_limited"
+    # El error_code CRUDO de Supabase queda en el log, no en la respuesta.
+    assert "over_email_send_rate_limit" not in response.text
     # El servidor deja rastro de la causa real (status + error_code), sin secretos.
     assert "over_email_send_rate_limit" in caplog.text
     assert _PASSWORD not in caplog.text
@@ -314,8 +329,11 @@ def test_contrasena_corta_no_aparece_en_el_cuerpo_del_422(monkeypatch: pytest.Mo
 
     assert response.status_code == 422
     assert "abc123" not in response.text
-    # El resto del error de validación se conserva (tipo y ubicación del campo).
-    detalle = response.json()["detail"][0]
+    # El resto del error de validación se conserva (tipo y ubicación del campo),
+    # ahora bajo details.errors del formato único (HU-1.8).
+    error = response.json()["error"]
+    assert error["code"] == "validation_error"
+    detalle = error["details"]["errors"][0]
     assert detalle["loc"][-1] == "password"
     assert "input" not in detalle
 
@@ -702,7 +720,14 @@ def test_login_credenciales_invalidas_401_mismo_mensaje_exista_o_no_el_email(
     assert r_email_inexistente.status_code == 401
     assert r_password_mala.status_code == 401
     assert r_email_inexistente.json() == r_password_mala.json()
-    assert r_password_mala.json() == {"detail": "Email o contraseña incorrectos."}
+    assert r_password_mala.json() == {
+        "error": {
+            "code": "invalid_credentials",
+            "message": "Email o contraseña incorrectos.",
+            "details": None,
+            "error_id": None,
+        }
+    }
 
 
 def test_login_email_sin_confirmar_403_con_discriminante_explicito(
@@ -718,9 +743,10 @@ def test_login_email_sin_confirmar_403_con_discriminante_explicito(
         response = client.post("/v1/auth/login", json={"email": _EMAIL, "password": _PASSWORD})
 
     assert response.status_code == 403
-    detail = response.json()["detail"]
-    assert detail["reason"] == "email_not_confirmed"
-    assert "confirmar" in detail["message"].lower()
+    # El discriminante ES el code del formato único (antes: detail.reason).
+    error = response.json()["error"]
+    assert error["code"] == "email_not_confirmed"
+    assert "confirmar" in error["message"].lower()
 
 
 def test_login_rate_limit_responde_429(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -737,6 +763,7 @@ def test_login_rate_limit_responde_429(monkeypatch: pytest.MonkeyPatch) -> None:
         response = client.post("/v1/auth/login", json={"email": _EMAIL, "password": _PASSWORD})
 
     assert response.status_code == 429
+    assert response.json()["error"]["code"] == "rate_limited"
 
 
 def test_login_fallo_del_proveedor_responde_503(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -749,6 +776,7 @@ def test_login_fallo_del_proveedor_responde_503(monkeypatch: pytest.MonkeyPatch)
         response = client.post("/v1/auth/login", json={"email": _EMAIL, "password": _PASSWORD})
 
     assert response.status_code == 503
+    assert response.json()["error"]["code"] == "service_unavailable"
 
 
 def test_login_contrasena_no_aparece_en_el_cuerpo_del_422(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -761,7 +789,7 @@ def test_login_contrasena_no_aparece_en_el_cuerpo_del_422(monkeypatch: pytest.Mo
 
     assert response.status_code == 422
     assert "MARCADOR" not in response.text
-    detalle = response.json()["detail"][0]
+    detalle = response.json()["error"]["details"]["errors"][0]
     assert detalle["loc"][-1] == "password"
     assert "input" not in detalle
 
@@ -827,7 +855,7 @@ def test_login_e2e_invalid_credentials_por_error_code_es_401(
         response = client.post("/v1/auth/login", json={"email": _EMAIL, "password": _PASSWORD})
 
     assert response.status_code == 401
-    assert response.json() == {"detail": "Email o contraseña incorrectos."}
+    assert response.json()["error"]["code"] == "invalid_credentials"
 
 
 def test_login_e2e_email_not_confirmed_por_error_code_es_403(
@@ -841,7 +869,7 @@ def test_login_e2e_email_not_confirmed_por_error_code_es_403(
         response = client.post("/v1/auth/login", json={"email": _EMAIL, "password": _PASSWORD})
 
     assert response.status_code == 403
-    assert response.json()["detail"]["reason"] == "email_not_confirmed"
+    assert response.json()["error"]["code"] == "email_not_confirmed"
 
 
 def test_login_e2e_respuesta_sin_sesion_es_503(monkeypatch: pytest.MonkeyPatch) -> None:

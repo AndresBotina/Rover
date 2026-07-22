@@ -10,12 +10,13 @@ import uuid
 from dataclasses import dataclass
 from typing import Annotated, Any
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, Request, status
 from fastapi.security import HTTPBearer
 from fastapi.security.http import HTTPAuthorizationCredentials
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.core.database import get_db
+from app.core.errors import ApiError, ErrorCode, error_doc
 from app.core.security import JWKSUnavailable, TokenError, validate_access_token
 from app.models import Plan, UserProfile
 
@@ -51,19 +52,16 @@ _SERVICE_UNAVAILABLE_DETAIL = "Servicio no disponible temporalmente."
 # el cuerpo del 401 es uniforme a propósito y la documentación no debe sugerir
 # lo contrario.
 AUTH_RESPONSES: dict[int | str, dict[str, Any]] = {
-    401: {
-        "description": (
-            "Falta el token, o no es válido (formato, firma, expiración, "
-            "issuer o audiencia). El cuerpo es **uniforme** para todos los "
-            "motivos; el motivo real solo va al log del servidor."
-        )
-    },
-    503: {
-        "description": (
-            "Fallo de infraestructura propia (el JWKS de Supabase o la base de "
-            "datos no están disponibles). No implica que el token sea inválido."
-        )
-    },
+    401: error_doc(
+        "`unauthenticated` — falta el token, o no es válido (formato, firma, "
+        "expiración, issuer o audiencia). El cuerpo es **uniforme** para todos "
+        "los motivos; el motivo real solo va al log del servidor."
+    ),
+    503: error_doc(
+        "`service_unavailable` — fallo de infraestructura propia (el JWKS de "
+        "Supabase o la base de datos no están disponibles). No implica que el "
+        "token sea inválido."
+    ),
 }
 
 
@@ -76,11 +74,20 @@ class CurrentUser:
     plan: Plan
 
 
-def _unauthorized() -> HTTPException:
-    return HTTPException(
+def _unauthorized() -> ApiError:
+    return ApiError(
         status.HTTP_401_UNAUTHORIZED,
+        ErrorCode.UNAUTHENTICATED,
         _UNAUTHORIZED_DETAIL,
         headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def _service_unavailable() -> ApiError:
+    return ApiError(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        ErrorCode.SERVICE_UNAVAILABLE,
+        _SERVICE_UNAVAILABLE_DETAIL,
     )
 
 
@@ -168,9 +175,7 @@ async def get_current_user(
         raise _unauthorized() from exc
     except JWKSUnavailable as exc:
         logger.error("No se pudo validar el token: JWKS no disponible.")
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE, _SERVICE_UNAVAILABLE_DETAIL
-        ) from exc
+        raise _service_unavailable() from exc
 
     try:
         profile = await _resolve_or_create_profile(user_id=user_id, email=email)
@@ -178,8 +183,6 @@ async def get_current_user(
         # Sin traza ni mensaje del error: podría contener la URL de la base (con
         # credenciales). Solo el id del usuario, que no es secreto.
         logger.error("No se pudo resolver el perfil local del usuario %s.", user_id)
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE, _SERVICE_UNAVAILABLE_DETAIL
-        ) from exc
+        raise _service_unavailable() from exc
 
     return CurrentUser(id=profile.id, email=profile.email, plan=profile.plan)
