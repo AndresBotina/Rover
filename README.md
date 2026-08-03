@@ -32,8 +32,9 @@ rover/
 ```
 
 > La documentación del proyecto (backlog incluido) vive en
-> [`docs/`](docs/): `backlog.md` (Épica 0 en curso) y `backlog-full.md`
-> (panorama de las 7 épicas).
+> [`docs/`](docs/): `backlog.md` (épica en curso), `backlog-full.md` (panorama
+> de las 7 épicas), [`auth.md`](docs/auth.md) (sesión y renovación de tokens) y
+> [`deploy.md`](docs/deploy.md).
 
 ## Requisitos
 

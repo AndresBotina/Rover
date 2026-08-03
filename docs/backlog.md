@@ -257,15 +257,25 @@ Contexto: con **"Confirm email" activado** en Supabase (lo deseable en producci�
 
 ---
 
-### HU-1.5 — Renovación de sesión
+### ✅ HU-1.5 — Renovación de sesión
 *Como* usuario, *quiero* renovar mi sesión sin volver a loguearme, *para* una experiencia fluida sobre todo en móvil.
 
-**Criterios de aceptación:**
-- El refresh y la **rotación** de tokens son responsabilidad de Supabase (y de su SDK en los clientes web/móvil); el backend **no** implementa lógica propia de refresh ni de rotación.
-- El flujo queda documentado: cómo renuevan sesión los clientes contra Supabase.
-- Solo si aporta a los clientes, se expone un `POST /v1/auth/refresh` que **delega** en Supabase; en ese caso, refresh token inválido o expirado responde `401` y hay tests con el cliente mockeado.
+**HU de DOCUMENTACIÓN: no se escribió código.** El refresh y la rotación ya los resuelven Supabase y su SDK; el trabajo era dejar el flujo preciso por escrito para que las Épicas 3 y 4 no tengan que investigarlo otra vez. El resultado vive en [`docs/auth.md`](auth.md).
 
-**Tareas técnicas:** documentar el flujo de refresh de Supabase · decidir si se expone un endpoint de refresh delegado (y si sí: endpoint + tests con mock).
+**Criterios de aceptación (como se construyó):**
+- **El backend no renueva nada.** Valida el access token en local (HU-1.6) y responde `401` cuando ya no vale. No firma, no renueva, no revoca, y **nunca ve el refresh token** después del login.
+- **El `401` de un token expirado es el `401` uniforme de siempre** y NO dice que el motivo fuera la expiración (mismo cuerpo para token ausente, malformado, con firma inválida o caducado; el motivo real solo va al log). Consecuencia documentada para los clientes: **no deben deducir del `401` si "basta con refrescar"** — esa decisión la toma el SDK, que sabe cuándo expira porque tiene la sesión.
+- **La renovación la hace el SDK, directamente contra Supabase**, con `autoRefreshToken` (activo por defecto): renueva *antes* de expirar, de forma transparente. Rover no aparece en esa flecha.
+- **Rotación documentada con sus dos reglas prácticas:** cada refresh puede emitir un refresh token nuevo e invalidar el anterior, así que (1) nunca copiar el refresh token a un sitio propio —la copia caduca en la siguiente renovación— y (2) no implementar reintentos propios de la llamada de refresh: reenviar uno ya consumido es lo que Supabase detecta como reuso. Hay una ventana corta de reutilización para renovaciones concurrentes, que el SDK ya coordina.
+- **Fallo del refresh → re-login.** Refresh token expirado, revocado o reusado no tiene recuperación desde el cliente: el SDK emite `SIGNED_OUT`, limpia la sesión y la app manda al login. El backend no participa ni tiene nada que avisar.
+- **Almacenamiento de tokens apuntado, no implementado:** web → decidir `@supabase/ssr` con cookies **antes** de la primera pantalla si hay Server Components o middleware (cambiarlo después toca layout, middleware y cada lectura); móvil → almacén seguro del sistema verificando su límite de tamaño por valor, `detectSessionInUrl: false`, y `startAutoRefresh`/`stopAutoRefresh` enganchados al `AppState` (los temporizadores no corren en segundo plano).
+- **Checklists concretas para la Épica 3 y la Épica 4**, para que la sesión no se improvise cuando empiecen.
+
+**Decisión: NO se expone `POST /v1/auth/refresh`.** Justificación completa en [`docs/auth.md`](auth.md#decisión-no-hay-un-post-v1authrefresh-propio); en corto: sería una reimplementación peor de lo que el SDK ya hace (el valor está en renovar antes de expirar, deduplicar renovaciones concurrentes y manejar la rotación, no en la llamada HTTP); añadiría un salto en el camino crítico de *seguir logueado* y convertiría a Rover en punto único de fallo para la sesión (hoy, con Rover caído, el usuario no puede usar la app pero **sigue autenticado**); ampliaría el radio de exposición del refresh token a nuestros logs y proxy en **cada** renovación en vez de una sola vez; y la rotación lo hace activamente peligroso de proxiar (un reintento ingenuo ante un timeout invalida una sesión válida). Se evaluaron y descartaron los casos a favor: un cliente sin SDK no existe hoy (y querría una credencial de servicio, no un refresh token de usuario), la revocación de sesiones es **otro** endpoint (`/v1/auth/logout`, posible HU futura) y ocultar la URL/anon key no compra nada porque son públicas por diseño. **Lo único que cambiaría la decisión** es querer que los clientes no hablen nunca con Supabase (p. ej. para poder cambiar de proveedor sin tocar web y móvil), pero eso obliga a proxiar **todo** el ciclo de sesión y renunciar al SDK: es una decisión de arquitectura de todo o nada, no un endpoint suelto.
+
+**Punto ambiguo resuelto para las Épicas 3 y 4:** como Rover ya expone `/v1/auth/login`, había que decidir si el cliente se loguea contra Rover o contra el SDK — y importa, porque **el SDK solo renueva las sesiones que él conoce**: una sesión obtenida por `/v1/auth/login` y guardada a mano **no se renueva sola**. Recomendado: login contra Rover y entregarle la sesión al SDK con `setSession(...)` acto seguido. Conserva el catálogo de `code` de dominio y el contrato único de error (HU-1.8) sin renunciar al auto-refresh, porque el SDK acaba siendo el dueño de la sesión igual.
+
+**Tareas técnicas:** `docs/auth.md` (flujo, rotación, fallo, almacenamiento, decisión del endpoint, checklists por épica) · enlaces desde el README del backend y el raíz · sin cambios en código (tests, lint y types siguen igual de verdes).
 
 ---
 

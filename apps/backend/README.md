@@ -128,6 +128,12 @@ sino que valida los de Supabase. Toda la interacción con el proveedor vive en
 `app/services/auth.py` (HTTP directo contra GoTrue); ningún otro módulo habla
 con Supabase.
 
+> **Renovación de sesión:** el backend **no** la implementa —valida el access
+> token y responde `401` cuando ya no vale— y **no** expone un endpoint de
+> refresh. Quien renueva es el SDK de Supabase en el cliente. El flujo completo
+> (rotación, fallo → re-login, almacenamiento de tokens, y qué debe hacer cada
+> cliente) está en [`docs/auth.md`](../../docs/auth.md).
+
 ### `POST /v1/auth/register`
 
 Registra un usuario (email + contraseña) y crea su fila de **perfil** local de
