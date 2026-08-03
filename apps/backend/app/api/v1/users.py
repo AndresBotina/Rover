@@ -20,12 +20,23 @@ from fastapi import APIRouter, Depends, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import AUTH_RESPONSES, CurrentUser, get_current_user
+from app.api.deps import (
+    AUTH_RESPONSES,
+    CurrentUser,
+    enforce_user_rate_limit,
+    get_current_user,
+)
 from app.core.database import get_db
 from app.core.errors import ApiError, ErrorCode, error_doc
 from app.models import Plan, UserProfile
 
-router = APIRouter(prefix="/users", tags=["users"])
+# La cuota por usuario (HU-1.7) se declara a nivel de ROUTER, no endpoint a
+# endpoint: así una ruta protegida nueva nace con cuota en vez de olvidarla.
+router = APIRouter(
+    prefix="/users",
+    tags=["users"],
+    dependencies=[Depends(enforce_user_rate_limit)],
+)
 
 # Tope del objeto ``preferences`` (JSON serializado). Es un JSONB de forma
 # libre; sin límite, alguien podría almacenar payloads enormes en cada fila.

@@ -7,6 +7,7 @@ materialización— lo crea de forma perezosa e idempotente si aún no existe.
 
 import logging
 import uuid
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Annotated, Any
 
@@ -15,8 +16,16 @@ from fastapi.security import HTTPBearer
 from fastapi.security.http import HTTPAuthorizationCredentials
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.errors import ApiError, ErrorCode, error_doc
+from app.core.rate_limit import (
+    RATE_LIMIT_MESSAGE,
+    get_rate_limit_store,
+    make_key,
+    rate_limit_headers,
+    rule_for_user,
+)
 from app.core.security import JWKSUnavailable, TokenError, validate_access_token
 from app.models import Plan, UserProfile
 
@@ -56,6 +65,11 @@ AUTH_RESPONSES: dict[int | str, dict[str, Any]] = {
         "`unauthenticated` — falta el token, o no es válido (formato, firma, "
         "expiración, issuer o audiencia). El cuerpo es **uniforme** para todos "
         "los motivos; el motivo real solo va al log del servidor."
+    ),
+    429: error_doc(
+        "`rate_limited` — se agotó la cuota de peticiones de la cuenta "
+        "(HU-1.7). La cabecera `Retry-After` dice en cuántos segundos "
+        "reintentar."
     ),
     503: error_doc(
         "`service_unavailable` — fallo de infraestructura propia (el JWKS de "
@@ -130,25 +144,32 @@ async def _resolve_or_create_profile(*, user_id: uuid.UUID, email: str) -> UserP
     y con manejo de carrera: si dos peticiones simultáneas del mismo usuario
     nuevo compiten, el ``IntegrityError`` del segundo se resuelve releyendo la
     fila que creó el primero.
-    """
-    async for session in get_db():
-        existing = await session.get(UserProfile, user_id)
-        if existing is not None:
-            return existing
 
-        profile = UserProfile(id=user_id, email=email)
-        session.add(profile)
-        try:
-            await session.commit()
-        except IntegrityError:
-            # Otra petición creó el perfil entre el get y el commit: no es un
-            # error, es la carrera esperada. Se relee la fila existente.
-            await session.rollback()
+    ``aclosing`` no es decorativo: esta función SALE con ``return`` desde dentro
+    del ``async for``, y eso deja el generador de ``get_db`` suspendido en su
+    ``yield`` — con la sesión (y su conexión) abiertas hasta que pase el
+    recolector. ``aclosing`` lo cierra en el momento, que es lo que hace
+    ``Depends`` cuando la dependencia se inyecta de la forma normal.
+    """
+    async with aclosing(get_db()) as sesiones:
+        async for session in sesiones:
             existing = await session.get(UserProfile, user_id)
-            if existing is None:
-                raise  # IntegrityError por otra causa: que suba.
-            return existing
-        return profile
+            if existing is not None:
+                return existing
+
+            profile = UserProfile(id=user_id, email=email)
+            session.add(profile)
+            try:
+                await session.commit()
+            except IntegrityError:
+                # Otra petición creó el perfil entre el get y el commit: no es
+                # un error, es la carrera esperada. Se relee la fila existente.
+                await session.rollback()
+                existing = await session.get(UserProfile, user_id)
+                if existing is None:
+                    raise  # IntegrityError por otra causa: que suba.
+                return existing
+            return profile
 
     raise RuntimeError("get_db no entregó una sesión")  # pragma: no cover
 
@@ -186,3 +207,59 @@ async def get_current_user(
         raise _service_unavailable() from exc
 
     return CurrentUser(id=profile.id, email=profile.email, plan=profile.plan)
+
+
+# --- Cuota por usuario (HU-1.7) ----------------------------------------------
+# El middleware (app/api/middleware.py) limita por IP; esto limita por CUENTA.
+# Va aquí y no allí porque la identidad no existe hasta que get_current_user
+# valida el token: FastAPI cachea esa dependencia, así que resolver el usuario
+# no se paga dos veces.
+
+
+# PUNTO DE EXTENSIÓN de los límites por plan (Épica 5, monetización). Hoy free
+# y pro pesan igual porque ROVER_RATE_LIMIT_PRO_MULTIPLIER vale 1.0; subirlo da
+# más cupo a los planes de pago sin tocar código. Un plan nuevo es una entrada
+# más en este mapa, y las cuotas de consumo del agente (Épica 2 — tokens de
+# LLM, minutos de voz) son ámbitos NUEVOS con su propia regla, no un cambio
+# aquí: esto acota peticiones, aquello acotará consumo.
+def _multiplicador_del_plan(plan: Plan) -> float:
+    return settings.rate_limit_pro_multiplier if plan is Plan.PRO else 1.0
+
+
+async def enforce_user_rate_limit(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+) -> None:
+    """Consume una unidad de la cuota del usuario; 429 cuando se agota.
+
+    Se aplica a TODO el router de ``users`` (y a cualquier router protegido que
+    se añada) declarándola en ``include_router``/``APIRouter``, no endpoint a
+    endpoint: así una ruta protegida nueva nace con cuota en vez de olvidarla.
+    """
+    if not settings.rate_limit_enabled:
+        return
+
+    regla = rule_for_user(multiplier=_multiplicador_del_plan(user.plan))
+    resultado = await get_rate_limit_store().hit(
+        make_key(regla.scope, "user", str(user.id)),
+        limit=regla.limit,
+        window_seconds=regla.window_seconds,
+    )
+    if resultado.allowed:
+        return
+
+    # El id del usuario sí (es la clave para diagnosticar), el email no: no
+    # hace falta un dato personal en el log para saber qué cuenta se pasó.
+    logger.warning(
+        "Rate limit de usuario superado: user_id=%s plan=%s limite=%s/%ss retry_after=%ss",
+        user.id,
+        user.plan.value,
+        regla.limit,
+        regla.window_seconds,
+        resultado.retry_after_seconds,
+    )
+    raise ApiError(
+        status.HTTP_429_TOO_MANY_REQUESTS,
+        ErrorCode.RATE_LIMITED,
+        RATE_LIMIT_MESSAGE,
+        headers=rate_limit_headers(resultado),
+    )

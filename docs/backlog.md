@@ -284,18 +284,30 @@ Contexto: con **"Confirm email" activado** en Supabase (lo deseable en producci�
 
 ---
 
-### HU-1.7 — Rate limiting por plan
-*Como* operador del producto, *quiero* limitar peticiones según el plan del usuario, *para* controlar costos y habilitar el freemium.
+### ✅ HU-1.7 — Rate limiting
+*Como* operador del producto, *quiero* limitar las peticiones a la API, *para* protegerla de abuso y dejar los cimientos de las cuotas por plan.
 
-**Criterios de aceptación:**
-- Rate limiting aplicado por usuario, con límites distintos según plan (free vs pago).
-- Excederse responde `429` con mensaje claro y cabecera de cuándo reintentar.
-- El contador es consistente aunque haya varios workers (estado compartido, no en memoria local).
-- Test verifica que el límite se respeta y se resetea.
+**Criterios de aceptación (como se construyó):**
+- **Tres controles con contadores independientes**, porque protegen cosas distintas: **global por IP** (120/min — protección base de toda la API, incluidas las rutas que no existen), **auth por IP** (10/min en `POST /v1/auth/login` y `/register`) y **usuario por id del token** (60/min en las rutas protegidas). Agotar uno no gasta los otros.
+- **El de auth es el estricto porque es donde se adivinan contraseñas:** con 10/min, un diccionario de 10.000 contraseñas pasa de minutos a casi 17 horas **por IP**, y eso además del límite propio de Supabase. El de usuario es más estricto que el global a propósito — el global protege la máquina, el de usuario acota lo que consume una cuenta.
+- **Clave por IP antes de autenticarse y por usuario después.** Antes del token la IP es lo único disponible (y es justo el caso de login/registro); después la cuenta es mejor clave, porque detrás de un NAT o de una operadora móvil mucha gente legítima comparte dirección y limitar solo por IP dejaría que uno se comiera el cupo de todos. Una ruta protegida pasa por los dos controles: manda el más estricto.
+- **IP no falsificable detrás del proxy.** `X-Forwarded-For` es una lista donde cada proxy **añade al final**; la primera entrada la escribe el cliente. Se lee la entrada `ROVER_RATE_LIMIT_TRUSTED_PROXIES`-ésima **empezando por el final** (1 = el edge de Render), y con `0` la cabecera se ignora del todo. Las entradas que no son una IP válida se descartan: si no, mandar basura distinta en cada petición esquivaría el conteo **y** haría crecer el almacén sin límite.
+- **Algoritmo: ventana deslizante** por marcas de tiempo, no ventana fija — la fija permite el doble del límite a caballo del corte (diez a las 11:59:59 y diez a las 12:00:00), que es justo el agujero que importa en el login. Con límites pequeños (10–120) la exactitud sale casi gratis y el `Retry-After` es **exacto**, no una estimación.
+- **`429` en el formato único de la HU-1.8**, con `code: "rate_limited"` y las cabeceras `Retry-After` (segundos, nunca 0), `X-RateLimit-Limit`, `X-RateLimit-Remaining` y `X-RateLimit-Reset`. **Mismo `code` que el 429 que nace de un rechazo de Supabase**, a propósito: la acción del cliente es idéntica y el catálogo de códigos es de dominio, no de origen (distinguirlos revelaría que hay un proveedor detrás). Los rechazos se loguean a `warning` con IP/ruta o id de usuario, nunca con el token.
+- **Almacén tras una interfaz (`RateLimitStore`), implementación en memoria.** `hit()` registra y consulta en **una sola operación atómica**: partirlo reabriría la carrera entre consultar y registrar.
+- **`@rover/shared`:** `isRateLimitedError` (type guard del 429), `parseRetryAfter` (acepta las dos formas de la RFC 9110: segundos o fecha HTTP, nunca negativo) y `ApiError.retryAfterSeconds`.
+- **Enganche de los planes listo, sin la política comercial:** `rule_for_user(multiplier=…)` escala la cuota y `_multiplicador_del_plan` traduce el plan; hoy free y pro pesan igual (`ROVER_RATE_LIMIT_PRO_MULTIPLIER=1.0`). Las cuotas de **consumo** del agente (tokens, voz — Épica 2) serán ámbitos **nuevos** con su propia regla: esto acota peticiones, aquello acotará consumo.
+- **Tests (33 nuevos, 151 en total):** almacén (límite exacto, reseteo por ventana, deslizante vs fija, claves independientes, `peek` sin consumir, ráfagas concurrentes) · IP tras el proxy (falsificación ignorada, cabecera repetida, IPv6, puerto, basura, caída al peer) · límites aplicados por HTTP (429 con formato y cabeceras, auth más estricto que global, rutas inexistentes cuentan, health exento, interruptor) · cuota de usuario y multiplicador de plan · el 429 es **idéntico** venga del middleware o de la dependencia.
 
-**Tareas técnicas:** elegir backend de estado (Redis serverless tipo Upstash, o Supabase) · integrar slowapi o equivalente · límites por plan en config · tests.
+**Divergencia consciente del criterio original** — el criterio decía *"el contador es consistente aunque haya varios workers (estado compartido, no en memoria local)"* y **no** se implementó así:
 
-> Nota: arranca con límites simples por nº de requests. El control de **tokens/voz** del agente irá en la Épica 2, apoyado en estos cimientos.
+> El conteo vive en la **memoria del proceso**: con varias instancias el límite efectivo se multiplica por el número de instancias.
+
+Se pospone porque el despliegue es de **una sola instancia** (Render, plan free) y Redis añadiría, desde ya, un salto de red en **cada** petición y una decisión nueva que hoy no hace falta tomar (si Redis cae, ¿se deja pasar el tráfico o se corta?). **El punto de cambio está aislado**: migrar es implementar `RateLimitStore` con un `ZSET` + script Lua y llamar a `reset_rate_limit_store(RedisRateLimitStore(...))` al arrancar — ni la política, ni el middleware, ni la dependencia, ni los endpoints cambian. Queda como **deuda técnica con disparador claro: la segunda instancia**.
+
+**Tareas técnicas:** interfaz `RateLimitStore` + implementación en memoria (`app/core/rate_limit.py`) · middleware ASGI por IP (`app/api/middleware.py`) · dependencia de cuota por usuario (`app/api/deps.py`) · límites y multiplicador en `Settings` · `conftest.py` que aísla el contador entre tests · tipos y type guard en `@rover/shared` · documentación en el README del backend.
+
+> **De regalo:** se cerró una fuga en `_resolve_or_create_profile` — salía con `return` desde dentro del `async for` sobre `get_db()`, dejando la sesión (y su conexión) abiertas hasta que pasara el recolector. Ahora usa `aclosing`, que es lo que hace `Depends` cuando la dependencia se inyecta de la forma normal.
 
 ---
 
@@ -415,5 +427,5 @@ La HU original juntaba **modelo + migración** y **endpoints**. Se dividió para
 ## Cómo arrancamos la Épica 1
 
 - **Orden sugerido** (de `backlog-full.md`): empezar por **HU-1.1 → 1.2** (base de datos y migraciones) **antes de auth**; luego 1.3 → 1.4 → 1.5 → 1.6 (auth completa), y de ahí 1.7–1.12.
-- **Decisiones que se resuelven en el camino (no bloquean):** backend de estado para rate limiting (Redis serverless tipo Upstash, o Supabase) — necesaria recién en la HU-1.7.
+- **Decisiones resueltas:** el backend de estado para rate limiting (HU-1.7) es **memoria del proceso**, tras la interfaz `RateLimitStore`. Redis (Upstash o propio) queda pospuesto con un disparador explícito: **cuando haya una segunda instancia**.
 - **Siguiente épica:** cuando las 12 HU estén *Done*, añadimos la Épica 2 (El agente) a este documento.

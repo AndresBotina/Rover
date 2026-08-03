@@ -9,7 +9,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { isApiErrorResponse } from "./error.ts";
+import { isApiErrorResponse, parseRetryAfter, RATE_LIMITED } from "./error.ts";
 
 const ERROR_401 = {
   error: {
@@ -83,4 +83,50 @@ test("rechaza valores que no son objeto", () => {
   assert.equal(isApiErrorResponse(null), false);
   assert.equal(isApiErrorResponse("error"), false);
   assert.equal(isApiErrorResponse(undefined), false);
+});
+
+// --- Retry-After del 429 (HU-1.7) --------------------------------------------
+
+test("parseRetryAfter entiende la forma en segundos (la que manda esta API)", () => {
+  assert.equal(parseRetryAfter("30"), 30);
+  assert.equal(parseRetryAfter("  30  "), 30);
+  assert.equal(parseRetryAfter("0"), 0);
+});
+
+test("parseRetryAfter entiende una fecha HTTP y la convierte a segundos", () => {
+  const ahora = new Date("2026-08-03T10:00:00Z");
+
+  assert.equal(parseRetryAfter("Mon, 03 Aug 2026 10:00:45 GMT", ahora), 45);
+});
+
+test("parseRetryAfter nunca devuelve segundos negativos", () => {
+  const ahora = new Date("2026-08-03T10:00:00Z");
+
+  // Una fecha ya pasada significa "reintenta ya", no "reintenta en el pasado".
+  assert.equal(parseRetryAfter("Mon, 03 Aug 2026 09:59:00 GMT", ahora), 0);
+});
+
+test("parseRetryAfter devuelve null si falta la cabecera o no se entiende", () => {
+  assert.equal(parseRetryAfter(null), null);
+  assert.equal(parseRetryAfter(undefined), null);
+  assert.equal(parseRetryAfter(""), null);
+  assert.equal(parseRetryAfter("pronto"), null);
+  // Nada de aceptar a medias un número mal escrito: o son dígitos, o no vale.
+  assert.equal(parseRetryAfter("12abc"), null);
+  assert.equal(parseRetryAfter("-5"), null);
+});
+
+test("rate_limited es un código conocido del catálogo", () => {
+  assert.equal(RATE_LIMITED, "rate_limited");
+  assert.equal(
+    isApiErrorResponse({
+      error: {
+        code: RATE_LIMITED,
+        message: "Demasiadas peticiones.",
+        details: null,
+        error_id: null,
+      },
+    }),
+    true,
+  );
 });

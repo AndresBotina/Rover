@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 
-import { ApiClient, ApiError } from "./client.ts";
+import { ApiClient, ApiError, isRateLimitedError } from "./client.ts";
 
 const originalFetch = globalThis.fetch;
 afterEach(() => {
@@ -362,4 +362,65 @@ test("un fallo de red lanza ApiError con status null", async () => {
     new ApiClient({ baseUrl: "http://api.test" }).getHealth(),
     (error: unknown) => error instanceof ApiError && error.status === null,
   );
+});
+
+// --- 429 y Retry-After (HU-1.7) ----------------------------------------------
+
+function rateLimitedResponse(retryAfter: string | null): Response {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (retryAfter !== null) {
+    headers["Retry-After"] = retryAfter;
+  }
+  return new Response(
+    JSON.stringify({
+      error: {
+        code: "rate_limited",
+        message: "Demasiadas peticiones; espera un momento antes de reintentar.",
+        details: null,
+        error_id: null,
+      },
+    }),
+    { status: 429, headers },
+  );
+}
+
+test("un 429 llega como ApiError con el code y los segundos de Retry-After", async () => {
+  globalThis.fetch = async () => rateLimitedResponse("42");
+
+  await assert.rejects(
+    new ApiClient({ baseUrl: "http://api.test" }).login({
+      email: "ana@example.com",
+      password: "un-secreto-largo",
+    }),
+    (error: unknown) =>
+      error instanceof ApiError &&
+      error.status === 429 &&
+      error.code === "rate_limited" &&
+      error.retryAfterSeconds === 42 &&
+      error.message === "Demasiadas peticiones; espera un momento antes de reintentar.",
+  );
+});
+
+test("isRateLimitedError distingue el 429 de cualquier otro error", async () => {
+  globalThis.fetch = async () => rateLimitedResponse("5");
+  const client = new ApiClient({ baseUrl: "http://api.test" });
+
+  const limitado = await client.getHealth().catch((error: unknown) => error);
+  assert.equal(isRateLimitedError(limitado), true);
+
+  globalThis.fetch = async () => jsonResponse({ detail: "boom" }, 500);
+  const otro = await client.getHealth().catch((error: unknown) => error);
+  assert.equal(isRateLimitedError(otro), false);
+  assert.equal(isRateLimitedError(new Error("no es de la API")), false);
+});
+
+test("sin Retry-After el 429 sigue siendo utilizable (el cliente decide el backoff)", async () => {
+  globalThis.fetch = async () => rateLimitedResponse(null);
+
+  const error = await new ApiClient({ baseUrl: "http://api.test" })
+    .getHealth()
+    .catch((e: unknown) => e);
+
+  assert.equal(isRateLimitedError(error), true);
+  assert.equal((error as ApiError).retryAfterSeconds, null);
 });

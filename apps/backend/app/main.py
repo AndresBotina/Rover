@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.middleware import RateLimitMiddleware
 from app.api.v1.router import TAGS_METADATA
 from app.api.v1.router import router as api_v1_router
 from app.core.config import settings
@@ -64,6 +65,10 @@ def create_app() -> FastAPI:
     )
     # Todos los errores salen con el mismo contrato (app/core/errors.py).
     register_exception_handlers(app)
+    # Rate limiting por IP (HU-1.7). Como middleware y no como dependencia del
+    # router para que cuente también las peticiones a rutas inexistentes, que
+    # son las de quien escanea.
+    app.add_middleware(RateLimitMiddleware)
     # Un único punto de montaje: el agregador ya trae el prefijo /v1.
     app.include_router(api_v1_router)
     return app

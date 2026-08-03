@@ -8,7 +8,7 @@ arranca en local/test sin base configurada (usarla sin configurar falla con un
 error claro) y el pool se cierra limpiamente en el lifespan (dispose_engine).
 """
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from typing import Any
 from uuid import uuid4
 
@@ -109,11 +109,15 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return _session_factory
 
 
-async def get_db() -> AsyncIterator[AsyncSession]:
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """Dependencia de FastAPI: entrega una AsyncSession por request.
 
     El ``async with`` garantiza que la sesión se cierra al terminar el request,
     incluso si el endpoint lanza una excepción.
+
+    Se anota como ``AsyncGenerator`` y no como ``AsyncIterator`` porque quien la
+    itera A MANO (sin ``Depends``) necesita poder cerrarla: ``aclosing`` exige
+    un ``aclose()``, que solo el primer tipo promete.
     """
     async with get_session_factory()() as session:
         yield session

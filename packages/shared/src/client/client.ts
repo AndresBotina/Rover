@@ -15,7 +15,12 @@ import {
   type RegisterRequest,
   type RegisterResponse,
 } from "../types/auth.ts";
-import { isApiErrorResponse, type ApiErrorCode } from "../types/error.ts";
+import {
+  isApiErrorResponse,
+  parseRetryAfter,
+  RATE_LIMITED,
+  type ApiErrorCode,
+} from "../types/error.ts";
 import { isProfile, type Profile, type ProfileUpdate } from "../types/profile.ts";
 import {
   isDbHealthResponse,
@@ -45,6 +50,11 @@ export class ApiError extends Error {
   readonly details: Record<string, unknown> | null;
   /** Identificador de un 500, para reportarlo y cruzarlo con los logs. */
   readonly errorId: string | null;
+  /**
+   * Segundos a esperar antes de reintentar, leídos de `Retry-After` (HU-1.7).
+   * Solo viene con un 429; `null` en cualquier otro error.
+   */
+  readonly retryAfterSeconds: number | null;
 
   constructor(
     message: string,
@@ -54,6 +64,7 @@ export class ApiError extends Error {
       code?: ApiErrorCode | null;
       details?: Record<string, unknown> | null;
       errorId?: string | null;
+      retryAfterSeconds?: number | null;
       cause?: unknown;
     },
   ) {
@@ -64,7 +75,22 @@ export class ApiError extends Error {
     this.code = options.code ?? null;
     this.details = options.details ?? null;
     this.errorId = options.errorId ?? null;
+    this.retryAfterSeconds = options.retryAfterSeconds ?? null;
   }
+}
+
+/**
+ * Type guard del 429: distingue "espera y reintenta" de cualquier otro fallo.
+ *
+ * Ramifica por `code`, no por `status`, igual que el resto del contrato de
+ * errores: el código es lo estable. Cuando devuelve `true`, `retryAfterSeconds`
+ * dice cuánto esperar —o es `null` si el servidor no lo indicó, en cuyo caso el
+ * cliente decide su propio backoff.
+ */
+export function isRateLimitedError(
+  error: unknown,
+): error is ApiError & { code: typeof RATE_LIMITED } {
+  return error instanceof ApiError && error.code === RATE_LIMITED;
 }
 
 /**
@@ -78,11 +104,25 @@ async function toApiError(url: string, response: Response): Promise<ApiError> {
   } catch {
     body = undefined; // cuerpo vacío o no-JSON (p. ej. un error de proxy)
   }
+  // Se lee siempre, no solo en los 429: un proxy o un balanceador puede mandar
+  // Retry-After con un 503, y al cliente le sirve igual.
+  const retryAfterSeconds = parseRetryAfter(response.headers.get("Retry-After"));
   if (isApiErrorResponse(body)) {
     const { code, message, details, error_id: errorId } = body.error;
-    return new ApiError(message, { url, status: response.status, code, details, errorId });
+    return new ApiError(message, {
+      url,
+      status: response.status,
+      code,
+      details,
+      errorId,
+      retryAfterSeconds,
+    });
   }
-  return new ApiError(`HTTP ${response.status} en ${url}`, { url, status: response.status });
+  return new ApiError(`HTTP ${response.status} en ${url}`, {
+    url,
+    status: response.status,
+    retryAfterSeconds,
+  });
 }
 
 /** Cliente de la API de Rover. Un método tipado por endpoint. */

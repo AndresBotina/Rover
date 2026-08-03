@@ -160,7 +160,12 @@ class LoginResponse(BaseModel):
             "`validation_error` (forma del cuerpo), `weak_password` o "
             "`invalid_email` (rechazo de la política de Supabase)."
         ),
-        429: error_doc("`rate_limited` — demasiados intentos de registro."),
+        429: error_doc(
+            "`rate_limited` — demasiados intentos. Mismo código tanto si el "
+            "límite es el de la API (HU-1.7, con `Retry-After`) como si lo "
+            "impuso el proveedor de identidad: la acción del cliente es la "
+            "misma y el catálogo de códigos es de dominio, no de origen."
+        ),
         503: error_doc("`service_unavailable` — Supabase Auth no respondió o falló."),
     },
 )
@@ -251,7 +256,12 @@ async def register(payload: RegisterRequest) -> RegisterResponse:
         # Declarado a mano para sustituir el 422 automático de FastAPI, cuyo
         # esquema (HTTPValidationError) ya no es el que devuelve la API.
         422: error_doc("`validation_error` — el cuerpo no tiene la forma esperada."),
-        429: error_doc("`rate_limited` — demasiados intentos de login."),
+        429: error_doc(
+            "`rate_limited` — demasiados intentos. Este endpoint tiene un "
+            "límite MÁS ESTRICTO que el resto de la API (HU-1.7): es donde se "
+            "adivinan contraseñas. La cabecera `Retry-After` dice en cuántos "
+            "segundos reintentar."
+        ),
         503: error_doc("`service_unavailable` — Supabase Auth no respondió o falló."),
     },
 )

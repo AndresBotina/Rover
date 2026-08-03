@@ -198,6 +198,27 @@ def _render(
     )
 
 
+def error_response(
+    status_code: int,
+    code: ErrorCode,
+    message: str,
+    *,
+    details: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    """Respuesta de error para quien NO puede lanzar ``ApiError``.
+
+    Los handlers de excepciones viven DENTRO del router de Starlette, así que
+    un middleware —que envuelve la app por fuera— no los alcanza: si lanzara
+    ``ApiError`` acabaría en el handler de ``Exception`` y saldría un 500. El
+    rate limiting (HU-1.7) rechaza desde un middleware justamente para cubrir
+    también las rutas que no existen, y necesita construir la respuesta él
+    mismo. Que lo haga por aquí mantiene la promesa del módulo: **la forma del
+    error se decide en un solo sitio**.
+    """
+    return _render(status_code, code, message, details=details, headers=headers)
+
+
 async def api_error_handler(request: Request, exc: Exception) -> JSONResponse:
     """``ApiError`` → respuesta: el endpoint ya eligió status, código y mensaje."""
     if not isinstance(exc, ApiError):  # pragma: no cover - invariante de registro

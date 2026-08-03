@@ -16,7 +16,9 @@ app/
 ├── core/database.py   # SQLAlchemy 2.0 async + asyncpg: engine, get_db, Base
 ├── core/security.py   # validación local del JWT de Supabase (JWKS cacheado)
 ├── core/errors.py     # formato ÚNICO de error + handlers centralizados
-├── api/deps.py        # get_current_user (middleware de auth) + esquema Bearer
+├── core/rate_limit.py # rate limiting: almacén, política y IP tras el proxy
+├── api/middleware.py  # middleware ASGI que aplica el límite por IP
+├── api/deps.py        # get_current_user + cuota por usuario + esquema Bearer
 └── api/v1/
     ├── router.py      # AGREGADOR: monta /v1 y describe los tags de OpenAPI
     ├── health.py      # GET /v1/health y /v1/health/db
@@ -27,6 +29,8 @@ tests/
 ├── test_openapi.py    # estructura de la API y docs (tags, seguridad, /docs)
 ├── test_errors.py     # formato único de error y blindaje de los 500
 ├── test_config.py     # tests de config por ambiente y fail-fast
+├── test_rate_limit.py # almacén, IP tras el proxy y límites aplicados
+├── conftest.py        # aísla el contador de rate limiting entre tests
 └── test_database.py   # tests de la capa DB SIN base real (SQLite en memoria)
 .env.example           # plantilla de variables (el .env real NUNCA se commitea)
 Dockerfile             # imagen de producción (Python 3.12 slim + uv, no-root)
@@ -365,6 +369,127 @@ En `@rover/shared`: `isApiErrorResponse` parsea **cualquier** error de la API, y
 `ApiClient` lo convierte en un `ApiError` con `status`, `code`, `details` y
 `errorId`. El tipo de `code` admite strings desconocidos a propósito: un cliente
 ya publicado debe poder parsear un error cuyo código aún no conocía.
+
+## Rate limiting (HU-1.7)
+
+Tres controles, con contadores **independientes** (agotar uno no gasta otro):
+
+| Ámbito | Clave | Dónde se aplica | Defecto |
+| --- | --- | --- | --- |
+| **Global** | IP | toda la API (`api/middleware.py`) | 120 / min |
+| **Auth** | IP | `POST /v1/auth/login` y `/register` | 10 / min |
+| **Usuario** | id del token | rutas protegidas (`api/deps.py`) | 60 / min |
+
+**Por qué esos valores.** El global (2 req/s sostenidas) es holgado para un
+cliente real y acota a una sola fuente abusiva. El de auth es el estricto porque
+es donde se adivinan contraseñas: con 10/min, probar un diccionario de 10.000
+contraseñas pasa de minutos a casi 17 horas **por IP**. El de usuario es más
+estricto que el global a propósito: el global protege la máquina, este acota lo
+que consume una cuenta.
+
+**Por qué por IP y por usuario.** Antes de autenticarse la IP es lo único que
+hay —y es justo el caso de login/registro—. Después, la cuenta es mejor clave:
+detrás de un NAT o de una operadora móvil mucha gente legítima comparte
+dirección, y limitar solo por IP dejaría que uno se comiera el cupo de todos.
+Además el token está firmado (no se falsifica), y la cuota por plan es por
+definición del usuario. Una ruta protegida pasa por los dos controles: son
+cosas distintas y manda el más estricto.
+
+**Algoritmo: ventana deslizante** por marcas de tiempo. Frente a la ventana
+fija, no permite la ráfaga del doble del límite a caballo del corte (con 10/min:
+diez peticiones a las 11:59:59 y diez a las 12:00:00) — justo el agujero que
+importa en el login. Cuesta O(N) marcas por clave, pero N es el propio límite
+(10–120): unos cientos de bytes. A cambio el `Retry-After` es exacto, no una
+estimación. Detalle y comparación con token bucket en `app/core/rate_limit.py`.
+
+**IP real detrás del proxy.** `X-Forwarded-For` es una lista donde cada proxy
+**añade al final** la dirección de quien le habló; la primera entrada la escribe
+el cliente y es falsificable. Se lee la entrada `ROVER_RATE_LIMIT_TRUSTED_PROXIES`-ésima
+**empezando por el final** (1 por defecto = el edge de Render):
+
+```
+X-Forwarded-For: 1.2.3.4, 203.0.113.7
+                 ────┬───  ─────┬─────
+        lo pone el cliente      lo pone Render → esta es la que se usa
+```
+
+Con `0` la cabecera se ignora del todo y se usa el peer TCP: sin un proxy de
+confianza delante, cualquier `X-Forwarded-For` lo escribió el cliente. Las
+entradas que no son una IP válida se descartan (si no, mandar basura distinta en
+cada petición crearía una clave nueva cada vez y haría crecer el almacén sin
+límite).
+
+**Respuesta al exceder el límite:** `429` con el [formato único de
+error](#formato-de-errores), `code: "rate_limited"` y las cabeceras
+`Retry-After` (segundos, nunca 0), `X-RateLimit-Limit`, `X-RateLimit-Remaining`
+y `X-RateLimit-Reset`. Es el **mismo `code`** que el 429 nacido de un rechazo
+del proveedor de identidad: la acción del cliente es idéntica y el catálogo es
+de dominio, no de origen. En `@rover/shared`, `isRateLimitedError` lo distingue
+y `ApiError.retryAfterSeconds` trae la espera ya parseada.
+
+### Limitación del almacén en memoria — LEER ANTES DE ESCALAR
+
+El conteo vive en la **memoria del proceso**:
+
+> Con **varias instancias** del backend el conteo **NO es global**: cada
+> proceso cuenta lo suyo, así que el límite efectivo se multiplica por el número
+> de instancias.
+
+Es aceptable **hoy** porque el despliegue es de una sola instancia. El punto de
+cambio está aislado a propósito: el almacén está detrás de la interfaz
+`RateLimitStore`, y `hit()` registra y consulta en **una sola operación
+atómica** (partirlo reabriría la carrera entre consultar y registrar).
+
+Migrar a Redis es implementar esa interfaz y llamar a
+`reset_rate_limit_store(RedisRateLimitStore(...))` al arrancar. **Nada más**: ni
+la política, ni el middleware, ni la dependencia, ni los endpoints cambian. Con
+un `ZSET` por clave y un script Lua para que sea atómico:
+
+```
+ZREMRANGEBYSCORE key -inf (now - window)   # tira lo viejo
+ZADD             key now <miembro único>   # registra
+ZCARD            key                       # cuenta
+EXPIRE           key window                # que se limpie solo
+```
+
+Se pospone porque una segunda instancia todavía no existe y Redis añadiría,
+desde ya, un salto de red en **cada** petición y una decisión nueva que hoy no
+hace falta tomar (si Redis cae, ¿se deja pasar el tráfico o se corta?).
+
+### Extensión: límites por plan
+
+`rule_for_user(multiplier=…)` escala la cuota del usuario, y
+`_multiplicador_del_plan` en `api/deps.py` traduce el plan a ese multiplicador.
+Hoy free y pro pesan igual (`ROVER_RATE_LIMIT_PRO_MULTIPLIER=1.0`): la HU deja
+el enganche, no la política comercial. Un plan nuevo (Épica 5) es una entrada
+más en ese mapa. Las cuotas de **consumo** del agente (tokens de LLM, minutos de
+voz — Épica 2) son ámbitos **nuevos** con su propia regla, no un cambio aquí:
+esto acota peticiones, aquello acotará consumo.
+
+### Verificarlo en local
+
+```bash
+uv run uvicorn app.main:app                      # terminal 1
+# terminal 2: 12 peticiones seguidas al login (límite de auth: 10/min)
+for i in $(seq 12); do
+  curl -s -o /dev/null -w "%{http_code} " \
+    -X POST http://127.0.0.1:8000/v1/auth/login \
+    -H 'Content-Type: application/json' -d '{}'
+done
+# → 422 422 422 422 422 422 422 422 422 422 429 429
+
+# El cuerpo y las cabeceras del rechazo:
+curl -si -X POST http://127.0.0.1:8000/v1/auth/login \
+  -H 'Content-Type: application/json' -d '{}' | head -12
+# HTTP/1.1 429 Too Many Requests
+# retry-after: 60
+# x-ratelimit-limit: 10
+# {"error":{"code":"rate_limited","message":"Demasiadas peticiones; …"}}
+```
+
+En local no hay proxy delante, así que todas las peticiones caen en el mismo
+cubo (el peer TCP). Para simular varias IPs, manda la cabecera a mano:
+`-H 'X-Forwarded-For: 203.0.113.7'`.
 
 ## Migraciones (Alembic)
 

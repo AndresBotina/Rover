@@ -20,7 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import ClassVar, Literal, Self
 
-from pydantic import SecretStr, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app import __version__
@@ -52,6 +52,48 @@ class Settings(BaseSettings):
     # ``None`` = decide el ambiente (ver la propiedad ``docs_enabled``); un
     # booleano explícito en ROVER_ENABLE_DOCS manda sobre esa regla.
     enable_docs: bool | None = None
+
+    # --- Rate limiting (HU-1.7) ----------------------------------------------
+    # Los límites son "N peticiones por ventana". Ver app/core/rate_limit.py
+    # para el algoritmo y app/api/middleware.py para dónde se aplica cada uno.
+
+    # Interruptor general. Existe para poder apagarlo en un incidente sin
+    # desplegar, y para los tests que no van de rate limiting.
+    rate_limit_enabled: bool = True
+
+    # GLOBAL, por IP: protección base de TODA la API. 120/min ≈ 2 req/s
+    # sostenidas — holgado para un cliente web o móvil real (una pantalla
+    # dispara un puñado de llamadas), y suficiente para que una sola fuente
+    # abusiva no monopolice la instancia.
+    rate_limit_default_limit: int = Field(default=120, ge=1)
+    rate_limit_default_window_seconds: int = Field(default=60, ge=1)
+
+    # AUTH, por IP: /v1/auth/login y /v1/auth/register. Mucho más estricto
+    # porque es donde se adivinan contraseñas y se crean cuentas en masa.
+    # 10/min deja de sobra para una persona que se equivoca al teclear y
+    # reintenta, pero convierte la fuerza bruta en algo inviable: probar un
+    # diccionario de 10.000 contraseñas pasaría de minutos a casi 17 horas
+    # POR IP, y eso además del límite propio de Supabase.
+    rate_limit_auth_limit: int = Field(default=10, ge=1)
+    rate_limit_auth_window_seconds: int = Field(default=60, ge=1)
+
+    # USUARIO, por id del token: la cuota de quien ya se autenticó. Es MÁS
+    # estricta que la global a propósito — la global protege la máquina de una
+    # fuente abusiva, esta acota lo que consume una cuenta, y es la que crecerá
+    # con los planes (Épica 5) y las cuotas del agente (Épica 2).
+    rate_limit_user_limit: int = Field(default=60, ge=1)
+    rate_limit_user_window_seconds: int = Field(default=60, ge=1)
+
+    # PUNTO DE EXTENSIÓN de los límites por plan: multiplica la cuota de
+    # usuario de los planes de pago. 1.0 = hoy free y pro valen lo mismo (la
+    # HU-1.7 deja el enganche, no la política comercial).
+    rate_limit_pro_multiplier: float = Field(default=1.0, gt=0)
+
+    # Saltos de proxy DE CONFIANZA delante de la app, para leer la IP real de
+    # X-Forwarded-For sin que el cliente pueda falsificarla. Render pone
+    # exactamente uno (su edge). 0 = exposición directa: la cabecera se ignora.
+    # Ver ``client_ip`` en app/core/rate_limit.py.
+    rate_limit_trusted_proxies: int = Field(default=1, ge=0)
 
     # --- Secretos (Épica 1) --------------------------------------------------
     # PATRÓN para añadir un secreto:

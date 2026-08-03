@@ -30,7 +30,6 @@ export type KnownApiErrorCode =
   | "internal_error"
   | "http_error";
 
- 
 export type ApiErrorCode = KnownApiErrorCode | (string & {});
 
 /** Contenido del error. */
@@ -48,6 +47,57 @@ export interface ApiErrorBody {
 /** Cuerpo completo de una respuesta de error. */
 export interface ApiErrorResponse {
   error: ApiErrorBody;
+}
+
+/**
+ * Código del 429. Se exporta como constante porque es el único que el cliente
+ * necesita nombrar para decidir *reintentar*, en vez de solo mostrar el error.
+ *
+ * Es el mismo tanto si el límite lo puso la API (HU-1.7) como si viene de un
+ * rechazo del proveedor de identidad: para quien llama la acción es idéntica
+ * —esperar y reintentar— y el `code` describe el dominio, no de dónde salió.
+ */
+export const RATE_LIMITED: KnownApiErrorCode = "rate_limited";
+
+/**
+ * Segundos a esperar según la cabecera `Retry-After`, o `null` si no la hay o
+ * no se entiende.
+ *
+ * RFC 9110 permite dos formas y aquí se aceptan las dos: un número de segundos
+ * (lo que manda esta API) o una fecha HTTP (lo que podría interponer un proxy o
+ * un balanceador). Nunca devuelve un valor negativo: una fecha ya pasada
+ * significa "reintenta ya", no "reintenta en el pasado".
+ */
+export function parseRetryAfter(
+  value: string | null | undefined,
+  now: Date = new Date(),
+): number | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const raw = value.trim();
+  if (raw === "") {
+    return null;
+  }
+
+  // Forma 1: delta-seconds. Solo dígitos, para no aceptar "12abc" ni "1e3".
+  if (/^\d+$/.test(raw)) {
+    return Number(raw);
+  }
+
+  // Un valor que PARECE un número pero no encajó arriba ("-5", "1.5") está mal
+  // escrito, no es una fecha: se descarta aquí porque `Date.parse` interpreta
+  // algunos de esos como años y devolvería un valor sin sentido.
+  if (/^[+-]?[\d.]+$/.test(raw)) {
+    return null;
+  }
+
+  // Forma 2: fecha HTTP.
+  const target = Date.parse(raw);
+  if (Number.isNaN(target)) {
+    return null;
+  }
+  return Math.max(0, Math.ceil((target - now.getTime()) / 1000));
 }
 
 /** Type guard: valida en runtime que un JSON desconocido es un error de la API. */
