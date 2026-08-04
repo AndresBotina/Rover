@@ -7,6 +7,7 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 
+import { REQUEST_ID_HEADER } from "../types/error.ts";
 import { ApiClient, ApiError, isRateLimitedError } from "./client.ts";
 
 const originalFetch = globalThis.fetch;
@@ -423,4 +424,69 @@ test("sin Retry-After el 429 sigue siendo utilizable (el cliente decide el backo
 
   assert.equal(isRateLimitedError(error), true);
   assert.equal((error as ApiError).retryAfterSeconds, null);
+});
+
+// --- Id de petición (HU-1.12) ------------------------------------------------
+
+test("un error trae el id de petición de la cabecera, para poder reportarlo", async () => {
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        error: {
+          code: "internal_error",
+          message: "Ocurrió un error inesperado.",
+          details: null,
+          error_id: "9f2c1ab4e77d",
+        },
+      }),
+      {
+        status: 500,
+        headers: { "Content-Type": "application/json", [REQUEST_ID_HEADER]: "abc123" },
+      },
+    );
+
+  const error = (await new ApiClient({ baseUrl: "http://api.test" })
+    .getHealth()
+    .catch((e: unknown) => e)) as ApiError;
+
+  // Los dos, sin sustituirse: el errorId nombra ESE fallo, el requestId la
+  // petición entera. En el log del servidor aparecen juntos.
+  assert.equal(error.requestId, "abc123");
+  assert.equal(error.errorId, "9f2c1ab4e77d");
+});
+
+test("el id de petición también llega en errores que no son 500", async () => {
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        error: {
+          code: "unauthenticated",
+          message: "No autenticado.",
+          details: null,
+          error_id: null,
+        },
+      }),
+      {
+        status: 401,
+        headers: { "Content-Type": "application/json", [REQUEST_ID_HEADER]: "req-401" },
+      },
+    );
+
+  const error = (await new ApiClient({ baseUrl: "http://api.test" })
+    .getHealth()
+    .catch((e: unknown) => e)) as ApiError;
+
+  assert.equal(error.requestId, "req-401");
+  assert.equal(error.errorId, null);
+});
+
+test("sin la cabecera (p. ej. un error de proxy) el id queda en null", async () => {
+  globalThis.fetch = async () => new Response("gateway caído", { status: 502 });
+
+  const error = (await new ApiClient({ baseUrl: "http://api.test" })
+    .getHealth()
+    .catch((e: unknown) => e)) as ApiError;
+
+  assert.equal(error.requestId, null);
+  assert.equal(error.status, 502);
 });

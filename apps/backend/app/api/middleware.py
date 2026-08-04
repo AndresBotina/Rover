@@ -1,12 +1,21 @@
-"""Middleware de la API: CORS (HU-1.11) y rate limiting por IP (HU-1.7).
+"""Middleware de la API: contexto de petición (HU-1.12), CORS (HU-1.11) y
+rate limiting por IP (HU-1.7).
 
-ORDEN DE LA PILA (importa): CORS queda POR FUERA del rate limiting. Starlette
-monta el último ``add_middleware`` como el más externo, así que ``create_app``
-añade primero el rate limiting y después CORS. El motivo es que las cabeceras
-de CORS se añaden a la RESPUESTA al salir: si CORS quedara por dentro, el 429
-que corta el rate limiter saldría sin ellas y el navegador se lo ocultaría al
-JavaScript como un error de CORS genérico — la web no podría distinguir "te
-pasaste de peticiones" de "el servidor no responde", ni leer ``Retry-After``.
+ORDEN DE LA PILA (importa, y no es arbitrario). Starlette monta el último
+``add_middleware`` como el más externo, así que ``create_app`` los añade al
+revés del orden en que corren. De fuera hacia dentro:
+
+    RequestContext → CORS → RateLimit → rutas
+
+- **RequestContext, el más externo**, para que TODO lo que pase dentro —incluido
+  un rechazo del rate limiter o un preflight que CORS corta en seco— tenga id
+  de petición en sus logs y en su respuesta. Es también quien mide la duración
+  real, con los otros middlewares dentro.
+- **CORS por fuera del rate limiting**, porque las cabeceras de CORS se añaden a
+  la RESPUESTA al salir: si CORS quedara por dentro, el 429 que corta el rate
+  limiter saldría sin ellas y el navegador se lo ocultaría al JavaScript como
+  un error de CORS genérico — la web no podría distinguir "te pasaste de
+  peticiones" de "el servidor no responde", ni leer ``Retry-After``.
 
 Contrapartida asumida: el preflight (OPTIONS) lo responde CORS sin llegar al
 rate limiter, así que no consume cupo. Es barato (no toca ruta, ni base, ni
@@ -39,11 +48,13 @@ distintos (la máquina y la cuenta) y el más estricto es el que manda.
 """
 
 import logging
+import time
 
 from fastapi import FastAPI, status
+from starlette.datastructures import MutableHeaders
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.core.config import settings
 from app.core.errors import ErrorCode, error_response
@@ -56,8 +67,23 @@ from app.core.rate_limit import (
     rate_limit_headers,
     rule_for_scope,
 )
+from app.core.request_context import (
+    REQUEST_ID_HEADER,
+    new_request_id,
+    reset_request_id,
+    sanitize_request_id,
+    set_request_id,
+    store_request_id,
+)
 
 logger = logging.getLogger(__name__)
+
+# El log de acceso va en su PROPIO logger, no en el del módulo: es un flujo
+# distinto —una línea por petición, siempre— frente a los eventos puntuales del
+# resto de la app, y quien opera querrá filtrarlo o bajarle el nivel por
+# separado sin perder los diagnósticos. Es el sustituto de ``uvicorn.access``,
+# que este proyecto silencia (ver app/core/logging.py).
+access_logger = logging.getLogger("app.access")
 
 # Endpoints de auth: límite estricto (fuerza bruta, alta masiva de cuentas).
 _RUTAS_AUTH = frozenset({"/v1/auth/login", "/v1/auth/register"})
@@ -67,6 +93,88 @@ _RUTAS_AUTH = frozenset({"/v1/auth/login", "/v1/auth/register"})
 # arriesga marcar como caída una instancia que funciona, y son respuestas sin
 # coste que no interesa a nadie abusar.
 _RUTAS_EXENTAS = frozenset({"/v1/health", "/v1/health/db"})
+
+# --- Contexto de petición y log de acceso (HU-1.12) --------------------------
+
+
+def _nivel_por_status(status_code: int) -> int:
+    """5xx es un fallo nuestro; 4xx, algo que el cliente debe corregir."""
+    if status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
+        return logging.ERROR
+    if status_code >= status.HTTP_400_BAD_REQUEST:
+        return logging.WARNING
+    return logging.INFO
+
+
+class RequestContextMiddleware:
+    """Da a cada petición un id, lo propaga, lo devuelve y la registra.
+
+    El id sale de la cabecera ``X-Request-ID`` si viene una válida —así una
+    traza que empieza en un proxy o en la web sigue siendo la misma aquí— y si
+    no, se genera. Lo entrante se sanea antes de usarse
+    (``app/core/request_context.py``): acaba en los logs y en una cabecera, así
+    que un salto de línea permitiría falsificar registros.
+
+    QUÉ SE REGISTRA de cada petición: método, RUTA, status y duración. Lo que
+    NO: el cuerpo, las cabeceras (``Authorization`` lleva el token) y la QUERY
+    STRING. Esta última es una política deliberada y no una omisión — hoy
+    ningún endpoint recibe nada sensible por query, pero los que suelen llegar
+    después (búsquedas, enlaces de confirmación con código, filtros con datos
+    del usuario) sí, y para entonces nadie se acordaría de revisar este
+    middleware. La ruta basta para saber qué se llamó.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope)
+        entrante = sanitize_request_id(request.headers.get(REQUEST_ID_HEADER))
+        request_id = entrante or new_request_id()
+        token = set_request_id(request_id)
+        # Además del contexto, en el scope: el handler de los 500 corre por
+        # fuera de este middleware y para entonces el contexto ya se restauró.
+        store_request_id(scope, request_id)
+
+        # Si la petición revienta, la respuesta la construye el handler de
+        # errores por FUERA de este middleware: el status que se registra es el
+        # 500 que va a salir.
+        status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        inicio = time.perf_counter()
+
+        async def send_con_id(message: Message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+                # Asignar y no añadir: si algo más lo hubiera puesto ya, no
+                # queremos dos cabeceras con ids distintos.
+                MutableHeaders(scope=message)[REQUEST_ID_HEADER] = request_id
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_con_id)
+        finally:
+            duracion_ms = round((time.perf_counter() - inicio) * 1000, 2)
+            access_logger.log(
+                _nivel_por_status(status_code),
+                "%s %s → %s (%s ms)",
+                request.method,
+                request.url.path,
+                status_code,
+                duracion_ms,
+                extra={
+                    "http_method": request.method,
+                    "path": request.url.path,
+                    "status": status_code,
+                    "duration_ms": duracion_ms,
+                },
+            )
+            reset_request_id(token)
+
 
 # --- CORS (HU-1.11) ----------------------------------------------------------
 # Qué es CORS y qué NO protege: es una regla que aplica el NAVEGADOR para que
@@ -83,18 +191,21 @@ CORS_METODOS = ("GET", "POST", "PATCH", "OPTIONS")
 # Cabeceras que los clientes ENVÍAN. ``Content-Type: application/json`` no es
 # un valor "simple" según la spec, así que sin declararlo el preflight
 # rechazaría cualquier POST con cuerpo JSON (registro, login);
-# ``Authorization`` es el Bearer de Supabase de las rutas protegidas.
-CORS_CABECERAS = ("Authorization", "Content-Type")
+# ``Authorization`` es el Bearer de Supabase de las rutas protegidas; y
+# ``X-Request-ID`` deja que la web propague su propia traza (HU-1.12).
+CORS_CABECERAS = ("Authorization", "Content-Type", REQUEST_ID_HEADER)
 
 # Cabeceras de RESPUESTA que el JavaScript del navegador puede LEER. Por
 # defecto solo ve un puñado de cabeceras "safelisted", y NINGUNA de estas lo
 # es: sin exponerlas, ``parseRetryAfter`` y ``ApiError.retryAfterSeconds`` de
-# @rover/shared (HU-1.7) leerían siempre null en web aunque el 429 las traiga.
+# @rover/shared (HU-1.7) leerían siempre null en web aunque el 429 las traiga,
+# y el id de petición (HU-1.12) no se podría mostrar al reportar un fallo.
 CORS_CABECERAS_EXPUESTAS = (
     "Retry-After",
     "X-RateLimit-Limit",
     "X-RateLimit-Remaining",
     "X-RateLimit-Reset",
+    REQUEST_ID_HEADER,
 )
 
 # Cuánto puede cachear el navegador un preflight: ahorra un OPTIONS por cada

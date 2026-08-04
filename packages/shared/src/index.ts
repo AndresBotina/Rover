@@ -23,6 +23,7 @@ export {
   isApiErrorResponse,
   parseRetryAfter,
   RATE_LIMITED,
+  REQUEST_ID_HEADER,
   type ApiErrorBody,
   type ApiErrorCode,
   type ApiErrorResponse,

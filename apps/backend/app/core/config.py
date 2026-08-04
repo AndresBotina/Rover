@@ -24,6 +24,7 @@ from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app import __version__
+from app.core.logging import LogFormat
 
 # Ambientes soportados. Cualquier otro valor de ROVER_ENV impide arrancar.
 Environment = Literal["local", "test", "production"]
@@ -62,6 +63,11 @@ class Settings(BaseSettings):
     # ``None`` = decide el ambiente (ver la propiedad ``docs_enabled``); un
     # booleano explícito en ROVER_ENABLE_DOCS manda sobre esa regla.
     enable_docs: bool | None = None
+
+    # --- Logging (HU-1.12) ---------------------------------------------------
+    # ``None`` = decide el ambiente (ver ``effective_log_format``); un valor
+    # explícito en ROVER_LOG_FORMAT manda sobre esa regla.
+    log_format: LogFormat | None = None
 
     # --- CORS (HU-1.11) ------------------------------------------------------
     # Orígenes que un NAVEGADOR puede usar para llamar a esta API, como lista
@@ -179,6 +185,24 @@ class Settings(BaseSettings):
         if self.enable_docs is not None:
             return self.enable_docs
         return self.env != "production"
+
+    @property
+    def effective_log_format(self) -> LogFormat:
+        """Formato de los logs, resuelto para el ambiente.
+
+        Por defecto: **JSON en producción**, porque quien lee es una
+        herramienta de monitoreo que necesita filtrar por campo (``level``,
+        ``request_id``, ``status``) y no sabe leer prosa; **texto fuera de
+        producción**, porque quien lee es una persona con una terminal y un
+        JSON por línea es hostil para eso.
+
+        ``ROVER_LOG_FORMAT`` (``json``/``text``) fuerza el valor en cualquier
+        ambiente — p. ej. ``json`` en local para probar el mismo formato que se
+        va a producción.
+        """
+        if self.log_format is not None:
+            return self.log_format
+        return "json" if self.env == "production" else "text"
 
     @property
     def cors_allowed_origins(self) -> list[str]:

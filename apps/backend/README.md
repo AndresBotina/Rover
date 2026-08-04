@@ -497,6 +497,113 @@ En local no hay proxy delante, así que todas las peticiones caen en el mismo
 cubo (el peer TCP). Para simular varias IPs, manda la cabecera a mano:
 `-H 'X-Forwarded-For: 203.0.113.7'`.
 
+## Observabilidad: logs estructurados y id de petición (HU-1.12)
+
+### Dos formatos, uno por audiencia
+
+`ROVER_LOG_FORMAT` (`json` | `text`). Sin definir, decide el ambiente:
+**`json` en producción**, porque quien lee es una herramienta de monitoreo que
+filtra por campo y no sabe leer prosa; **`text` fuera de producción**, porque
+quien lee es una persona en una terminal y un JSON por línea es hostil para eso.
+
+```jsonc
+// production
+{"timestamp":"2026-08-04T14:31:07.512+00:00","level":"INFO","logger":"app.access",
+ "message":"GET /v1/health → 200 (1.83 ms)","request_id":"3f1c…","http_method":"GET",
+ "path":"/v1/health","status":200,"duration_ms":1.83}
+```
+
+```text
+# local
+INFO [app.access] GET /v1/health → 200 (1.83 ms)  (req 3f1c9d02)
+```
+
+En texto el id va **abreviado a 8 caracteres** (en una terminal, 32 caracteres
+de UUID por línea tapan el mensaje); el id completo está siempre en la cabecera
+de la respuesta y en el JSON.
+
+Los loggers de **uvicorn** se reenganchan al mismo handler, para que en
+producción no salgan líneas de texto suelto entre el JSON. Su `uvicorn.access`
+se **apaga**: lo sustituye nuestra línea de acceso, que dice lo mismo y además
+trae id de petición y duración.
+
+### Id de petición (`X-Request-ID`)
+
+Cada petición recibe un id. Si llega una cabecera `X-Request-ID` **válida** se
+respeta —así una traza que empieza en un proxy o en la web sigue siendo la
+misma aquí—; si no, se genera. Se devuelve **siempre** en la respuesta, también
+en los errores.
+
+Un id entrante es **entrada no confiable**: acaba en cada línea de log y en una
+cabecera. Se acota a `[A-Za-z0-9._:-]{1,64}` y lo que no encaje se descarta y se
+sustituye por uno propio. Sin eso, un salto de línea permitiría **falsificar
+líneas de log enteras**.
+
+**Cómo se propaga:** un `ContextVar` (`app/core/request_context.py`). Cada
+petición corre en su propia *task* de asyncio y cada task hereda su copia del
+contexto, así que lo que escribe el middleware lo ven todas las llamadas de esa
+petición y solo de esa. Un `Filter` de logging lo lee y lo cuelga de **todos**
+los registros, así que ningún call site tiene que acordarse de nada:
+`logger.warning("...")` ya sale correlacionado. La alternativa —pasarlo por
+parámetro— contaminaría firmas que no tienen nada que ver con logs y bastaría
+un olvido para perder la traza.
+
+Hay un **segundo canal**, el scope ASGI, para un caso concreto: Starlette monta
+su `ServerErrorMiddleware` como el más externo de todos, así que cuando una
+excepción llega hasta él el middleware ya restauró el contexto. El handler del
+500 sí tiene el `Request`, y el scope es el mismo objeto de principio a fin.
+
+### Correlación con el `error_id` de los 500
+
+Se mantienen como **dos campos**, juntos en la misma línea de log:
+
+| | `request_id` | `error_id` |
+|---|---|---|
+| Identifica | la petición entera | un fallo concreto |
+| Aparece en | todas las líneas de esa petición, y en toda respuesta | solo en los 500 |
+| Origen | el servidor **o el cliente/proxy** | siempre el servidor |
+
+No se unifican porque el request id **puede venir de fuera**: unificarlos
+dejaría que un cliente *eligiera* el identificador con el que se archiva un
+error del servidor —cómodo para envenenar búsquedas en el log o hacer colisionar
+dos incidentes— y perdería la traza compartida con el proxy. Con los dos en la
+misma línea se navega en ambos sentidos sin renunciar a nada.
+
+### Qué se registra de cada petición, y qué no
+
+Una línea al terminar, con método, **ruta**, status y duración. Nivel según el
+status: `INFO` < 400, `WARNING` 4xx, `ERROR` 5xx.
+
+**No** se registran el cuerpo, las cabeceras (`Authorization` lleva el token) ni
+la **query string**. Esto último es una política deliberada, no una omisión: hoy
+ningún endpoint recibe nada sensible por query, pero los que suelen llegar
+después (búsquedas, enlaces de confirmación con código, filtros con datos del
+usuario) sí, y para entonces nadie se acordaría de revisar el middleware. La
+ruta basta para saber qué se llamó.
+
+### Verificarlo en local
+
+```bash
+# Formato de desarrollo (el default en local):
+uv run uvicorn app.main:app
+curl -si http://127.0.0.1:8000/v1/health | grep -i x-request-id
+# x-request-id: 3f1c9d02f0e94a3f8c2b7d15a4e6b8c1
+# …y en la terminal del servidor:
+# INFO [app.access] GET /v1/health → 200 (1.83 ms)  (req 3f1c9d02)
+
+# El mismo formato que se va a producción:
+ROVER_LOG_FORMAT=json uv run uvicorn app.main:app
+
+# Propagar una traza propia (se respeta si es válida):
+curl -si http://127.0.0.1:8000/v1/health -H 'X-Request-ID: mi-traza-123' | grep -i x-request-id
+
+# Todas las líneas de una petición comparten id (aquí, dos: el rechazo de auth
+# y la de acceso):
+curl -s -o /dev/null http://127.0.0.1:8000/v1/users/me -H 'Authorization: Bearer roto'
+# WARNING [app.api.deps] Autenticación rechazada: malformed  (req 9ab531cc)
+# WARNING [app.access] GET /v1/users/me → 401 (2.4 ms)       (req 9ab531cc)
+```
+
 ## CORS (HU-1.11)
 
 CORS decide qué **orígenes de navegador** pueden llamar a esta API. Conviene

@@ -19,6 +19,7 @@ import {
   isApiErrorResponse,
   parseRetryAfter,
   RATE_LIMITED,
+  REQUEST_ID_HEADER,
   type ApiErrorCode,
 } from "../types/error.ts";
 import { isProfile, type Profile, type ProfileUpdate } from "../types/profile.ts";
@@ -55,6 +56,18 @@ export class ApiError extends Error {
    * Solo viene con un 429; `null` en cualquier otro error.
    */
   readonly retryAfterSeconds: number | null;
+  /**
+   * Id de la petición (`X-Request-ID`), presente en CUALQUIER respuesta del
+   * backend (HU-1.12). Es lo que permite cruzar lo que vio el usuario con los
+   * logs del servidor: conviene mostrarlo o registrarlo al reportar un fallo.
+   *
+   * Complementa a `errorId` sin sustituirlo: el `errorId` solo existe en los
+   * 500 e identifica ESE fallo, mientras que el request id identifica la
+   * petición entera y también está en los errores que no son 500 (un 429, un
+   * 401) y en las respuestas correctas. En los logs del servidor los dos
+   * aparecen juntos en la misma línea.
+   */
+  readonly requestId: string | null;
 
   constructor(
     message: string,
@@ -65,6 +78,7 @@ export class ApiError extends Error {
       details?: Record<string, unknown> | null;
       errorId?: string | null;
       retryAfterSeconds?: number | null;
+      requestId?: string | null;
       cause?: unknown;
     },
   ) {
@@ -76,6 +90,7 @@ export class ApiError extends Error {
     this.details = options.details ?? null;
     this.errorId = options.errorId ?? null;
     this.retryAfterSeconds = options.retryAfterSeconds ?? null;
+    this.requestId = options.requestId ?? null;
   }
 }
 
@@ -107,6 +122,9 @@ async function toApiError(url: string, response: Response): Promise<ApiError> {
   // Se lee siempre, no solo en los 429: un proxy o un balanceador puede mandar
   // Retry-After con un 503, y al cliente le sirve igual.
   const retryAfterSeconds = parseRetryAfter(response.headers.get("Retry-After"));
+  // El backend lo devuelve en TODA respuesta (HU-1.12); puede faltar si el
+  // error lo generó un proxy que nunca llegó a la app.
+  const requestId = response.headers.get(REQUEST_ID_HEADER);
   if (isApiErrorResponse(body)) {
     const { code, message, details, error_id: errorId } = body.error;
     return new ApiError(message, {
@@ -116,12 +134,14 @@ async function toApiError(url: string, response: Response): Promise<ApiError> {
       details,
       errorId,
       retryAfterSeconds,
+      requestId,
     });
   }
   return new ApiError(`HTTP ${response.status} en ${url}`, {
     url,
     status: response.status,
     retryAfterSeconds,
+    requestId,
   });
 }
 

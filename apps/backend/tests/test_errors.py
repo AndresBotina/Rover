@@ -191,4 +191,7 @@ def test_el_500_se_registra_a_nivel_error(
     with caplog.at_level(logging.ERROR, logger="app.core.errors"):
         cliente_con_rutas_de_prueba.get("/boom")
 
-    assert [r.levelno for r in caplog.records] == [logging.ERROR]
+    # Solo los de este módulo: el log de acceso (HU-1.12) también registra la
+    # petición a ERROR por ser un 5xx, y es otra línea con otro propósito.
+    del_handler = [r for r in caplog.records if r.name == "app.core.errors"]
+    assert [r.levelno for r in del_handler] == [logging.ERROR]

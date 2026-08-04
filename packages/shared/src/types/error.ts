@@ -32,6 +32,13 @@ export type KnownApiErrorCode =
 
 export type ApiErrorCode = KnownApiErrorCode | (string & {});
 
+/**
+ * Cabecera con el id de la petición (HU-1.12). El backend la devuelve en TODA
+ * respuesta —correcta o no— y respeta la que mande el cliente si es válida, así
+ * que también sirve para propagar una traza propia hacia el servidor.
+ */
+export const REQUEST_ID_HEADER = "X-Request-ID";
+
 /** Contenido del error. */
 export interface ApiErrorBody {
   /** Código estable, legible por máquina: por AQUÍ se ramifica, no por el status. */

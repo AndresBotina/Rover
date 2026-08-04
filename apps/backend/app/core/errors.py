@@ -49,6 +49,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.core.request_context import REQUEST_ID_HEADER, request_id_of
+
 logger = logging.getLogger(__name__)
 
 # Campos cuyo valor NUNCA debe aparecer en la respuesta de error.
@@ -301,16 +303,48 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 
     Se registran el método y la ruta, no la query string ni las cabeceras: un
     token en `Authorization` no debe acabar en los logs.
+
+    CORRELACIÓN con el id de petición (HU-1.12): ``error_id`` y ``request_id``
+    se mantienen como DOS campos distintos, presentes juntos en esta línea. No
+    se unifican porque no son lo mismo ni se confían igual:
+
+    - el ``request_id`` identifica LA PETICIÓN, aparece en todas sus líneas de
+      log, se devuelve siempre en una cabecera y **puede venir de fuera** (un
+      proxy o el cliente lo mandan para poder cruzar sus trazas con las
+      nuestras);
+    - el ``error_id`` identifica UN FALLO concreto, existe solo en los 500 y es
+      lo que el usuario cita al reportar.
+
+    Unificarlos dejaría que un cliente ELIGIERA el identificador con el que se
+    archiva un error del servidor —cómodo para envenenar búsquedas en el log o
+    para hacer colisionar dos incidentes— y perdería la traza compartida con
+    el proxy. Teniendo los dos en la misma línea se navega en ambos sentidos
+    sin renunciar a nada.
     """
     error_id = uuid.uuid4().hex[:12]
+    # Del scope y no del contexto: este handler corre por fuera del middleware
+    # que lo fijó (ver app/core/request_context.py).
+    request_id = request_id_of(request)
+    # El filtro de app/core/logging.py cuelga el request_id de todo registro,
+    # pero aquí se pasa explícito porque el contexto ya no lo tiene; y el
+    # error_id va también en el texto para que la línea se explique sola.
     logger.exception(
-        "Error no controlado [error_id=%s] en %s %s", error_id, request.method, request.url.path
+        "Error no controlado [error_id=%s] en %s %s",
+        error_id,
+        request.method,
+        request.url.path,
+        extra={"error_id": error_id, "request_id": request_id},
     )
+    # La respuesta del 500 la construye este handler POR FUERA del middleware
+    # de contexto (Starlette pone su ServerErrorMiddleware el más externo de
+    # todos), así que la cabecera del id no se la pone nadie: se añade aquí.
+    headers = {REQUEST_ID_HEADER: request_id} if request_id else None
     return _render(
         status.HTTP_500_INTERNAL_SERVER_ERROR,
         ErrorCode.INTERNAL_ERROR,
         _INTERNAL_ERROR_MESSAGE,
         error_id=error_id,
+        headers=headers,
     )
 
 
