@@ -16,8 +16,6 @@ la ruta, así que la mayoría de los casos se ejercen contra rutas que responden
 """
 
 import asyncio
-import os
-import tempfile
 import uuid
 from collections.abc import Coroutine
 from typing import Any
@@ -26,15 +24,8 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import update
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
 from starlette.requests import Request
 
-from app.core import database
 from app.core.config import settings
 from app.core.errors import ErrorCode
 from app.core.rate_limit import (
@@ -49,6 +40,7 @@ from app.core.rate_limit import (
 from app.main import app
 from app.models import Plan, UserProfile
 from tests import auth_utils
+from tests.conftest import BaseDeTest
 
 # IP "real" que el proxy de confianza pondría al final de X-Forwarded-For.
 _IP = "203.0.113.7"
@@ -56,7 +48,12 @@ _OTRA_IP = "198.51.100.4"
 
 
 def _ejecutar(corutina: Coroutine[Any, Any, Any]) -> Any:
-    """Corre una corutina en su propio loop (la suite es síncrona)."""
+    """Corre una corutina del almacén en memoria en su propio loop.
+
+    Aquí ``asyncio.run`` es seguro y se queda: el almacén no toca la base ni
+    ninguna otra cosa que sobreviva al loop (lo que sí pasaba con el engine de
+    SQLite, ver la fixture ``bd`` de conftest).
+    """
     return asyncio.run(corutina)
 
 
@@ -438,48 +435,22 @@ def test_rafagas_concurrentes_por_http_no_superan_el_limite(limites_pequenos: No
 
 # --- Cuota por usuario y enganche de los planes ------------------------------
 
-_engines_del_test: list[AsyncEngine] = []
-_ficheros_del_test: list[str] = []
-
 
 @pytest.fixture(autouse=True)
-def _entorno_auth(monkeypatch: pytest.MonkeyPatch) -> Any:
-    """JWKS de prueba y limpieza de las bases temporales que cree el test."""
+def _entorno_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    """JWKS de prueba (la base la entrega la fixture ``bd`` de conftest)."""
     auth_utils.install_auth_env(monkeypatch)
-    yield
-    while _engines_del_test:
-        asyncio.run(_engines_del_test.pop().dispose())
-    while _ficheros_del_test:
-        os.unlink(_ficheros_del_test.pop())
 
 
-def _usar_sqlite(monkeypatch: pytest.MonkeyPatch) -> async_sessionmaker[AsyncSession]:
-    """Base SQLite en fichero temporal (sobrevive a los varios event loops)."""
-    fd, path = tempfile.mkstemp(suffix=".sqlite")
-    os.close(fd)
-    _ficheros_del_test.append(path)
-    engine = create_async_engine(f"sqlite+aiosqlite:///{path}")
-
-    async def crear() -> None:
-        async with engine.begin() as conn:
-            await conn.run_sync(database.Base.metadata.create_all)
-
-    asyncio.run(crear())
-    _engines_del_test.append(engine)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
-    return factory
-
-
-def _poner_plan(factory: async_sessionmaker[AsyncSession], user_id: uuid.UUID, plan: Plan) -> None:
+def _poner_plan(bd: BaseDeTest, user_id: uuid.UUID, plan: Plan) -> None:
     async def actualizar() -> None:
-        async with factory() as session:
+        async with bd.factory() as session:
             await session.execute(
                 update(UserProfile).where(UserProfile.id == user_id).values(plan=plan)
             )
             await session.commit()
 
-    asyncio.run(actualizar())
+    bd.run(actualizar)
 
 
 @pytest.fixture
@@ -493,9 +464,8 @@ def cuota_de_usuario(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_la_cuota_por_usuario_corta_con_429(
-    cuota_de_usuario: None, monkeypatch: pytest.MonkeyPatch
+    bd: BaseDeTest, cuota_de_usuario: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _usar_sqlite(monkeypatch)
     token = auth_utils.make_token(sub=str(uuid.uuid4()))
 
     with TestClient(app) as client:
@@ -508,11 +478,10 @@ def test_la_cuota_por_usuario_corta_con_429(
 
 
 def test_dos_usuarios_desde_la_misma_ip_no_se_gastan_el_cupo(
-    cuota_de_usuario: None, monkeypatch: pytest.MonkeyPatch
+    bd: BaseDeTest, cuota_de_usuario: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """El motivo de limitar por usuario y no solo por IP: detrás de un NAT (o de
     una operadora móvil) mucha gente legítima comparte dirección."""
-    _usar_sqlite(monkeypatch)
     primera = auth_utils.make_token(sub=str(uuid.uuid4()), email="una@example.com")
     segunda = auth_utils.make_token(sub=str(uuid.uuid4()), email="otra@example.com")
 
@@ -529,11 +498,10 @@ def test_dos_usuarios_desde_la_misma_ip_no_se_gastan_el_cupo(
 
 
 def test_el_plan_pro_recibe_mas_cupo_con_el_multiplicador(
-    cuota_de_usuario: None, monkeypatch: pytest.MonkeyPatch
+    bd: BaseDeTest, cuota_de_usuario: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """El punto de extensión de la Épica 5, ejercido de verdad: subir el
     multiplicador cambia el límite sin tocar código."""
-    factory = _usar_sqlite(monkeypatch)
     monkeypatch.setattr(settings, "rate_limit_pro_multiplier", 2.0)
     user_id = uuid.uuid4()
     token = auth_utils.make_token(sub=str(user_id))
@@ -542,7 +510,7 @@ def test_el_plan_pro_recibe_mas_cupo_con_el_multiplicador(
         cabeceras = {"Authorization": f"Bearer {token}", **_desde(_IP)}
         # La primera petición materializa el perfil (plan free por defecto).
         client.get("/v1/users/me", headers=cabeceras)
-        _poner_plan(factory, user_id, Plan.PRO)
+        _poner_plan(bd, user_id, Plan.PRO)
         reset_rate_limit_store()
         respuestas = [client.get("/v1/users/me", headers=cabeceras) for _ in range(5)]
 
@@ -569,10 +537,9 @@ def test_la_cuota_de_usuario_y_la_de_ip_no_comparten_clave() -> None:
 
 
 def test_el_429_es_identico_venga_del_middleware_o_de_la_cuota_de_usuario(
-    monkeypatch: pytest.MonkeyPatch,
+    bd: BaseDeTest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Dos caminos distintos, un solo contrato de error para el cliente."""
-    _usar_sqlite(monkeypatch)
     monkeypatch.setattr(settings, "rate_limit_enabled", True)
     monkeypatch.setattr(settings, "rate_limit_user_limit", 1)
     monkeypatch.setattr(settings, "rate_limit_default_limit", 1_000)

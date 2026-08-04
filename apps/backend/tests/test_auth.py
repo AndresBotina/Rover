@@ -6,7 +6,6 @@ base de datos se sustituye por SQLite async en memoria con el esquema de
 ``test_models.py``).
 """
 
-import asyncio
 import io
 import logging
 import uuid
@@ -17,7 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core import database
 from app.core.config import settings
@@ -25,21 +24,10 @@ from app.core.logging import configure_logging
 from app.main import app
 from app.models import UserProfile
 from app.services import auth as auth_service
+from tests.conftest import BaseDeTest
 
 _EMAIL = "viajera@example.com"
 _PASSWORD = "una-contrasena-larga-y-segura"
-
-
-def _sqlite_factory_con_esquema() -> async_sessionmaker[AsyncSession]:
-    """Fábrica de sesiones SQLite en memoria, con ``user_profiles`` ya creada."""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-
-    async def crear_esquema() -> None:
-        async with engine.begin() as conn:
-            await conn.run_sync(database.Base.metadata.create_all)
-
-    asyncio.run(crear_esquema())
-    return async_sessionmaker(engine, expire_on_commit=False)
 
 
 def _mock_sign_up(
@@ -76,22 +64,20 @@ def _mock_sign_up_error(monkeypatch: pytest.MonkeyPatch, error: Exception) -> No
     monkeypatch.setattr(auth_service, "sign_up", fake_sign_up)
 
 
-def _leer_perfil(factory: async_sessionmaker[AsyncSession], user_id: uuid.UUID) -> UserProfile:
+def _leer_perfil(bd: BaseDeTest, user_id: uuid.UUID) -> UserProfile:
     async def consulta() -> UserProfile:
-        async with factory() as session:
+        async with bd.factory() as session:
             return (
                 await session.execute(select(UserProfile).where(UserProfile.id == user_id))
             ).scalar_one()
 
-    return asyncio.run(consulta())
+    return bd.run(consulta)
 
 
 def test_registro_con_confirmacion_desactivada_devuelve_sesion(
-    monkeypatch: pytest.MonkeyPatch,
+    bd: BaseDeTest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Alta CON sesión: 201, status 'active', sesión presente, perfil creado."""
-    factory = _sqlite_factory_con_esquema()
-    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
     user_id = _mock_sign_up(monkeypatch, con_sesion=True)
 
     with TestClient(app) as client:
@@ -108,17 +94,15 @@ def test_registro_con_confirmacion_desactivada_devuelve_sesion(
         },
     }
 
-    perfil = _leer_perfil(factory, user_id)
+    perfil = _leer_perfil(bd, user_id)
     assert perfil.email == _EMAIL
     assert perfil.plan.value == "free"
 
 
 def test_registro_con_confirmacion_pendiente_no_devuelve_sesion(
-    monkeypatch: pytest.MonkeyPatch,
+    bd: BaseDeTest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Alta SIN sesión: 201 (no 503), status pendiente, sin sesión, perfil creado."""
-    factory = _sqlite_factory_con_esquema()
-    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
     user_id = _mock_sign_up(monkeypatch, con_sesion=False)
 
     with TestClient(app) as client:
@@ -132,14 +116,14 @@ def test_registro_con_confirmacion_pendiente_no_devuelve_sesion(
     }
 
     # El perfil se crea igual que en el caso con sesión.
-    perfil = _leer_perfil(factory, user_id)
+    perfil = _leer_perfil(bd, user_id)
     assert perfil.email == _EMAIL
     assert perfil.plan.value == "free"
 
 
-def test_la_respuesta_no_filtra_la_contrasena(monkeypatch: pytest.MonkeyPatch) -> None:
-    factory = _sqlite_factory_con_esquema()
-    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
+def test_la_respuesta_no_filtra_la_contrasena(
+    bd: BaseDeTest, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _mock_sign_up_exitoso(monkeypatch)
 
     with TestClient(app) as client:
@@ -512,10 +496,10 @@ def _mock_signup_http(monkeypatch: pytest.MonkeyPatch, status_code: int, payload
     monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
 
 
-def test_e2e_formato_raiz_devuelve_201_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_e2e_formato_raiz_devuelve_201_pending(
+    bd: BaseDeTest, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Bug 1: cuerpo 200 en formato RAÍZ → 201 pending_email_confirmation (no 503)."""
-    factory = _sqlite_factory_con_esquema()
-    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
     user_id = uuid.uuid4()
     payload = {
         "id": str(user_id),
@@ -541,14 +525,14 @@ def test_e2e_formato_raiz_devuelve_201_pending(monkeypatch: pytest.MonkeyPatch) 
         "session": None,
     }
     # El perfil se crea igual en el caso pendiente.
-    perfil = _leer_perfil(factory, user_id)
+    perfil = _leer_perfil(bd, user_id)
     assert perfil.email == _EMAIL
 
 
-def test_e2e_formato_anidado_devuelve_201_active(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_e2e_formato_anidado_devuelve_201_active(
+    bd: BaseDeTest, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """El formato ANIDADO (con 'user' y ambos tokens) sigue dando active con sesión."""
-    factory = _sqlite_factory_con_esquema()
-    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
     user_id = uuid.uuid4()
     payload = {
         "access_token": "at-real",
@@ -627,10 +611,10 @@ def test_fallo_del_proveedor_emite_una_linea_con_status_y_codigo(
     assert "anon" not in salida.lower()
 
 
-def test_idempotencia_el_mismo_id_no_duplica_ni_revienta(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_idempotencia_el_mismo_id_no_duplica_ni_revienta(
+    bd: BaseDeTest, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Registrar dos veces con el mismo id de Supabase no rompe ni duplica la fila."""
-    factory = _sqlite_factory_con_esquema()
-    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
     user_id = uuid.uuid4()
     _mock_sign_up_exitoso(monkeypatch, user_id=user_id)
 
@@ -642,7 +626,7 @@ def test_idempotencia_el_mismo_id_no_duplica_ni_revienta(monkeypatch: pytest.Mon
     assert segunda.status_code == 201
 
     async def contar_filas() -> int:
-        async with factory() as session:
+        async with bd.factory() as session:
             filas = (
                 (await session.execute(select(UserProfile).where(UserProfile.id == user_id)))
                 .scalars()
@@ -650,7 +634,7 @@ def test_idempotencia_el_mismo_id_no_duplica_ni_revienta(monkeypatch: pytest.Mon
             )
             return len(filas)
 
-    assert asyncio.run(contar_filas()) == 1
+    assert bd.run(contar_filas) == 1
 
 
 # =============================================================================

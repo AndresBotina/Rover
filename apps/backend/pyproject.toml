@@ -22,6 +22,10 @@ package = false
 [dependency-groups]
 dev = [
     "aiosqlite>=0.22.1",
+    # Ya venía como transitiva de Starlette; se declara porque tests/conftest.py
+    # la importa DIRECTO (BlockingPortal: el event loop único de cada test,
+    # HU-1.13). No añade nada al entorno, pero deja de ser un import prestado.
+    "anyio>=4.14.1",
     "mypy>=2.1.0",
     "pytest>=9.1.1",
     "ruff>=0.15.20",

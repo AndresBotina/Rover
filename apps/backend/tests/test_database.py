@@ -7,9 +7,8 @@ conectividad real contra Supabase se verifica a mano con GET /v1/health/db
 (ver README del backend).
 """
 
-import asyncio
-
 import pytest
+from anyio.abc import BlockingPortal
 from fastapi.testclient import TestClient
 from sqlalchemy import NullPool, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -17,15 +16,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.core import database
 from app.core.database import build_async_url, engine_kwargs, get_db, is_supabase_pooler
 from app.main import app
+from tests.conftest import BaseDeTest
 
 _URL_POOLER = "postgresql://postgres.abc:pw@aws-1-us-east-1.pooler.supabase.com:6543/postgres"
 _URL_DIRECTA = "postgresql://postgres:pw@db.proyecto.supabase.co:5432/postgres"
-
-
-def _sqlite_factory() -> async_sessionmaker[AsyncSession]:
-    """Fábrica de sesiones contra SQLite async en memoria (sustituto de Supabase)."""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    return async_sessionmaker(engine, expire_on_commit=False)
 
 
 def test_build_async_url_anade_el_driver_async() -> None:
@@ -70,18 +64,15 @@ def test_url_directa_mantiene_comportamiento_por_defecto() -> None:
     assert kwargs["pool_pre_ping"] is True
 
 
-def test_el_engine_acepta_los_kwargs_del_pooler() -> None:
+def test_el_engine_acepta_los_kwargs_del_pooler(loop_de_test: BlockingPortal) -> None:
     """create_async_engine debe aceptar los nombres de los kwargs (sin conectar)."""
     url = build_async_url(_URL_POOLER)
     engine = create_async_engine(url, **engine_kwargs(url))
-    asyncio.run(engine.dispose())
+    loop_de_test.call(engine.dispose)
 
 
-def test_get_db_entrega_y_cierra_la_sesion(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_db_entrega_y_cierra_la_sesion(bd: BaseDeTest, monkeypatch: pytest.MonkeyPatch) -> None:
     """get_db entrega una AsyncSession usable y la cierra al agotarse."""
-    factory = _sqlite_factory()
-    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
-
     closed = False
     original_close = AsyncSession.close
 
@@ -103,14 +94,11 @@ def test_get_db_entrega_y_cierra_la_sesion(monkeypatch: pytest.MonkeyPatch) -> N
         with pytest.raises(StopAsyncIteration):
             await anext(generador)
 
-    asyncio.run(ejercicio())
+    bd.run(ejercicio)
     assert closed, "la sesión debe cerrarse cuando el request termina"
 
 
-def test_health_db_ok_con_base_sustituta(monkeypatch: pytest.MonkeyPatch) -> None:
-    factory = _sqlite_factory()
-    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
-
+def test_health_db_ok_con_base_sustituta(bd: BaseDeTest) -> None:
     with TestClient(app) as client:
         response = client.get("/v1/health/db")
 

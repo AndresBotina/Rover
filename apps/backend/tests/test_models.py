@@ -1,22 +1,20 @@
 """Tests del modelo de perfil de usuario — SIN base real (CI sin Supabase).
 
-El esquema se crea desde ``Base.metadata`` sobre SQLite async en memoria (el
-mismo sustituto que en ``test_database.py``). Los tipos exclusivos de
+El esquema lo crea la fixture ``bd`` de conftest desde ``Base.metadata``, sobre
+la misma SQLite sustituta que usa el resto de la suite. Los tipos exclusivos de
 Postgres están resueltos en el propio modelo: ``preferences`` es JSONB con
 variante JSON para SQLite (``with_variant``), el ``id`` usa el ``sa.Uuid``
 genérico (UUID nativo en Postgres, texto en SQLite) y ``plan`` es
 VARCHAR + CHECK (no ENUM nativo), idéntico en ambas bases.
 """
 
-import asyncio
 import uuid
 from datetime import datetime
 
 from sqlalchemy import Enum, String, Table, Uuid, select
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
-from app.core.database import Base
 from app.models import Plan, UserProfile
+from tests.conftest import BaseDeTest
 
 _COLUMNAS_ESPERADAS = {"id", "email", "plan", "preferences", "created_at", "updated_at"}
 
@@ -26,14 +24,6 @@ def _tabla() -> Table:
     tabla = UserProfile.__table__
     assert isinstance(tabla, Table)
     return tabla
-
-
-async def _engine_con_esquema() -> AsyncEngine:
-    """SQLite async en memoria con las tablas de Base.metadata creadas."""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    return engine
 
 
 def test_declaracion_de_la_tabla() -> None:
@@ -70,19 +60,17 @@ def test_plan_es_varchar_con_check_y_default_free() -> None:
     assert tabla.c.plan.server_default is not None
 
 
-def test_crear_y_leer_un_perfil() -> None:
+def test_crear_y_leer_un_perfil(bd: BaseDeTest) -> None:
     """Alta y lectura contra la base sustituta, con los defaults aplicados."""
 
     async def ejercicio() -> None:
-        engine = await _engine_con_esquema()
-        factory = async_sessionmaker(engine, expire_on_commit=False)
         id_supabase = uuid.uuid4()
 
-        async with factory() as session:
+        async with bd.factory() as session:
             session.add(UserProfile(id=id_supabase, email="ana@example.com"))
             await session.commit()
 
-        async with factory() as session:
+        async with bd.factory() as session:
             perfil = (
                 await session.execute(select(UserProfile).where(UserProfile.id == id_supabase))
             ).scalar_one()
@@ -93,25 +81,20 @@ def test_crear_y_leer_un_perfil() -> None:
             assert isinstance(perfil.created_at, datetime)
             assert isinstance(perfil.updated_at, datetime)
 
-        await engine.dispose()
-
-    asyncio.run(ejercicio())
+    bd.run(ejercicio)
 
 
-def test_defaults_del_lado_de_la_base() -> None:
+def test_defaults_del_lado_de_la_base(bd: BaseDeTest) -> None:
     """Un INSERT sin pasar por el ORM también recibe plan y preferences."""
 
     async def ejercicio() -> None:
-        engine = await _engine_con_esquema()
         tabla = _tabla()
 
-        async with engine.begin() as conn:
+        async with bd.engine.begin() as conn:
             await conn.execute(tabla.insert().values(id=uuid.uuid4(), email="core@example.com"))
             fila = (await conn.execute(select(tabla.c.plan, tabla.c.preferences))).one()
 
         assert fila.plan == "free"  # server_default del CHECK-enum
         assert fila.preferences == {}  # server_default '{}', nunca NULL
 
-        await engine.dispose()
-
-    asyncio.run(ejercicio())
+    bd.run(ejercicio)

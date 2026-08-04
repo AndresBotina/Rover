@@ -11,11 +11,8 @@ test; el JWKS se inyecta parcheando ``app.core.security._fetch_jwks``, sin
 tocar el JWKS real. La base es SQLite async en fichero temporal.
 """
 
-import asyncio
 import io
 import json
-import os
-import tempfile
 import time
 import uuid
 from collections.abc import Iterator
@@ -25,20 +22,15 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import deps
-from app.core import database, security
+from app.core import security
 from app.core.config import settings
 from app.core.logging import configure_logging
 from app.main import app
 from app.models import UserProfile
+from tests.conftest import BaseDeTest
 
 _SUPABASE_URL = "https://test-project.supabase.co"
 _ISSUER = f"{_SUPABASE_URL}/auth/v1"
@@ -83,17 +75,9 @@ def _token(
     return jwt.encode(payload, key, algorithm="ES256", headers={"kid": kid})
 
 
-# Recursos creados por _usar_sqlite en el test actual, para limpiarlos al final.
-_engines_del_test: list[AsyncEngine] = []
-_ficheros_del_test: list[str] = []
-
-
 @pytest.fixture(autouse=True)
 def _entorno_auth(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Configura la URL de Supabase, inyecta el JWKS de prueba y aísla la caché.
-
-    Al terminar, cierra los engines y borra los ficheros SQLite del test.
-    """
+    """Configura la URL de Supabase, inyecta el JWKS de prueba y aísla la caché."""
     monkeypatch.setattr(settings, "supabase_url", _SUPABASE_URL)
 
     async def fake_fetch() -> jwt.PyJWKSet:
@@ -103,39 +87,15 @@ def _entorno_auth(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     security.reset_jwks_cache()
     yield
     security.reset_jwks_cache()
-    while _engines_del_test:
-        asyncio.run(_engines_del_test.pop().dispose())
-    while _ficheros_del_test:
-        os.unlink(_ficheros_del_test.pop())
-
-
-def _usar_sqlite(monkeypatch: pytest.MonkeyPatch) -> async_sessionmaker[AsyncSession]:
-    # Fichero temporal (no :memory:): el esquema y los datos quedan en disco, así
-    # cualquier conexión —desde el schema, el TestClient o el conteo, cada uno en
-    # su event loop— ve la misma BD. Robusto frente a reconexiones del pool.
-    fd, path = tempfile.mkstemp(suffix=".sqlite")
-    os.close(fd)
-    _ficheros_del_test.append(path)
-    engine = create_async_engine(f"sqlite+aiosqlite:///{path}")
-
-    async def crear() -> None:
-        async with engine.begin() as conn:
-            await conn.run_sync(database.Base.metadata.create_all)
-
-    asyncio.run(crear())
-    _engines_del_test.append(engine)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database, "get_session_factory", lambda: factory)
-    return factory
 
 
 def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def _contar_perfiles(factory: async_sessionmaker[AsyncSession], user_id: uuid.UUID) -> int:
+def _contar_perfiles(bd: BaseDeTest, user_id: uuid.UUID) -> int:
     async def contar() -> int:
-        async with factory() as session:
+        async with bd.factory() as session:
             filas = (
                 (await session.execute(select(UserProfile).where(UserProfile.id == user_id)))
                 .scalars()
@@ -143,14 +103,13 @@ def _contar_perfiles(factory: async_sessionmaker[AsyncSession], user_id: uuid.UU
             )
             return len(filas)
 
-    return asyncio.run(contar())
+    return bd.run(contar)
 
 
 # --- Caso feliz + creación perezosa ------------------------------------------
 
 
-def test_token_valido_devuelve_identidad_y_crea_el_perfil(monkeypatch: pytest.MonkeyPatch) -> None:
-    factory = _usar_sqlite(monkeypatch)
+def test_token_valido_devuelve_identidad_y_crea_el_perfil(bd: BaseDeTest) -> None:
     user_id = uuid.uuid4()
     token = _token(sub=str(user_id), email="ana@example.com")
 
@@ -167,11 +126,10 @@ def test_token_valido_devuelve_identidad_y_crea_el_perfil(monkeypatch: pytest.Mo
         "free",
     )
     # Creación perezosa: el perfil no existía y el middleware lo materializó.
-    assert _contar_perfiles(factory, user_id) == 1
+    assert _contar_perfiles(bd, user_id) == 1
 
 
-def test_perfil_existente_se_reutiliza_sin_duplicar(monkeypatch: pytest.MonkeyPatch) -> None:
-    factory = _usar_sqlite(monkeypatch)
+def test_perfil_existente_se_reutiliza_sin_duplicar(bd: BaseDeTest) -> None:
     user_id = uuid.uuid4()
     token = _token(sub=str(user_id))
 
@@ -181,27 +139,23 @@ def test_perfil_existente_se_reutiliza_sin_duplicar(monkeypatch: pytest.MonkeyPa
 
     assert primera.status_code == 200
     assert segunda.status_code == 200
-    assert _contar_perfiles(factory, user_id) == 1
+    assert _contar_perfiles(bd, user_id) == 1
 
 
-def test_creacion_perezosa_carrera_integrityerror_relee(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_creacion_perezosa_carrera_integrityerror_relee(
+    bd: BaseDeTest, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Si el perfil ya existe cuando el middleware intenta insertarlo (carrera),
     el IntegrityError no rompe: relee y devuelve la fila existente.
 
-    Test unitario de ``_resolve_or_create_profile`` en un ÚNICO event loop (la
-    conexión :memory: compartida no tolera writes desde varios loops).
+    Test unitario de ``_resolve_or_create_profile``: todo ocurre dentro del
+    mismo event loop del test (``bd.run``), incluida la inserción competidora.
     """
     user_id = uuid.uuid4()
 
     async def escenario() -> tuple[str, int]:
-        engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
-        async with engine.begin() as conn:
-            await conn.run_sync(database.Base.metadata.create_all)
-        factory = async_sessionmaker(engine, expire_on_commit=False)
-        monkeypatch.setattr(database, "get_session_factory", lambda: factory)
-
         # Otra petición ya insertó el perfil (fila competidora).
-        async with factory() as session:
+        async with bd.factory() as session:
             session.add(UserProfile(id=user_id, email="otra@example.com"))
             await session.commit()
 
@@ -223,16 +177,15 @@ def test_creacion_perezosa_carrera_integrityerror_relee(monkeypatch: pytest.Monk
 
         # El conteo usa execute(select(...)), no get, así que el patch de get
         # (ya en su 2ª llamada = real) no lo afecta.
-        async with factory() as session:
+        async with bd.factory() as session:
             filas = (
                 (await session.execute(select(UserProfile).where(UserProfile.id == user_id)))
                 .scalars()
                 .all()
             )
-        await engine.dispose()
         return profile.email, len(filas)
 
-    email, n_filas = asyncio.run(escenario())
+    email, n_filas = bd.run(escenario)
 
     # Devuelve el perfil existente (el precreado), sin romper ni duplicar.
     assert email == "otra@example.com"
@@ -246,64 +199,58 @@ def _get_me(client: TestClient, headers: dict[str, str]) -> object:
     return client.get("/v1/users/me", headers=headers)
 
 
-def test_sin_header_responde_401(monkeypatch: pytest.MonkeyPatch) -> None:
-    _usar_sqlite(monkeypatch)
+def test_sin_header_responde_401(bd: BaseDeTest) -> None:
     with TestClient(app) as client:
         response = client.get("/v1/users/me")
     assert response.status_code == 401
 
 
-def test_esquema_incorrecto_responde_401(monkeypatch: pytest.MonkeyPatch) -> None:
-    _usar_sqlite(monkeypatch)
+def test_esquema_incorrecto_responde_401(bd: BaseDeTest) -> None:
     token = _token(sub=str(uuid.uuid4()))
     with TestClient(app) as client:
         response = client.get("/v1/users/me", headers={"Authorization": f"Basic {token}"})
     assert response.status_code == 401
 
 
-def test_token_malformado_responde_401(monkeypatch: pytest.MonkeyPatch) -> None:
-    _usar_sqlite(monkeypatch)
+def test_token_malformado_responde_401(bd: BaseDeTest) -> None:
     with TestClient(app) as client:
         response = client.get("/v1/users/me", headers=_auth("esto-no-es-un-jwt"))
     assert response.status_code == 401
 
 
-def test_firma_invalida_responde_401(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_firma_invalida_responde_401(bd: BaseDeTest) -> None:
     """Token firmado con una clave que NO está en el JWKS (impostor)."""
-    _usar_sqlite(monkeypatch)
     token = _token(sub=str(uuid.uuid4()), key=_IMPOSTOR_KEY)  # mismo kid, otra clave
     with TestClient(app) as client:
         response = client.get("/v1/users/me", headers=_auth(token))
     assert response.status_code == 401
 
 
-def test_token_expirado_responde_401(monkeypatch: pytest.MonkeyPatch) -> None:
-    _usar_sqlite(monkeypatch)
+def test_token_expirado_responde_401(bd: BaseDeTest) -> None:
     token = _token(sub=str(uuid.uuid4()), exp_delta=-10)
     with TestClient(app) as client:
         response = client.get("/v1/users/me", headers=_auth(token))
     assert response.status_code == 401
 
 
-def test_issuer_incorrecto_responde_401(monkeypatch: pytest.MonkeyPatch) -> None:
-    _usar_sqlite(monkeypatch)
+def test_issuer_incorrecto_responde_401(bd: BaseDeTest) -> None:
     token = _token(sub=str(uuid.uuid4()), iss="https://otro-proyecto.supabase.co/auth/v1")
     with TestClient(app) as client:
         response = client.get("/v1/users/me", headers=_auth(token))
     assert response.status_code == 401
 
 
-def test_audiencia_incorrecta_responde_401(monkeypatch: pytest.MonkeyPatch) -> None:
-    _usar_sqlite(monkeypatch)
+def test_audiencia_incorrecta_responde_401(bd: BaseDeTest) -> None:
     token = _token(sub=str(uuid.uuid4()), aud="otra-audiencia")
     with TestClient(app) as client:
         response = client.get("/v1/users/me", headers=_auth(token))
     assert response.status_code == 401
 
 
-def test_kid_desconocido_responde_401_tras_refrescar(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_kid_desconocido_responde_401_tras_refrescar(
+    bd: BaseDeTest, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Un kid ausente del JWKS fuerza un refresco; si sigue sin estar → 401."""
-    _usar_sqlite(monkeypatch)
     refrescos = 0
     original = security._fetch_jwks
 
@@ -324,9 +271,8 @@ def test_kid_desconocido_responde_401_tras_refrescar(monkeypatch: pytest.MonkeyP
     assert refrescos >= 2
 
 
-def test_todos_los_401_tienen_el_mismo_cuerpo(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_todos_los_401_tienen_el_mismo_cuerpo(bd: BaseDeTest) -> None:
     """El cliente no puede distinguir el motivo: el 401 es uniforme."""
-    _usar_sqlite(monkeypatch)
     uid = str(uuid.uuid4())
     tokens = {
         "sin_header": None,
@@ -348,9 +294,8 @@ def test_todos_los_401_tienen_el_mismo_cuerpo(monkeypatch: pytest.MonkeyPatch) -
     assert all(cuerpo == cuerpos[0] for cuerpo in cuerpos)
 
 
-def test_el_motivo_real_del_401_aparece_en_los_logs(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_el_motivo_real_del_401_aparece_en_los_logs(bd: BaseDeTest) -> None:
     """El cuerpo es genérico, pero el log SÍ dice por qué falló (aquí: expirado)."""
-    _usar_sqlite(monkeypatch)
     token = _token(sub=str(uuid.uuid4()), exp_delta=-10)
 
     stream = io.StringIO()
