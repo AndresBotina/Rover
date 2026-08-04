@@ -2,7 +2,7 @@
 
 > **Documento de trabajo vivo.** Crece **épica por épica**: aquí solo se detalla la épica en curso. Cuando cerremos todas sus HU (cumpliendo la Definition of Done), añadimos la siguiente. El panorama completo de las 7 épicas vive en `backlog-full.md` como referencia.
 >
-> **Épica en curso: 1 — Backend core.** (Épica 0 — Fundación: **completada**; queda abajo como registro histórico.)
+> **Épicas 0 y 1: completadas.** Ambas quedan abajo como registro histórico de lo construido. **Siguiente: Épica 2 — El agente**, que se detallará en este documento al arrancarla (ver *Cierre de la Épica 1* al final: hay deuda técnica que conviene resolver antes o al principio de esa épica).
 
 ---
 
@@ -36,8 +36,8 @@ Una HU está **Done** solo cuando:
 | Épica | Nombre | Objetivo | Estado |
 |-------|--------|----------|--------|
 | 0 | Fundación | Monorepo, tooling, CI/CD desplegando desde el día uno | Completada ✅ |
-| **1** | Backend core | API `/v1`, async Supabase, Alembic, auth vía Supabase Auth, rate limiting, errores | **En curso** |
-| 2 | El agente | RAG + tool-calling, streaming, sesiones, caché semántico, voz opcional (pipeline) | Pendiente |
+| 1 | Backend core | API `/v1`, async Supabase, Alembic, auth vía Supabase Auth, rate limiting, errores, CORS, observabilidad | Completada ✅ |
+| **2** | El agente | RAG + tool-calling, streaming, sesiones, caché semántico, voz opcional (pipeline) | **Siguiente** |
 | 3 | Web | Next.js con auth, chat con streaming, pricing | Pendiente |
 | 4 | Mobile | Expo reusando la capa compartida | Pendiente |
 | 5 | Monetización | Stripe / Play Billing / Apple IAP, freemium | Diferida |
@@ -153,9 +153,11 @@ Una HU está **Done** solo cuando:
 
 ---
 
-# ÉPICA 1 — Backend core
+# ÉPICA 1 — Backend core ✅ COMPLETADA
 
 **Objetivo:** el backend permanente y bien construido. API versionada, conexión async a Supabase, migraciones, autenticación delegada en Supabase Auth, rate limiting por plan, manejo de errores centralizado y observabilidad básica. Esto no se bota cuando crezcas; solo le pones más máquinas detrás.
+
+> **Estado: las 14 HU están hechas** (1.1, 1.2, 1.3, 1.3b, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 1.10a, 1.10b, 1.11 y 1.12 — la numeración incluye la 1.3b, que nació de un caso descubierto al verificar la 1.3, y el desdoble de la 1.10 en 1.10a/1.10b; el encabezado de la HU-1.10 se conserva porque explica esa división, pero no es una HU en sí). Esta sección queda como registro histórico. La deuda técnica que cruza a la Épica 2 está anotada al final, en *Cierre de la Épica 1*.
 
 > **Decisión de arquitectura: Supabase Auth como proveedor de identidad.** El backend **no emite JWT propios**: delega registro y login en Supabase Auth y **valida** los tokens que este emite. Motivos: el login social con Google/Apple que exigen las stores viene resuelto de serie, la seguridad de credenciales (hashing, rotación de refresh tokens, recuperación de contraseña) queda en un servicio probado en vez de código propio, y es coherente con el Postgres de Supabase que ya usamos (HU-1.1). Trade-off asumido: **acoplamiento al proveedor** — migrar de Supabase Auth tendría costo; se mitiga concentrando la integración en el servicio de auth del backend. Consecuencia en el modelo de datos: la tabla local de usuarios pasa a ser un **perfil** que referencia el id de Supabase (`auth.users`), no una fuente de identidad (ver HU-1.10a).
 
@@ -247,7 +249,7 @@ Contexto: con **"Confirm email" activado** en Supabase (lo deseable en producci�
 
 **Tareas técnicas (como se hizo):** `_gotrue_post` + `_parse_user_and_session` compartidos con el alta · `sign_in` + `_parse_signin` (sesión obligatoria) · excepciones `InvalidCredentials` / `EmailNotConfirmed` mapeadas por `error_code` · endpoint con mapeo `401/403/429/503` · cliente compartido con tipos + método + type guard · tests con httpx/servicio mockeados · flujo documentado en el README.
 
-> **Deuda técnica (infra de tests) — SIGUE ABIERTA y se acumula (revisada en la HU-1.7):** al correr el **conjunto completo** aparecen warnings intermitentes de aiosqlite (`RuntimeError: Event loop is closed`) durante el *teardown*. **No son fallos**: los **151 tests pasan de forma determinista** y el CI no los trata como error. Son ruido, pero ruido que ensucia la señal de la suite.
+> **Deuda técnica (infra de tests) — SIGUE ABIERTA y se acumula (revisada en la HU-1.7 y al cerrar la épica):** al correr el **conjunto completo** aparecen warnings intermitentes de aiosqlite (`RuntimeError: Event loop is closed`) durante el *teardown*. **No son fallos**: los **192 tests pasan de forma determinista** y el CI no los trata como error. Son ruido, pero ruido que ensucia la señal de la suite. **Cruza a la Épica 2** — ver *Cierre de la Épica 1*.
 >
 > **Causa, ya identificada:** los fixtures crean el engine SQLite con `asyncio.run(...)`, lo usan desde el loop del `TestClient` y lo cierran con otro `asyncio.run(engine.dispose())` en el teardown — **tres event loops distintos para el mismo engine**. El hilo trabajador de aiosqlite guarda el loop con el que nació y falla al entregar su resultado cuando ese loop ya no existe; el warning aflora en el test que estuviera corriendo en ese momento, no en el que lo causó. Afecta a `test_auth_middleware.py` y `test_users_me.py` (cierre entre loops) y a los tests de **registro/login**, que además ni siquiera cierran sus engines.
 >
@@ -414,37 +416,65 @@ La HU original juntaba **modelo + migración** y **endpoints**. Se dividió para
 
 ---
 
-### HU-1.11 — CORS por ambiente
+### ✅ HU-1.11 — CORS por ambiente
 *Como* operador, *quiero* CORS restringido por ambiente, *para* no exponer la API a orígenes arbitrarios.
 
-**Criterios de aceptación:**
-- Los orígenes permitidos se leen de config, distintos por ambiente.
-- En producción, `*` está prohibido; solo orígenes explícitos.
-- Una petición desde un origen no permitido es rechazada.
+**Criterios de aceptación (como se construyó):**
+- **Orígenes desde config, nunca en el código:** `ROVER_CORS_ORIGINS` (lista separada por comas). Se declara **crudo** (`str`) y se interpreta en `Settings.cors_allowed_origins`, igual que `enable_docs`/`docs_enabled`: un `list[str]` con default fijo no permitiría que el default **dependa del ambiente**, que es justo lo que aquí importa. Sin la variable: en `local`/`test`, `http://localhost:3000` y `http://127.0.0.1:3000` (van **los dos** porque para un navegador son orígenes distintos — la comparación es textual, no por resolución de nombres); en `production`, **ninguno**. Una cadena vacía significa "ningún origen", explícitamente: lo configurado manda sobre el default.
+- **Producción sin orígenes → lista vacía, NO `*`.** Un despliegue al que se le olvidó la variable debe quedar **cerrado** a los navegadores, no abierto a todos. Y **no corta el arranque** (no entra en `_REQUIRED_IN_PRODUCTION`, a diferencia de los secretos): la API es perfectamente útil sin navegadores —móvil, `curl`, un servicio— y negarse a arrancar castigaría a esos clientes por una variable que solo afecta a la web, que ni siquiera existe hasta la Épica 3. El aviso se da por **log al arrancar**, porque el síntoma del olvido (la web falla con un error de CORS opaco) no apunta al backend por sí solo.
+- **`*` en producción SÍ impide arrancar** (fail-fast en un `model_validator`, como el resto de la config): eso no es un olvido, es un error de configuración, y arrancar con él sería servir la API a cualquier página web con la sesión de quien la visita. Fuera de producción se admite, como escape hatch de depuración.
+- **Política explícita en vez de comodines:** métodos `GET, POST, PATCH, OPTIONS` (los que la API usa hoy); cabeceras de petición `Authorization`, `Content-Type` y `X-Request-ID` — `application/json` **no** es un valor "simple" según la spec, así que sin declararlo el preflight rechazaría **todo** POST con cuerpo.
+- **Cabeceras expuestas** (`Retry-After`, `X-RateLimit-*`, `X-Request-ID`): ninguna es *safelisted*, así que sin exponerlas el JavaScript del navegador **no puede leerlas** y `parseRetryAfter`/`ApiError.retryAfterSeconds` de `@rover/shared` (HU-1.7) devolverían siempre `null` en web aunque el 429 las traiga.
+- **Credenciales desactivadas**: la sesión viaja en `Authorization`, no en cookies (ver [`docs/auth.md`](auth.md), HU-1.5). Activarlas no daría nada y ampliaría lo que un origen permitido puede hacer en nombre del usuario. Efecto lateral valioso: la combinación insegura **`*` + credenciales** es **imposible por construcción**, no depende de que nadie se acuerde.
+- **Orden en la pila: CORS por FUERA del rate limiting.** Las cabeceras de CORS se añaden a la respuesta *al salir*, así que con CORS por dentro el **429** saldría sin ellas y el navegador se lo ocultaría a la web como un error de CORS genérico — no podría distinguir "te pasaste de peticiones" de "el servidor no responde", ni leer `Retry-After`. Contrapartida asumida y documentada: el **preflight no consume cupo** (lo responde CORS sin llegar al limitador); es barato —no toca ruta, ni base, ni JWKS— y no abre nada, porque quien quiera abusar manda peticiones reales, que sí cuentan.
+- **20 tests** (`tests/test_cors.py`): origen permitido con `Vary: Origin`, origen ajeno sin permiso, `localhost` vs `127.0.0.1`, preflight por método, `Authorization` permitido, preflight de origen ajeno, credenciales ausentes, cabeceras del rate limit legibles, **el 429 con cabeceras de CORS**, el preflight sin consumir cupo, producción sin orígenes y con lista explícita, el comodín impidiendo arrancar, y la resolución de la config (defaults por ambiente, limpieza de la lista, cadena vacía).
+- **Verificado contra un servidor real**, no solo en tests: cabeceras del origen permitido, ausencia de permiso para el ajeno, preflight completo, el `429` saliendo con `access-control-allow-origin`, y el arranque abortando con `ROVER_CORS_ORIGINS='*'` en producción.
 
-**Tareas técnicas:** middleware CORS leyendo de config · valores por ambiente · documentar en `.env.example`.
+**Tareas técnicas (como se hizo):** `Settings.cors_origins` + propiedad `cors_allowed_origins` + validador de `*` en producción · `configure_cors()` en `app/api/middleware.py` con la política en constantes · montaje en `create_app()` tras el rate limiter · `tests/test_cors.py` · README (§ CORS: tabla por ambiente, política, orden de la pila, verificación en local) y `.env.example`.
+
+> **Nota para la Épica 3:** el dominio de los *preview deployments* de Vercel, si se quiere permitir, va enumerado en `ROVER_CORS_ORIGINS` como cualquier otro. Y el móvil (Expo) **no pasa por CORS**: esto solo afecta a la web.
 
 ---
 
-### HU-1.12 — Observabilidad básica (logging estructurado)
+### ✅ HU-1.12 — Observabilidad básica (logging estructurado)
 *Como* operador, *quiero* logs estructurados con id de request, *para* diagnosticar problemas en producción.
 
-**Criterios de aceptación:**
-- Logs en formato estructurado (JSON) con timestamp, nivel, id de request y user_id si aplica.
-- Cada request entra y sale con una línea de log correlacionable.
-- Los errores `500` incluyen el id de error de la HU-1.8.
-- No se loguean secretos ni datos sensibles (contraseñas, tokens).
+> Dos piezas ya estaban al llegar aquí: el **logging básico** (HU-1.3b, `configure_logging` enrutando los `app.*` a stdout) y el **`error_id` de los 500** (HU-1.8). Lo que faltaba —y es lo que hizo esta HU— era el formato **estructurado**, el **request id**, y **correlacionarlos**.
 
-**Tareas técnicas:** configurar logging estructurado · middleware de request id · correlación con el manejador de errores · revisar que no se filtren secretos.
+**Criterios de aceptación (como se construyó):**
+- **Dos formatos, uno por audiencia.** `ROVER_LOG_FORMAT` (`json`/`text`); sin definir lo decide el ambiente: **JSON en producción**, porque quien lee es una herramienta de monitoreo que necesita filtrar por campo (`level`, `request_id`, `status`, `duration_ms`) y no sabe leer prosa; **texto fuera**, porque quien lee es una persona en una terminal y un JSON por línea es hostil para eso. Cada línea JSON lleva `timestamp` (ISO 8601 **en UTC**, comparable entre instancias sin pensar en husos), `level`, `logger`, `message`, el contexto, y en las excepciones tipo, mensaje y traza.
+- **Contexto sin ensuciar los call sites.** Cualquier `extra={...}` se emite como campo propio del JSON, sin tocar el formateador (los atributos estándar de `LogRecord` se filtran por lista; se descarta el `color_message` con escapes ANSI que uvicorn adjunta a los suyos).
+- **Propagación del request id con un `ContextVar`** (`app/core/request_context.py`). Cada petición corre en su propia *task* de asyncio y cada task hereda su copia del contexto, así que lo que escribe el middleware lo ven **todas** las llamadas de esa petición y **solo** de esa —peticiones concurrentes no se pisan—. Un `Filter` de logging lo cuelga de **todos** los registros, así que **ningún call site cambia**: `logger.warning("...")` ya sale correlacionado. La alternativa (pasarlo por parámetro) contaminaría firmas que no tienen nada que ver con logs —los servicios no tienen el `Request` ni deberían— y bastaría un olvido para perder la traza.
+- **Un segundo canal, el scope ASGI**, por un caso concreto descubierto al implementarlo: Starlette monta su `ServerErrorMiddleware` como **el más externo de todos**, así que cuando una excepción llega hasta él el middleware de contexto ya ejecutó su `finally` y restauró la variable. El handler del 500 sí tiene el `Request`, y el scope es el mismo objeto de principio a fin de la petición.
+- **Id entrante respetado pero SANEADO.** Se acepta `X-Request-ID` si encaja en `[A-Za-z0-9._:-]{1,64}` —así una traza que empieza en un proxy o en la web sigue siendo la misma aquí— y si no, se genera uno propio. Es **entrada no confiable** que acaba en cada línea de log y en una cabecera de respuesta: un salto de línea permitiría **falsificar líneas de log enteras** (*log injection*) y un valor de 10 KB engordaría todas las líneas de la petición. Se **devuelve siempre** en la respuesta, también en los 500.
+- **Correlación `error_id` ↔ `request_id`: DOS campos, juntos en la misma línea.** No se unifican porque no son lo mismo ni se confían igual: el `request_id` identifica **la petición**, está en todas sus líneas y en toda respuesta, y **puede venir de fuera**; el `error_id` identifica **un fallo** concreto, existe solo en los 500 y es lo que el usuario cita al reportar. Unificarlos dejaría que un cliente **eligiera** el identificador con el que se archiva un error del servidor —cómodo para envenenar búsquedas en el log o hacer colisionar dos incidentes— y perdería la traza compartida con el proxy. Con los dos en la misma línea se navega en ambos sentidos sin renunciar a nada.
+- **Una línea de acceso por petición** con método, ruta, status y duración, en su **propio logger `app.access`** —es un flujo distinto (una línea por petición, siempre) de los eventos puntuales del resto de la app, y quien opera querrá filtrarlo por separado—. Nivel según el status: `INFO` <400, `WARNING` 4xx, `ERROR` 5xx. Sustituye a `uvicorn.access`, que se **silencia**: dice lo mismo y además trae id y duración. Los demás loggers de uvicorn se reenganchan a nuestro handler, para que en producción no salgan líneas de texto suelto entre el JSON.
+- **Qué NO se registra: cuerpo, cabeceras y query string.** Lo último es una **política deliberada**, no una omisión: hoy ningún endpoint recibe nada sensible por query, pero los que suelen llegar después (búsquedas, enlaces de confirmación con código, filtros con datos del usuario) sí, y para entonces nadie se acordaría de revisar el middleware. La ruta basta para saber qué se llamó. `Authorization` nunca se loguea.
+- **`RequestContextMiddleware` es el más externo de la pila**, por delante de CORS y del rate limiting, para que **todo** lo de dentro —incluido un 429 o un preflight que CORS corta en seco— salga con id en logs y cabecera.
+- **`@rover/shared`:** `ApiError` gana `requestId` (leído de la cabecera) y se exporta `REQUEST_ID_HEADER`. **Complementa** a `errorId` sin sustituirlo: el request id existe también en los errores que no son 500 (un 429, un 401) y en las respuestas correctas.
+- **24 tests nuevos** (21 backend + 3 shared): JSON válido con sus campos, la línea de acceso con método/ruta/status/duración, el nivel por status, el id en **todas** las líneas y en la cabecera, id entrante respetado y el inválido descartado (incluido un intento de *log injection*), la correlación en un 500, y **la ausencia de secretos con una petición que lleva contraseña, token en `Authorization` y query string**.
+- **Verificado contra un servidor real** en los dos formatos: en JSON, todas las líneas (arranque de uvicorn incluido) parsean; en texto, dos líneas de la misma petición compartiendo id.
 
-> **Ya adelantado (HU-1.3b):** el **logging básico ya está resuelto** — `app/core/logging.py` (`configure_logging`, llamado desde `create_app`) enruta los loggers `app.*` a **stdout** con formato consistente y sin filtrar secretos, así que los diagnósticos de la app son visibles junto a los de uvicorn.
->
-> **Ya adelantado (HU-1.8):** el **`error_id` de los `500` ya existe** y se loguea a nivel `error` con la causa real, el método y la ruta; el cliente lo recibe en el cuerpo. **Pendiente de esta HU:** el logging **estructurado** (JSON), el **request id**, y **correlacionar** ambos — que la línea de entrada/salida de cada request y el `error_id` compartan identificador, hoy inconexos.
+**Tareas técnicas (como se hizo):** `app/core/request_context.py` (ContextVar + saneo + canal por scope) · `app/core/logging.py` (`JsonFormatter`, `TextFormatter`, `RequestIdFilter`, reenganche de uvicorn) · `Settings.log_format` + `effective_log_format` · `RequestContextMiddleware` · correlación y cabecera en `unhandled_exception_handler` · `@rover/shared` (`requestId` + `REQUEST_ID_HEADER`) · `tests/test_logging.py` y tests del cliente · README (§ Observabilidad) y `.env.example`.
+
+> **Fuera de alcance, a propósito:** el `user_id` en las líneas de log. Lo pedía el criterio original, pero la identidad no existe hasta que `get_current_user` valida el token —dentro del router—, así que la línea de acceso (que corre en el middleware, por fuera) no puede tenerlo sin repetir la validación. Las líneas que **sí** conocen al usuario ya lo registran donde importa (auth, rate limiting), y el `request_id` permite cruzarlas con la de acceso. Añadirlo a todas exigiría un segundo `ContextVar` que rellene la dependencia; queda como mejora si algún día hace falta filtrar por usuario en el monitoreo.
 
 ---
 
-## Cómo arrancamos la Épica 1
+## Cierre de la Épica 1
 
-- **Orden sugerido** (de `backlog-full.md`): empezar por **HU-1.1 → 1.2** (base de datos y migraciones) **antes de auth**; luego 1.3 → 1.4 → 1.5 → 1.6 (auth completa), y de ahí 1.7–1.12.
-- **Decisiones resueltas:** el backend de estado para rate limiting (HU-1.7) es **memoria del proceso**, tras la interfaz `RateLimitStore`. Redis (Upstash o propio) queda pospuesto con un disparador explícito: **cuando haya una segunda instancia**.
-- **Siguiente épica:** cuando las 12 HU estén *Done*, añadimos la Épica 2 (El agente) a este documento.
+**Las 14 HU están completadas** (1.1, 1.2, 1.3, 1.3b, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 1.10a, 1.10b, 1.11, 1.12). El backend tiene API versionada con documentación, base async con migraciones, identidad delegada en Supabase Auth con validación local del JWT, perfil de usuario, rate limiting en tres ámbitos, contrato único de error, CORS por ambiente y logs estructurados correlacionables. **192 tests** en el backend y **53** en `@rover/shared`, con lint, formato y tipado estricto en verde.
+
+### Deuda técnica que CRUZA a la Épica 2
+
+1. **Limpieza de los fixtures de test (aiosqlite) — recomendada ANTES o al principio de la Épica 2.** Es la única deuda que **empeora sola**: cada HU que necesita base de datos copia el patrón y lo extiende. Los fixtures crean el engine SQLite con `asyncio.run(...)`, lo usan desde el loop del `TestClient` y lo cierran con otro `asyncio.run(...)` — **tres event loops para el mismo engine**—, y el hilo trabajador de aiosqlite falla al entregar su resultado cuando el loop que lo vio nacer ya no existe. No son fallos (la suite pasa determinista) pero el warning aflora en un test que no lo causó, así que **ensucia la señal justo cuando más se necesita**: la Épica 2 trae streaming y concurrencia, donde un "Event loop is closed" espurio puede costar horas de diagnóstico. El arreglo es acotado —un fixture compartido en `tests/conftest.py`, que ya existe desde la HU-1.7, que haga nacer y morir el engine en el mismo loop— y solo se encarece con cada módulo nuevo. Detalle completo en la nota de la HU-1.4.
+2. **Rate limiting en memoria del proceso** (HU-1.7): con varias instancias el límite efectivo se multiplica por el número de instancias. **Disparador explícito: la segunda instancia.** El punto de cambio está aislado tras la interfaz `RateLimitStore` (implementar `hit`/`peek`/`reset` con un `ZSET` + script Lua y llamar a `reset_rate_limit_store(...)` al arrancar); ni la política, ni el middleware, ni la dependencia, ni los endpoints cambian.
+3. **Catálogo `ErrorCode` duplicado a mano** entre el backend y `@rover/shared` (HU-1.8). Duplicación consciente y barata (una línea por código); desaparece sola el día que se generen los tipos desde el esquema OpenAPI —idea anotada en el cliente compartido desde la HU-0.7—.
+
+### Qué queda apuntado para las Épicas 3 y 4
+
+La sesión y su renovación están resueltas **por escrito** en [`docs/auth.md`](auth.md) (HU-1.5), con checklists por épica: el backend nunca renueva, el SDK de Supabase es el dueño de la sesión, y el cliente que se loguee contra `/v1/auth/login` debe entregarle la sesión con `setSession(...)` acto seguido o el auto-refresh no funcionará. No hay `POST /v1/auth/refresh` y la decisión está justificada allí.
+
+### Siguiente épica
+
+**Épica 2 — El agente.** Se detallará en este documento al arrancarla, tomando el esqueleto de `backlog-full.md`.
