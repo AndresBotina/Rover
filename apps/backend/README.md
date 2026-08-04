@@ -497,6 +497,99 @@ En local no hay proxy delante, así que todas las peticiones caen en el mismo
 cubo (el peer TCP). Para simular varias IPs, manda la cabecera a mano:
 `-H 'X-Forwarded-For: 203.0.113.7'`.
 
+## CORS (HU-1.11)
+
+CORS decide qué **orígenes de navegador** pueden llamar a esta API. Conviene
+tener claro qué **no** es: no es un control de acceso del servidor. Quien lo
+aplica es el navegador, para que una página cualquiera no pueda leer respuestas
+de Rover usando la sesión de quien la visita; `curl`, Postman o el **móvil
+(Expo)** ignoran CORS por completo, y hacen bien. La autorización de verdad
+sigue siendo el Bearer de Supabase y los límites de peticiones.
+
+### Orígenes por ambiente
+
+Los orígenes **nunca** están en el código: salen de `ROVER_CORS_ORIGINS` (lista
+separada por comas, sin barra final). Si la variable no se define, decide el
+ambiente:
+
+| Ambiente | Sin `ROVER_CORS_ORIGINS` | Con la variable | `*` |
+|---|---|---|---|
+| `local` / `test` | `http://localhost:3000` y `http://127.0.0.1:3000` | manda la variable | admitido (escape hatch de depuración) |
+| `production` | **ninguno** | manda la variable | **PROHIBIDO: la app no arranca** |
+
+Dos detalles que muerden:
+
+- `localhost` y `127.0.0.1` son orígenes **distintos** para un navegador (la
+  comparación es textual). Por eso el default de desarrollo trae los dos.
+- Una cadena **vacía** (`ROVER_CORS_ORIGINS=`) significa "ningún origen",
+  explícitamente: lo configurado manda sobre el default del ambiente.
+
+**Producción sin orígenes configurados → ninguno permitido.** Es deliberado que
+no caiga a `*`: un despliegue al que se le olvidó la variable debe quedar
+**cerrado** a los navegadores, no abierto a todos. Tampoco corta el arranque
+(no está en `_REQUIRED_IN_PRODUCTION`, a diferencia de los secretos): la API es
+perfectamente útil sin navegadores —móvil, `curl`, un servicio— y negarse a
+arrancar castigaría a esos clientes por una variable que solo afecta a la web.
+El aviso se da por **log al arrancar**, porque el síntoma del olvido (la web
+falla con un error de CORS opaco) no apunta al backend por sí solo.
+
+**En Render:** panel del servicio → **Environment** → `ROVER_CORS_ORIGINS` con
+los orígenes exactos de la web, p. ej.
+`https://rover.app,https://www.rover.app`. El dominio de los *preview
+deployments* de Vercel, si se quiere permitir, va también enumerado.
+
+### Política
+
+| Qué | Valor | Por qué |
+|---|---|---|
+| Métodos | `GET, POST, PATCH, OPTIONS` | los que la API usa hoy; ampliarla debería ser una decisión, no un `*` |
+| Cabeceras de petición | `Authorization`, `Content-Type` | el Bearer de las rutas protegidas y el JSON de los cuerpos (`application/json` no es un valor "simple": sin declararlo, todo POST con cuerpo fallaría en el preflight) |
+| Cabeceras expuestas | `Retry-After`, `X-RateLimit-*` | ninguna es "safelisted": sin exponerlas, `parseRetryAfter` y `ApiError.retryAfterSeconds` de `@rover/shared` leerían siempre `null` en web |
+| Credenciales | **no** | la sesión viaja en `Authorization`, no en cookies (ver [`docs/auth.md`](../../docs/auth.md)) |
+| `max-age` del preflight | 600 s | ahorra un `OPTIONS` por petición sin congelar la política |
+
+Sobre **credenciales**: activarlas (cookies, `credentials: 'include'`) no daría
+nada hoy y ampliaría lo que un origen permitido puede hacer en nombre del
+usuario. Como efecto lateral, la combinación insegura **`*` + credenciales**
+—que el propio navegador rechaza— es imposible por construcción. Si algún día
+la web necesitara cookies contra esta API, activarlas obliga a que los orígenes
+sean siempre explícitos, que es justo lo que ya garantiza el validador de
+producción.
+
+### Orden en la pila de middleware
+
+CORS se monta **por fuera** del rate limiting (`create_app` añade primero el
+rate limiter y después CORS: en Starlette, el último en añadirse queda más
+externo). El motivo es concreto: las cabeceras de CORS se añaden a la respuesta
+al salir, así que con CORS por dentro el **429** saldría sin ellas y el
+navegador se lo ocultaría a la web como un error de CORS genérico — no podría
+distinguir "te pasaste de peticiones" de "el servidor no responde", ni leer
+`Retry-After`. Contrapartida asumida: el **preflight no consume cupo** (lo
+responde CORS sin llegar al limitador). Es barato —no toca ruta, ni base, ni
+JWKS— y no abre nada: quien quiera abusar manda peticiones reales, que sí
+cuentan.
+
+### Verificarlo en local
+
+```bash
+uv run uvicorn app.main:app                      # terminal 1
+
+# Origen permitido → llega la cabecera de permiso:
+curl -si http://127.0.0.1:8000/v1/health -H 'Origin: http://localhost:3000' | grep -i access-control
+# access-control-allow-origin: http://localhost:3000
+# access-control-expose-headers: Retry-After, X-RateLimit-Limit, …
+
+# Origen ajeno → responde igual, pero SIN permiso (el navegador es quien corta):
+curl -si http://127.0.0.1:8000/v1/health -H 'Origin: https://sitio-ajeno.example' | grep -ci access-control-allow-origin
+# 0
+
+# Preflight de un POST con JSON:
+curl -si -X OPTIONS http://127.0.0.1:8000/v1/auth/login \
+  -H 'Origin: http://localhost:3000' \
+  -H 'Access-Control-Request-Method: POST' \
+  -H 'Access-Control-Request-Headers: content-type' | head -8
+```
+
 ## Migraciones (Alembic)
 
 El esquema se versiona con Alembic (`alembic.ini` + `migrations/`), configurado

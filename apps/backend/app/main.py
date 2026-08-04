@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.middleware import RateLimitMiddleware
+from app.api.middleware import RateLimitMiddleware, configure_cors
 from app.api.v1.router import TAGS_METADATA
 from app.api.v1.router import router as api_v1_router
 from app.core.config import settings
@@ -69,6 +69,11 @@ def create_app() -> FastAPI:
     # router para que cuente también las peticiones a rutas inexistentes, que
     # son las de quien escanea.
     app.add_middleware(RateLimitMiddleware)
+    # CORS por ambiente (HU-1.11). Va DESPUÉS del rate limiting a propósito:
+    # el último que se añade queda por FUERA, y CORS tiene que envolver al
+    # rate limiter para que el 429 salga con cabeceras de CORS y el navegador
+    # deje que la web lo lea. El porqué completo, en app/api/middleware.py.
+    configure_cors(app)
     # Un único punto de montaje: el agregador ya trae el prefijo /v1.
     app.include_router(api_v1_router)
     return app

@@ -32,6 +32,16 @@ Environment = Literal["local", "test", "production"]
 # carga no dependa del directorio desde el que se lance uvicorn o pytest.
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
+# Orígenes de desarrollo permitidos por defecto FUERA de producción, para que
+# la web de la Épica 3 arranque sin tener que configurar nada. ``localhost`` y
+# ``127.0.0.1`` son orígenes DISTINTOS para un navegador (la comparación es
+# textual, no por resolución de nombres), así que van los dos: si no, arrancar
+# el dev server por una u otra forma daría resultados distintos.
+_DEV_CORS_ORIGINS: tuple[str, ...] = (
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+)
+
 
 class Settings(BaseSettings):
     """Settings de la app. Defaults sensatos SOLO para lo no sensible."""
@@ -52,6 +62,19 @@ class Settings(BaseSettings):
     # ``None`` = decide el ambiente (ver la propiedad ``docs_enabled``); un
     # booleano explícito en ROVER_ENABLE_DOCS manda sobre esa regla.
     enable_docs: bool | None = None
+
+    # --- CORS (HU-1.11) ------------------------------------------------------
+    # Orígenes que un NAVEGADOR puede usar para llamar a esta API, como lista
+    # separada por comas ("https://rover.app,https://www.rover.app").
+    #
+    # Se declara CRUDO (str) y se interpreta en ``cors_allowed_origins``, igual
+    # que ``enable_docs``/``docs_enabled``: un ``list[str]`` con default fijo
+    # no permitiría que el default DEPENDA del ambiente, que es justo lo que
+    # aquí importa (dev abierto a localhost, producción cerrada).
+    #
+    # ``None`` = sin configurar → decide el ambiente. Una cadena VACÍA es
+    # distinto: significa "ningún origen", explícitamente.
+    cors_origins: str | None = None
 
     # --- Rate limiting (HU-1.7) ----------------------------------------------
     # Los límites son "N peticiones por ventana". Ver app/core/rate_limit.py
@@ -156,6 +179,49 @@ class Settings(BaseSettings):
         if self.enable_docs is not None:
             return self.enable_docs
         return self.env != "production"
+
+    @property
+    def cors_allowed_origins(self) -> list[str]:
+        """Orígenes permitidos por el navegador, ya resueltos para el ambiente.
+
+        Sin ``ROVER_CORS_ORIGINS`` configurada:
+
+        - fuera de producción → los orígenes de desarrollo (``_DEV_CORS_ORIGINS``),
+          para que la web de la Épica 3 funcione recién clonado el repo;
+        - en producción → **lista vacía**: ningún origen. Es la opción segura,
+          y es deliberado que NO caiga a ``"*"`` — un despliegue al que se le
+          olvidó la variable debe quedar cerrado a los navegadores, no abierto
+          a todos. Tampoco corta el arranque (no está en
+          ``_REQUIRED_IN_PRODUCTION``): la API sigue siendo perfectamente útil
+          sin navegadores —móvil (Expo) no está sujeto a CORS, y curl o un
+          servicio tampoco—, así que negarse a arrancar castigaría a esos
+          clientes por una variable que solo afecta a la web. El aviso se da
+          por log al arrancar (ver ``app/api/middleware.py``).
+
+        Una cadena vacía se respeta tal cual (ningún origen): si se configura
+        explícitamente, manda sobre el default del ambiente.
+        """
+        if self.cors_origins is None:
+            return [] if self.env == "production" else list(_DEV_CORS_ORIGINS)
+        return [origen.strip() for origen in self.cors_origins.split(",") if origen.strip()]
+
+    @model_validator(mode="after")
+    def _reject_wildcard_cors_in_production(self) -> Self:
+        """En producción, ``"*"`` es un error de configuración, no un atajo.
+
+        Fail-fast como el resto de la config: mejor no arrancar que servir una
+        API que cualquier página web puede llamar desde el navegador de un
+        usuario logueado. Fuera de producción sí se admite, como escape hatch
+        para depurar desde un origen suelto.
+        """
+        if self.env == "production" and "*" in self.cors_allowed_origins:
+            raise ValueError(
+                "config inválida para env='production': ROVER_CORS_ORIGINS no puede ser '*'. "
+                "Enumera los orígenes exactos de la web (p. ej. "
+                "'https://rover.app,https://www.rover.app'), o déjala sin definir para no "
+                "permitir ninguno."
+            )
+        return self
 
     @model_validator(mode="after")
     def _fail_fast_if_missing_required(self) -> Self:
