@@ -2,7 +2,7 @@
 
 > **Documento de trabajo vivo.** Crece **épica por épica**: aquí solo se detalla la épica en curso. Cuando cerremos todas sus HU (cumpliendo la Definition of Done), añadimos la siguiente. El panorama completo de las 7 épicas vive en `backlog-full.md` como referencia.
 >
-> **Épicas 0 y 1: completadas.** Ambas quedan abajo como registro histórico de lo construido. **Siguiente: Épica 2 — El agente**, que se detallará en este documento al arrancarla (ver *Cierre de la Épica 1* al final: hay deuda técnica que conviene resolver antes o al principio de esa épica).
+> **Épicas 0 y 1: completadas.** Ambas quedan abajo como registro histórico de lo construido. **Siguiente: Épica 2 — El agente**, que se detallará en este documento al arrancarla. La deuda que convenía saldar antes de empezarla —la limpieza de los fixtures de test— está **resuelta** (HU-1.13); la que queda tiene disparadores propios y no bloquea (ver *Cierre de la Épica 1*).
 
 ---
 
@@ -157,7 +157,7 @@ Una HU está **Done** solo cuando:
 
 **Objetivo:** el backend permanente y bien construido. API versionada, conexión async a Supabase, migraciones, autenticación delegada en Supabase Auth, rate limiting por plan, manejo de errores centralizado y observabilidad básica. Esto no se bota cuando crezcas; solo le pones más máquinas detrás.
 
-> **Estado: las 14 HU están hechas** (1.1, 1.2, 1.3, 1.3b, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 1.10a, 1.10b, 1.11 y 1.12 — la numeración incluye la 1.3b, que nació de un caso descubierto al verificar la 1.3, y el desdoble de la 1.10 en 1.10a/1.10b; el encabezado de la HU-1.10 se conserva porque explica esa división, pero no es una HU en sí). Esta sección queda como registro histórico. La deuda técnica que cruza a la Épica 2 está anotada al final, en *Cierre de la Épica 1*.
+> **Estado: las 15 HU están hechas** (1.1, 1.2, 1.3, 1.3b, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 1.10a, 1.10b, 1.11, 1.12 y 1.13 — la numeración incluye la 1.3b, que nació de un caso descubierto al verificar la 1.3, el desdoble de la 1.10 en 1.10a/1.10b, y la 1.13, que salda una deuda técnica de la propia épica; el encabezado de la HU-1.10 se conserva porque explica esa división, pero no es una HU en sí). Esta sección queda como registro histórico. La deuda técnica restante está anotada al final, en *Cierre de la Épica 1*.
 
 > **Decisión de arquitectura: Supabase Auth como proveedor de identidad.** El backend **no emite JWT propios**: delega registro y login en Supabase Auth y **valida** los tokens que este emite. Motivos: el login social con Google/Apple que exigen las stores viene resuelto de serie, la seguridad de credenciales (hashing, rotación de refresh tokens, recuperación de contraseña) queda en un servicio probado en vez de código propio, y es coherente con el Postgres de Supabase que ya usamos (HU-1.1). Trade-off asumido: **acoplamiento al proveedor** — migrar de Supabase Auth tendría costo; se mitiga concentrando la integración en el servicio de auth del backend. Consecuencia en el modelo de datos: la tabla local de usuarios pasa a ser un **perfil** que referencia el id de Supabase (`auth.users`), no una fuente de identidad (ver HU-1.10a).
 
@@ -249,13 +249,15 @@ Contexto: con **"Confirm email" activado** en Supabase (lo deseable en producci�
 
 **Tareas técnicas (como se hizo):** `_gotrue_post` + `_parse_user_and_session` compartidos con el alta · `sign_in` + `_parse_signin` (sesión obligatoria) · excepciones `InvalidCredentials` / `EmailNotConfirmed` mapeadas por `error_code` · endpoint con mapeo `401/403/429/503` · cliente compartido con tipos + método + type guard · tests con httpx/servicio mockeados · flujo documentado en el README.
 
-> **Deuda técnica (infra de tests) — SIGUE ABIERTA y se acumula (revisada en la HU-1.7 y al cerrar la épica):** al correr el **conjunto completo** aparecen warnings intermitentes de aiosqlite (`RuntimeError: Event loop is closed`) durante el *teardown*. **No son fallos**: los **192 tests pasan de forma determinista** y el CI no los trata como error. Son ruido, pero ruido que ensucia la señal de la suite. **Cruza a la Épica 2** — ver *Cierre de la Épica 1*.
+> **Deuda técnica (infra de tests) — ✅ RESUELTA en la HU-1.13.** Queda el registro de cómo se veía desde aquí, porque el recorrido explica por qué tardó tres HU en cerrarse.
 >
-> **Causa, ya identificada:** los fixtures crean el engine SQLite con `asyncio.run(...)`, lo usan desde el loop del `TestClient` y lo cierran con otro `asyncio.run(engine.dispose())` en el teardown — **tres event loops distintos para el mismo engine**. El hilo trabajador de aiosqlite guarda el loop con el que nació y falla al entregar su resultado cuando ese loop ya no existe; el warning aflora en el test que estuviera corriendo en ese momento, no en el que lo causó. Afecta a `test_auth_middleware.py` y `test_users_me.py` (cierre entre loops) y a los tests de **registro/login**, que además ni siquiera cierran sus engines.
+> **El síntoma:** al correr el conjunto completo aparecían warnings intermitentes de aiosqlite (`RuntimeError: Event loop is closed`) durante el *teardown*. Nunca fueron fallos —la suite pasaba determinista— pero el warning afloraba en el test que estuviera corriendo en ese momento, no en el que lo causaba.
 >
-> **Intentos descartados en la HU-1.7:** `poolclass=NullPool` en los engines de test y cerrar el generador de `get_db` con `aclosing` (esto último sí arregló una fuga real, ver la HU-1.7). Ninguno lo elimina: el arreglo de verdad es **reestructurar los fixtures** para que el engine nazca y muera en el mismo loop.
+> **Lo que se creía la causa (desde esta HU y revisado en la HU-1.7):** los fixtures crean el engine SQLite con `asyncio.run(...)`, lo usan desde el loop del `TestClient` y lo cierran con otro `asyncio.run(engine.dispose())` — **tres event loops para el mismo engine**. Correcto, pero **incompleto**: era solo la mitad del problema.
 >
-> **Recomendación: abrir una HU dedicada de limpieza de fixtures de test, y pronto.** La deuda ya no está "acotada a registro/login" como decía esta nota antes de la HU-1.7: cada HU nueva que necesita base de datos copia el patrón y lo extiende. El trabajo es acotado (un fixture compartido en `tests/conftest.py`, que desde la HU-1.7 ya existe) pero crece con cada módulo que se añada.
+> **Intentos descartados en la HU-1.7:** `poolclass=NullPool` en los engines de test y cerrar el generador de `get_db` con `aclosing` (esto último sí arregló una fuga real, ver la HU-1.7).
+>
+> **Por qué aquello no bastó, visto ya desde la HU-1.13:** el problema tenía **dos mitades** —el pool que recicla conexiones y el engine repartido entre loops— y cada intento atacó solo una. `NullPool` se probó **sin** quitar los `asyncio.run`, y reestructurar los fixtures sin tocar el pool habría dejado igual la conexión reutilizada. La causa raíz completa y el arreglo están en la **HU-1.13**.
 
 ---
 
@@ -461,13 +463,41 @@ La HU original juntaba **modelo + migración** y **endpoints**. Se dividió para
 
 ---
 
+### ✅ HU-1.13 — Limpieza de los fixtures de test *(deuda técnica)*
+*Como* desarrollador, *quiero* que la suite corra sin warnings espurios, *para* que un aviso en los tests signifique siempre algo real.
+
+> **HU de DEUDA TÉCNICA**, arrastrada desde la HU-1.3 y revisada sin éxito en la HU-1.7 y al cerrar la épica. No cambia el comportamiento de la app: **no se tocó una sola línea de `app/`**.
+
+**Causa raíz (más profunda que el diagnóstico que veníamos arrastrando):**
+
+- El diagnóstico anterior —"tres event loops para el mismo engine"— era **correcto pero incompleto**. Medido con una sonda, el pool real de los engines de test era **`AsyncAdaptedQueuePool`, que REUTILIZA conexiones**: una conexión abierta bajo un event loop terminaba usándose —o cerrándose— bajo otro que ya estaba muerto. Ésa es la mitad que faltaba.
+- Con las **dos mitades** a la vista (un pool que recicla + un engine creado y cerrado con `asyncio.run(...)` en loops distintos) se explica por qué **el intento de la HU-1.7 falló**: probó `NullPool` **sin** quitar los `asyncio.run`. Atacar una sola mitad no arregla nada, y por eso la deuda parecía irreductible.
+
+**Criterios de aceptación (como se construyó):**
+- **Fixture central `bd` en `tests/conftest.py`, con tres piezas que se necesitan JUNTAS:**
+  - **`NullPool`** — ninguna conexión se guarda para reutilizarse, así que **ninguna cruza de loop ni sobrevive al que la abrió**. Es la raíz.
+  - **Un `BlockingPortal` por test** — un único event loop vivo durante todo el test, en el que el engine **nace, crea el esquema, se consulta y muere**. `bd.run(...)` sustituye a `asyncio.run(...)` con el mismo uso desde tests síncronos, sin fabricar y tirar un loop por llamada.
+  - **Fichero temporal en vez de `:memory:`** — con `NullPool` cada conexión es nueva, y una base en memoria sería una base **vacía distinta por conexión** (el clásico "no such table"). Antes funcionaba de milagro: el pool reciclaba la única conexión que tenía el esquema. El fichero evita además el `StaticPool`, que arreglaría el esquema **volviendo a compartir una conexión entre loops** — justo lo que se quería quitar.
+- **Scope de función**, un fichero por test: el aislamiento entre tests es exactamente el que ya había (cada uno montaba su propia base).
+- **Módulos refactorizados:** `test_auth`, `test_auth_middleware`, `test_users_me`, `test_rate_limit`, `test_database` y **`test_models`** —este último no estaba en el diagnóstico y también montaba su engine—. Fuera cuatro copias de `_usar_sqlite`, las listas de engines/ficheros pendientes de limpiar y sus teardowns. El test de la carrera del `IntegrityError` deja de montar su `StaticPool` en memoria y corre entero dentro de `bd.run`. `tests/auth_utils.py` se reutiliza tal cual, sin duplicar nada. Neto: **−297/+235 líneas**.
+- **Refactor de andamiaje, no de intención:** verificado **diffeando todos los `assert`** del cambio. Las únicas seis diferencias son el argumento de un helper (`factory` → `bd`); los valores esperados son idénticos.
+- **Se conserva un `asyncio.run`**, en `_ejecutar` de `test_rate_limit`: corre corutinas del almacén en memoria, que no tocan la base ni nada que sobreviva al loop. Está documentado en su docstring para que no parezca un olvido.
+- **Verificación:** **192 tests verdes en 17 corridas seguidas, sin un solo warning de aiosqlite**, más una corrida con **`-W error::pytest.PytestUnhandledThreadExceptionWarning`** (el aviso convertido en fallo duro) también en verde. Comprobado además que ningún módulo crea ya engines sueltos y que no quedan ficheros `.sqlite` huérfanos. Efecto lateral: la suite baja de **~3,8 s a ~1,7 s**, por dejar de levantar y tirar un event loop por consulta.
+- **Dependencias: ninguna nueva.** Se **declara** `anyio>=4.14.1` en el grupo `dev` porque ya venía como transitiva de Starlette y ahora `conftest.py` la importa **directo** (`BlockingPortal`); dejarla implícita sería un import prestado que se rompe el día que Starlette cambie de dependencias. No se adoptó `pytest-asyncio`: la suite es síncrona y usa `TestClient`, así que habría obligado a convertir los tests a `async def` —un cambio de forma en todos ellos— sin resolver nada que el portal no resuelva ya.
+
+**Tareas técnicas (como se hizo):** fixtures `loop_de_test` (portal) y `bd` (engine + esquema + `get_session_factory` parcheado) en `tests/conftest.py` · clase `BaseDeTest` (`engine`, `factory`, `run`) · refactor de los seis módulos · `anyio` declarada en `dev`.
+
+> **Salvedad honesta, para que quede en el registro:** el warning **no se pudo reproducir a voluntad** —ni en 14 corridas previas al arreglo, ni forzando GC sobre engines huérfanos—. `aiosqlite` 0.22.1 ata el future al loop **que llama** (`future.get_loop()`) en vez de a uno capturado al nacer el hilo trabajador, lo que estrechó mucho la ventana de fallo desde que se escribió el diagnóstico original. Es decir: **lo corregido y objetivamente verificable es el defecto estructural** (conexiones cruzando loops), no una reproducción del síntoma. Se deja dicho para no atribuirle al arreglo más evidencia de la que tiene.
+
+---
+
 ## Cierre de la Épica 1
 
-**Las 14 HU están completadas** (1.1, 1.2, 1.3, 1.3b, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 1.10a, 1.10b, 1.11, 1.12). El backend tiene API versionada con documentación, base async con migraciones, identidad delegada en Supabase Auth con validación local del JWT, perfil de usuario, rate limiting en tres ámbitos, contrato único de error, CORS por ambiente y logs estructurados correlacionables. **192 tests** en el backend y **53** en `@rover/shared`, con lint, formato y tipado estricto en verde.
+**Las 15 HU están completadas** (1.1, 1.2, 1.3, 1.3b, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 1.10a, 1.10b, 1.11, 1.12 y 1.13). El backend tiene API versionada con documentación, base async con migraciones, identidad delegada en Supabase Auth con validación local del JWT, perfil de usuario, rate limiting en tres ámbitos, contrato único de error, CORS por ambiente y logs estructurados correlacionables. **192 tests** en el backend y **53** en `@rover/shared`, con lint, formato y tipado estricto en verde, y **sin warnings espurios en la suite**.
 
-### Deuda técnica que CRUZA a la Épica 2
+### Deuda técnica
 
-1. **Limpieza de los fixtures de test (aiosqlite) — recomendada ANTES o al principio de la Épica 2.** Es la única deuda que **empeora sola**: cada HU que necesita base de datos copia el patrón y lo extiende. Los fixtures crean el engine SQLite con `asyncio.run(...)`, lo usan desde el loop del `TestClient` y lo cierran con otro `asyncio.run(...)` — **tres event loops para el mismo engine**—, y el hilo trabajador de aiosqlite falla al entregar su resultado cuando el loop que lo vio nacer ya no existe. No son fallos (la suite pasa determinista) pero el warning aflora en un test que no lo causó, así que **ensucia la señal justo cuando más se necesita**: la Épica 2 trae streaming y concurrencia, donde un "Event loop is closed" espurio puede costar horas de diagnóstico. El arreglo es acotado —un fixture compartido en `tests/conftest.py`, que ya existe desde la HU-1.7, que haga nacer y morir el engine en el mismo loop— y solo se encarece con cada módulo nuevo. Detalle completo en la nota de la HU-1.4.
+1. ~~**Limpieza de los fixtures de test (aiosqlite)**~~ — ✅ **RESUELTA en la HU-1.13**, que era el requisito recomendado antes de arrancar la Épica 2. Era la única deuda que **empeoraba sola** (cada HU con base de datos copiaba el patrón), y la que más iba a estorbar justo aquí: la Épica 2 trae streaming y concurrencia, donde un "Event loop is closed" espurio puede costar horas de diagnóstico. La suite entra en la Épica 2 **limpia**.
 2. **Rate limiting en memoria del proceso** (HU-1.7): con varias instancias el límite efectivo se multiplica por el número de instancias. **Disparador explícito: la segunda instancia.** El punto de cambio está aislado tras la interfaz `RateLimitStore` (implementar `hit`/`peek`/`reset` con un `ZSET` + script Lua y llamar a `reset_rate_limit_store(...)` al arrancar); ni la política, ni el middleware, ni la dependencia, ni los endpoints cambian.
 3. **Catálogo `ErrorCode` duplicado a mano** entre el backend y `@rover/shared` (HU-1.8). Duplicación consciente y barata (una línea por código); desaparece sola el día que se generen los tipos desde el esquema OpenAPI —idea anotada en el cliente compartido desde la HU-0.7—.
 
