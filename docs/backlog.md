@@ -2,7 +2,7 @@
 
 > **Documento de trabajo vivo.** Crece **épica por épica**: aquí solo se detalla la épica en curso. Cuando cerremos todas sus HU (cumpliendo la Definition of Done), añadimos la siguiente. El panorama completo de las 7 épicas vive en `backlog-full.md` como referencia.
 >
-> **Épicas 0 y 1: completadas.** Ambas quedan abajo como registro histórico de lo construido. **Siguiente: Épica 2 — El agente**, que se detallará en este documento al arrancarla. La deuda que convenía saldar antes de empezarla —la limpieza de los fixtures de test— está **resuelta** (HU-1.13); la que queda tiene disparadores propios y no bloquea (ver *Cierre de la Épica 1*).
+> **Épicas 0 y 1: completadas.** Ambas quedan abajo como registro histórico de lo construido. **En curso: Épica 2 — El agente**, detallada al final de este documento. La deuda que convenía saldar antes de empezarla —la limpieza de los fixtures de test— está **resuelta** (HU-1.13); la que queda tiene disparadores propios y no bloquea (ver *Cierre de la Épica 1*).
 
 ---
 
@@ -11,7 +11,7 @@
 - **Jerarquía:** Épica → Historia de Usuario (HU = un Issue) → Tareas técnicas (checklist dentro del Issue).
 - **Tablero (GitHub Projects):** `Backlog → En progreso → En revisión → Done`.
 - **Flujo de trabajo:** un solo desarrollador; todo el trabajo se commitea directo en `develop` (no hay rama `main` ni PRs por ahora). La calidad la garantizan los hooks locales (lefthook) y el CI que corre en cada push a `develop`.
-- **Labels sugeridas:** `epica:0-fundacion` · `epica:1-backend` · `tipo:hu | bug | tech-debt` · `prioridad:alta | media | baja` · `bloqueante`.
+- **Labels sugeridas:** `epica:0-fundacion` · `epica:1-backend` · `epica:2-agente` · `tipo:hu | bug | tech-debt` · `prioridad:alta | media | baja` · `bloqueante`.
 - **Sprints:** solo como *timeboxes* de foco (elige unas pocas HU, no toques nada fuera de ese alcance). Sin story points ni dailies.
 
 ---
@@ -37,7 +37,7 @@ Una HU está **Done** solo cuando:
 |-------|--------|----------|--------|
 | 0 | Fundación | Monorepo, tooling, CI/CD desplegando desde el día uno | Completada ✅ |
 | 1 | Backend core | API `/v1`, async Supabase, Alembic, auth vía Supabase Auth, rate limiting, errores, CORS, observabilidad | Completada ✅ |
-| **2** | El agente | RAG + tool-calling, streaming, sesiones, caché semántico, voz opcional (pipeline) | **Siguiente** |
+| **2** | El agente | Conversación con memoria, streaming SSE, sesiones y tool-calling con datos en vivo (clima primero) | **En curso** 🚧 |
 | 3 | Web | Next.js con auth, chat con streaming, pricing | Pendiente |
 | 4 | Mobile | Expo reusando la capa compartida | Pendiente |
 | 5 | Monetización | Stripe / Play Billing / Apple IAP, freemium | Diferida |
@@ -507,4 +507,203 @@ La sesión y su renovación están resueltas **por escrito** en [`docs/auth.md`]
 
 ### Siguiente épica
 
-**Épica 2 — El agente.** Se detallará en este documento al arrancarla, tomando el esqueleto de `backlog-full.md`.
+**Épica 2 — El agente**, detallada abajo y **en curso**. El diseño se reenfocó respecto al esqueleto de `backlog-full.md`: la v1 es conversar con memoria, en streaming y con datos en vivo; RAG, caché semántico y voz quedaron diferidos con disparador.
+
+---
+
+# ÉPICA 2 — El agente 🚧 EN CURSO
+
+**Objetivo:** el corazón del producto. Un agente que **conversa con memoria, en streaming, y consulta datos en vivo** — empezando por el clima. Text-first, con personalidad en el system prompt y un cerebro económico (DeepSeek V4 Flash) tras una abstracción de proveedor. Se apoya en toda la Épica 1: base async, auth, rate limiting, contrato único de error y logs correlacionables.
+
+> **Alcance deliberado de la v1:** RAG, caché semántico, voz y router por dificultad **no entran**. Cada uno queda abajo, en *Diferido a segunda iteración*, con su detalle técnico intacto y un **disparador** explícito. El criterio: hasta que el núcleo —conversar, recordar, consultar en vivo— no esté sólido, cualquiera de esas piezas es peso que se arrastra sin saber todavía si hace falta.
+
+## Decisiones de arquitectura
+
+- **Cerebro:** DeepSeek V4 Flash tras una abstracción de proveedor, **single-model**. La selección por **capacidad** (derivar a otro modelo lo que pida visión, cuando llegue) queda prevista como *seam* en el código; la selección por **dificultad** se difiere. El endpoint es **OpenAI-compatible**, lo que abarata cambiar de proveedor.
+- **Streaming: SSE, no WebSockets.** Es HTTP estándar: encaja con la auth por header y el CORS ya montados (HU-1.6, HU-1.11), atraviesa proxies sin ceremonia, y el flujo es unidireccional — no hay nada que un socket bidireccional resuelva aquí.
+- **Sesiones: dos tablas** (conversaciones y mensajes). Se **persisten los pasos intermedios** del tool-calling (qué herramienta, con qué argumentos, qué devolvió) porque son oro para depurar y para el router futuro, pero **al cliente solo se le expone el texto conversacional**. Título simple ahora, **soft-delete**, y la conversación pertenece al usuario **por el id del token** — nunca por un id que venga en el cuerpo.
+- **Contexto: ventana por tokens**, no por número de turnos, y estructurada **stable-prefix-first** (system prompt → definiciones de tools → historial → mensaje nuevo) para que el **caché automático de DeepSeek** muerda. El resumen de historial largo se difiere.
+- **Conocimiento (v1): modelo base + herramientas en vivo.** El RAG bajo demanda se difiere.
+- **Herramientas: tool-calling directo, no LangGraph.** Un framework de orquestación se adopta cuando la orquestación duela de verdad; hoy no duele. El **clima** es la herramienta de referencia que fija el patrón, y **cada tool vive tras su propia abstracción**. El mapa **visual** es de las Épicas 3 y 4 — aquí solo viajan los **datos**.
+- **Personalidad en system prompt, no fine-tuning:** portable entre modelos e iterable en minutos.
+- **Las tools de pago se miden:** el rate limiting de la HU-1.7 acota *peticiones*; el control de consumo (HU-2.8) acota *consumo* — tokens y llamadas a APIs que se cobran.
+
+---
+
+### HU-2.1 — Integración con el LLM y abstracción de proveedor
+*Como* sistema, *quiero* hablar con el LLM a través de una capa que abstraiga el proveedor, *para* cambiar de modelo sin reescribir el agente.
+
+**Criterios de aceptación:**
+- Existe una interfaz de proveedor con una implementación para **DeepSeek V4 Flash** sobre su endpoint OpenAI-compatible.
+- La API key es un **secreto**: `SecretStr` en config, dentro de `_REQUIRED_IN_PRODUCTION`, nunca en el repo ni en los logs.
+- Modelo, proveedor y parámetros de generación salen de **config**, no hardcodeados.
+- El *seam* de **selección por capacidad** está documentado en el código: dónde entraría un segundo modelo (visión) sin tocar el agente. La selección por **dificultad no se implementa**.
+- La interfaz soporta **streaming**, no solo respuesta completa.
+- El system prompt se envía como **prefijo estable**, para aprovechar el caché automático del proveedor.
+- **Instrumentación de uso y calidad** en cada llamada: tokens de entrada/salida, latencia, modelo usado y si hubo *cache hit*, sobre los logs estructurados de la HU-1.12. Es la **semilla del router por dificultad**: sin estos datos, ese router se diseñaría a ciegas.
+- Tests con el proveedor mockeado que verifican el contrato de la capa, **incluido el camino de streaming**.
+
+**Tareas técnicas:** `services/agent/llm.py` con la interfaz de proveedor · cliente DeepSeek (OpenAI-compatible) · key como `SecretStr` en `_REQUIRED_IN_PRODUCTION` · modelo y parámetros en config · streaming en la interfaz · campos de uso/latencia/modelo/cache-hit en el log estructurado · mocks de respuesta completa y de streaming.
+
+---
+
+### HU-2.2 — Personalidad vía system prompt
+*Como* producto, *quiero* la personalidad de Rover en un system prompt versionado, *para* iterarla rápido y mantenerla portable entre modelos (sin fine-tuning).
+
+**Criterios de aceptación:**
+- El system prompt vive **en el repo, versionado**: ni en base de datos ni incrustado en el endpoint.
+- Cambiar la personalidad es **editar un archivo**, sin tocar lógica.
+- Se inyecta como **prefijo estable**, primero, en cada llamada (caché-friendly, coherente con la HU-2.1).
+- Existe un test que verifica que el prompt viaja en la petición al LLM.
+
+**Tareas técnicas:** archivo de prompt versionado · carga en el servicio del agente · test de inclusión.
+
+---
+
+### HU-2.3 — Modelo de datos de conversaciones
+*Como* usuario, *quiero* que mis conversaciones queden guardadas, *para* retomarlas después y que el agente tenga de dónde recordar.
+
+**Criterios de aceptación:**
+- Tabla `conversations`: id, `user_id`, título, timestamps de creación/actualización y **soft-delete** (`deleted_at`).
+- Tabla `messages`: id, `conversation_id`, rol, contenido, **pasos intermedios de tool-calling en JSONB**, orden dentro de la conversación y timestamp.
+- El **título** se deriva de forma simple del primer mensaje; nada de generarlo con el modelo por ahora.
+- El `user_id` sale **del token** (HU-1.6), nunca del cuerpo de la petición.
+- Migración Alembic asociada; modelos en estilo **SQLAlchemy 2.0**, como el resto del backend.
+- Tests **sin base de datos real**, con el patrón limpio de fixtures de la HU-1.13 (una sola base y un solo event loop por test).
+
+**Tareas técnicas:** modelos `Conversation` y `Message` · índices por `user_id` y por orden dentro de la conversación · migración Alembic · tests sobre el patrón de la HU-1.13.
+
+---
+
+### HU-2.4 — Endpoint de chat con streaming SSE (conversación pura)
+*Como* usuario, *quiero* ver la respuesta aparecer token a token, *para* una experiencia fluida en vez de una espera en blanco.
+
+**Criterios de aceptación:**
+- `POST /v1/chat` responde con **Server-Sent Events**, haciendo streaming de la respuesta del modelo.
+- La ruta está protegida por **auth** (HU-1.6) y sujeta a **rate limiting** (HU-1.7).
+- El mensaje del usuario y la respuesta del agente **se persisten** (HU-2.3).
+- Un fallo a mitad de stream emite un **evento de error con el contrato de la HU-1.8** adaptado a SSE (mismo catálogo de `code`), no un corte mudo.
+- La **configuración anti-buffering en Render** queda documentada: un proxy que acumule la respuesta anula el streaming aunque el backend lo haga bien.
+- `@rover/shared` expone el **consumo tipado del SSE**, para que las Épicas 3 y 4 no lo improvisen.
+- Tests de integración: llega un stream con contenido, y un fallo a mitad emite el evento de error.
+
+**Tareas técnicas:** endpoint SSE · puente del stream del LLM a SSE · evento de error en formato HU-1.8 · nota de despliegue anti-buffering · consumo tipado del SSE en `@rover/shared` · tests.
+
+---
+
+### HU-2.5 — Contexto multi-turno (ventana por tokens) y sesiones
+*Como* usuario, *quiero* hacer preguntas de seguimiento sin repetir contexto, *para* conversar de verdad y no lanzar preguntas sueltas.
+
+**Criterios de aceptación:**
+- El historial se trunca por **presupuesto de tokens**, no por número de turnos, y se arma **stable-prefix-first** (coherente con la HU-2.1).
+- Queda **documentada la decisión** de qué pasos intermedios de tool-calling se reenvían al modelo y cuáles no: reenviarlo todo infla el costo, no reenviar nada pierde el hilo de una herramienta ya usada.
+- `GET /v1/chat/sessions` lista las conversaciones del usuario; `GET /v1/chat/sessions/{id}` devuelve el historial **solo con el texto conversacional** (los pasos intermedios se quedan del lado del servidor).
+- `DELETE /v1/chat/sessions/{id}` hace **soft-delete**; una conversación borrada no vuelve a aparecer en el listado.
+- Un test verifica la **coherencia multi-turno**: una pregunta de seguimiento se responde usando el turno anterior.
+- `@rover/shared` actualizado con los tipos y métodos nuevos.
+
+**Tareas técnicas:** conteo de tokens y truncado por presupuesto · armado stable-prefix-first · política documentada de reenvío de pasos intermedios · endpoints de sesiones · soft-delete · tests de coherencia multi-turno · `@rover/shared`.
+
+---
+
+### HU-2.6 — Maquinaria de tool-calling + herramienta de clima (referencia)
+*Como* viajero, *quiero* que el agente consulte datos en vivo —el clima de un destino, para empezar—, *para* recibir respuestas útiles y no solo lo que el modelo recuerda.
+
+**Criterios de aceptación:**
+- Existe un **registro de herramientas** con esquema (nombre, descripción, parámetros) y una interfaz común para implementarlas.
+- El **loop de tool-calling funciona con streaming**: el usuario ve texto mientras el agente decide, invoca y procesa el resultado.
+- El **clima** es la primera herramienta, **tras su propia abstracción** de proveedor (cambiar de API de clima no toca el agente); la key va fuera del repo, en config.
+- Los **pasos intermedios se persisten** (HU-2.3) y **no se exponen** al cliente.
+- Un error de una herramienta **no tumba la conversación**: el agente lo dice y sigue (degradación elegante).
+- Tests con tool mockeada: **ciclo completo** (el agente la pide, se ejecuta, el resultado vuelve al modelo) y **camino de fallo**.
+
+**Tareas técnicas:** registro e interfaz de tools · loop de tool-calling sobre el stream · abstracción e integración de la API de clima · persistencia de los pasos intermedios · manejo de fallo de tool · tests de ciclo y de fallo.
+
+---
+
+### HU-2.7 — Herramientas adicionales (patrón repetido)
+*Como* viajero, *quiero* que el agente consulte más fuentes en vivo además del clima, *para* resolver preguntas de planeación reales.
+
+> **Se concreta al priorizarla.** La maquinaria y el patrón ya los fija la HU-2.6: cada herramienta nueva es una repetición del mismo molde, no un diseño nuevo. Candidatas identificadas:
+>
+> - **Lugares** (comer, ver, hacer): Google Places, Mapbox o alternativa. Es **API de pago** — hay que medir el consumo y elegir por **costo y lock-in**, no solo por cobertura.
+> - **Búsqueda web** (Tavily u otra): para lo que ni el modelo ni las tools específicas cubren.
+> - **Datos geográficos**: distancias, rutas, geocoding. **Solo el dato** — la visualización en mapa es de las Épicas 3 y 4.
+
+**Criterios de aceptación:**
+- Cada herramienta vive **tras su propia abstracción**: cambiar de proveedor no toca el agente.
+- Su key es un **secreto en config**, fuera del repo.
+- Su consumo se **mide**, y si es de pago **cuenta para la cuota de la HU-2.8**.
+- Devuelve resultados **estructurados** que el agente integra de forma natural; el fallo se degrada con gracia.
+- Test con la API mockeada.
+
+**Tareas técnicas:** elegir proveedor por costo y lock-in al priorizar · abstracción e integración · esquema de la tool · medición de consumo · tests.
+
+---
+
+### HU-2.8 — Control de consumo del agente por plan (freemium)
+*Como* operador del freemium, *quiero* limitar el consumo del agente según el plan, *para* que un usuario intensivo no vuelva insostenible el costo.
+
+**Criterios de aceptación:**
+- Cuota por plan sobre lo que **cuesta dinero**: mensajes/tokens del modelo y **llamadas a tools de pago**, con reseteo por periodo.
+- Se apoya en el **enganche por plan ya montado en la HU-1.7** (`rule_for_user(multiplier=…)`) como **ámbito nuevo**: la 1.7 acota *peticiones*, esto acota *consumo*.
+- Al agotarse la cuota, la respuesta usa el **contrato de error de la HU-1.8** con un mensaje claro que invita al upgrade, no un error críptico.
+- El conteo es **consistente entre instancias**: hoy en memoria del proceso, con Redis **cuando llegue la segunda instancia** — mismo disparador y mismo punto de cambio aislado que la deuda #2 del cierre de la Épica 1.
+- La cuota **distingue** el consumo servido desde caché (barato o gratis) del que golpea el modelo o una API de pago.
+- Tests: se respeta la cuota, se resetea por periodo, y el mensaje de límite trae el `code` correcto.
+
+**Tareas técnicas:** modelo de cuota por plan · contador tras la interfaz de store (memoria hoy, Redis con la segunda instancia) · mensaje de límite en formato HU-1.8 · conteo diferenciado de tools de pago · tests.
+
+---
+
+## Diferido a segunda iteración (con disparador)
+
+Nada de esto es un descarte: es **detalle ya pensado que se guarda entero** para no rediseñarlo cuando toque. Cada entrada lleva su **disparador** — la señal concreta que la devuelve al backlog activo.
+
+### Caché semántico de respuestas
+
+**Disparador:** volumen de preguntas repetidas que justifique el ahorro. Sin tráfico real es complejidad sin beneficio medible; con tráfico, en viajes las preguntas frecuentes se repiten muchísimo **entre usuarios distintos**, y ahí pasa a ser la mayor palanca de ahorro del producto.
+
+**Detalle técnico conservado (de la antigua HU-2.12):**
+- Antes de llamar al LLM, se busca una respuesta cacheada **semánticamente similar** (por embedding).
+- Si hay un match **por encima de un umbral**, se sirve del caché sin tocar el LLM.
+- El caché tiene **expiración/invalidez configurable** y **no sirve respuestas obsoletas de datos en vivo**: el clima y demás datos vivos **no se cachean igual** que el contenido estable — servir un clima viejo desde caché es peor que no cachear.
+- **Métricas:** tasa de aciertos del caché observable.
+- **Test:** una pregunta repetida no llama al LLM.
+- **Tareas:** store de caché con embeddings · lógica de umbral y expiración · regla para no cachear datos en vivo · métricas de hit-rate · tests.
+
+*Enganche ya previsto:* la HU-2.8 distingue el consumo servido por caché del que golpea el modelo.
+
+### RAG bajo demanda (efímero)
+
+**Forma que tomará:** el usuario pasa un **link o un archivo**, se procesa **al vuelo**, el agente responde con eso y **no se persiste**. Es lo contrario de la biblioteca curada que planteaba el diseño viejo: el conocimiento lo trae el usuario en el momento, no lo mantiene el operador. La **variante persistente** (base de conocimiento propia, ingestión curada) se evalúa aparte y solo si aparece la necesidad.
+
+**Disparador:** núcleo del agente sólido (HU-2.1–2.6 en producción y estables) **y** necesidad real de que el usuario aporte contenido propio.
+
+**Detalle técnico conservado (de las antiguas HU-2.5, 2.6 y 2.7)** — sirve tanto para la variante efímera como para la persistente:
+
+- **Ingestión, job async (antigua 2.5):** `POST /v1/ingest` recibe una fuente, **encola un job y responde de inmediato** (no bloquea la API). El job **descarga, limpia y trocea** el contenido en chunks. Los **chunk IDs se derivan de un hash de url+contenido**, para que no haya colisiones entre fuentes. El **estado del job** es consultable (pendiente/procesando/listo/error). Backend de jobs a decidir: `BackgroundTasks`/Upstash al inicio, Celery si el volumen lo pide. *(En la variante efímera el "responde de inmediato" pierde sentido —el usuario está esperando su respuesta—, pero el pipeline de limpieza, chunking y hashing se conserva igual.)*
+- **Embeddings y almacenamiento en pgvector (antigua 2.6):** cada chunk genera su **embedding** y se almacena en **Supabase con pgvector**; el **modelo de embeddings sale de config** (intercambiable); existe **índice vectorial** para búsqueda eficiente; migración Alembic asociada. **Test:** un chunk ingerido queda consultable por similitud.
+- **Recuperación y armado de contexto (antigua 2.7):** dada una consulta se recuperan los **top-k** chunks por similitud; se inyectan en el prompt **de forma acotada**, sin inflar el contexto sin control; si **no hay contexto relevante**, el agente lo maneja con gracia y **no inventa**. **Test:** una pregunta sobre contenido ingerido recupera el chunk correcto.
+
+### Router por dificultad
+
+**Disparador:** que la **instrumentación de la HU-2.1** (tokens, latencia, modelo, cache hit) muestre que el modelo barato **falla o exige reintentos en una fracción significativa del tráfico**. Solo entonces el router se diseña **contra ejemplos reales** de dónde falla, en vez de contra una intuición previa.
+
+*No confundir con la selección por **capacidad*** (derivar a un modelo con visión), que sí queda prevista como *seam* en la HU-2.1.
+
+### Voz (pipeline opcional)
+
+**Disparador:** núcleo de texto sólido **y** una decisión de producto de priorizar voz. La voz siempre fue un **modo opcional**: el agente funciona al 100 % en texto.
+
+**Requisito no-funcional de latencia (transversal a todo lo de voz, conservado):** tiempo hasta el **primer audio < 2 s** en los modos de **pipeline**, logrado con **streaming encadenado** — STT parcial en vivo → modelo en streaming → TTS que arranca en la primera frase, sin esperar la respuesta completa. El modo **speech-to-speech** apunta a latencia **sub-segundo**. Ninguna HU de voz está *Done* si no cumple su objetivo de latencia.
+
+**Detalle técnico conservado:**
+- **Voz de entrada, STT (antigua 2.14):** endpoint que recibe audio y devuelve la **transcripción**; el texto transcrito entra **al mismo flujo de chat** que un mensaje escrito; la transcripción es **en streaming** (parcial en vivo mientras el usuario habla), no se espera al final — clave para la fluidez; el proveedor de STT sale de **config**; fallo degradado a *"no te entendí, ¿puedes escribir?"*; test con STT mockeado.
+- **Voz de salida, TTS (antigua 2.15):** la respuesta de texto se convierte a audio vía TTS, en **pipeline desacoplado del LLM**; proveedor desde **config** (arrancar con uno económico de baja latencia); el TTS **arranca en cuanto está lista la primera frase**, sin esperar la respuesta completa (**< 2 s** al primer audio); **solo se genera audio cuando el usuario está en modo voz** (no se gasta TTS de más); fallo de TTS degradado a solo texto; test con TTS mockeado.
+- **Audio servido por URL, no base64 (antigua 2.16):** el audio TTS se sube a **Supabase Storage** y la API devuelve una **URL** (prefirmada si aplica); la respuesta de chat **no incluye base64** — respuestas ligeras y audio **cacheable**, que en móvil es determinante; respuestas repetidas **no regeneran** el mismo audio; test: la respuesta trae URL y no base64.
+- **Manos libres / VAD** y **speech-to-speech**: **nunca llegaron a escribirse como HU** en el backlog viejo — la única huella era la referencia a "HU-2.18 (speech-to-speech)" dentro de la nota de latencia. Quedan aquí como **piezas por diseñar**, con su objetivo ya fijado: detección de actividad de voz para conversar sin tocar la pantalla, y un modo speech-to-speech de latencia **sub-segundo** que se salta el pipeline STT→LLM→TTS.
+
+---
+
+> **Nota de renumeración:** esta Épica 2 sustituye por completo a la versión previa (HU-2.1 a 2.16). Correspondencias que conviene tener a mano: el **clima** pasó de la antigua 2.9 a la **HU-2.6**; el **control de consumo** de la antigua 2.13 a la **HU-2.8**; las **sesiones** se desdoblaron en **HU-2.3** (modelo de datos) y **HU-2.5** (contexto y endpoints); RAG (antiguas 2.5–2.7), caché semántico (2.12) y voz (2.14–2.16) viven ahora en *Diferido a segunda iteración*. Cualquier referencia a la numeración vieja fuera de esta sección está desactualizada.
