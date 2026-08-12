@@ -3,10 +3,12 @@
 Dos cosas viven aquí porque son transversales y porque tenerlas repetidas en
 cada módulo ya causó problemas:
 
-1. **Aislamiento del rate limiting** (desde la HU-1.7): el contador vive en la
-   memoria del proceso y sobrevive entre tests, así que sin reiniciarlo un
-   módulo agotaría el cupo del siguiente y haría fallar tests que no tienen
-   nada que ver con los límites.
+1. **Aislamiento del estado global del proceso**: el contador del rate limiting
+   (HU-1.7) y el registro de proveedores de LLM (HU-2.1) viven en la memoria
+   del proceso y sobreviven entre tests. Sin reiniciarlos, un módulo agotaría
+   el cupo del siguiente —haciendo fallar tests que no van de límites— y un
+   doble de proveedor inyectado en un test seguiría atendiendo en el
+   siguiente.
 
 2. **La base de datos de test** (HU-1.13, deuda de la Épica 1). Antes cada
    módulo montaba la suya con ``asyncio.run(...)``, y eso repartía el MISMO
@@ -55,6 +57,7 @@ from sqlalchemy.pool import NullPool
 
 from app.core import database
 from app.core.rate_limit import reset_rate_limit_store
+from app.services.llm import reset_llm_providers
 
 T = TypeVar("T")
 
@@ -63,6 +66,19 @@ T = TypeVar("T")
 def rate_limit_aislado() -> None:
     """Cada test arranca con el contador de peticiones vacío."""
     reset_rate_limit_store()
+
+
+@pytest.fixture(autouse=True)
+def proveedores_de_llm_aislados() -> Iterator[None]:
+    """Cada test arranca sin proveedores de LLM registrados.
+
+    Antes y después: si un test inyecta un doble con ``set_llm_provider``, no
+    debe atender llamadas del siguiente — y un proveedor construido a partir
+    de la config tampoco debe sobrevivir a un ``monkeypatch`` de esa config.
+    """
+    reset_llm_providers()
+    yield
+    reset_llm_providers()
 
 
 @pytest.fixture

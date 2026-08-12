@@ -158,6 +158,7 @@ def test_el_default_por_ambiente_se_calcula_en_settings() -> None:
         supabase_url="https://x.supabase.co",
         supabase_anon_key="anon",
         supabase_service_role_key="service",
+        llm_api_key="llm",
     )
     assert produccion.docs_enabled is False
     assert produccion.model_copy(update={"enable_docs": True}).docs_enabled is True

@@ -19,6 +19,8 @@ app/
 ├── core/rate_limit.py # rate limiting: almacén, política y IP tras el proxy
 ├── api/middleware.py  # middleware ASGI que aplica el límite por IP
 ├── api/deps.py        # get_current_user + cuota por usuario + esquema Bearer
+├── services/auth.py   # Supabase Auth: TODO el acoplamiento al proveedor, aquí
+├── services/llm/      # proveedor de LLM tras una interfaz (DeepSeek detrás)
 └── api/v1/
     ├── router.py      # AGREGADOR: monta /v1 y describe los tags de OpenAPI
     ├── health.py      # GET /v1/health y /v1/health/db
@@ -30,8 +32,10 @@ tests/
 ├── test_errors.py     # formato único de error y blindaje de los 500
 ├── test_config.py     # tests de config por ambiente y fail-fast
 ├── test_rate_limit.py # almacén, IP tras el proxy y límites aplicados
-├── conftest.py        # aísla el contador de rate limiting entre tests
+├── test_llm.py        # capa de LLM SIN llamar a DeepSeek (transporte simulado)
+├── conftest.py        # aísla el estado global del proceso entre tests
 └── test_database.py   # tests de la capa DB SIN base real (SQLite en memoria)
+scripts/check_llm.py   # comprobación manual contra el proveedor real (no es test)
 .env.example           # plantilla de variables (el .env real NUNCA se commitea)
 Dockerfile             # imagen de producción (Python 3.12 slim + uv, no-root)
 docker-compose.yml     # servicio de desarrollo (hot-reload + puerto 8000)
@@ -62,6 +66,7 @@ pone `/v1` en un único sitio, y `main.py` monta solo ese agregador. Publicar un
 | `ROVER_VERSION`  | `0.1.0` | Versión (origen: `app.__version__`). |
 | `ROVER_ENABLE_DOCS` | según ambiente | Fuerza el encendido/apagado de `/docs`, `/redoc` y `/openapi.json`. |
 | `ROVER_DATABASE_URL` | — | **SECRETO.** URL directa de Supabase Postgres, tal cual la da Supabase (`postgresql://…`). Obligatoria en producción. |
+| `ROVER_LLM_API_KEY` | — | **SECRETO.** Key del proveedor de LLM. Obligatoria en producción (ver § Proveedor de LLM). |
 
 **Desarrollo local** — copia la plantilla y ajusta lo que necesites:
 
@@ -71,8 +76,8 @@ cp .env.example .env
 
 El `.env` real está **git-ignorado y nunca se commitea** (regla de oro: ningún
 secreto en el código ni en git). La plantilla versionada es `.env.example`:
-documenta TODAS las variables, con placeholders, incluidas las que llegan en
-Épica 1 (Supabase, LLM) marcadas como **SECRETO**.
+documenta TODAS las variables, con placeholders, y marca como **SECRETO** las
+que lo son (Supabase en la Épica 1, el proveedor de LLM en la Épica 2).
 
 **Producción (Render)** — no hay archivo `.env`: las variables se configuran en
 el panel del servicio (**Environment**). El mismo código sirve para ambos
@@ -496,6 +501,123 @@ curl -si -X POST http://127.0.0.1:8000/v1/auth/login \
 En local no hay proxy delante, así que todas las peticiones caen en el mismo
 cubo (el peer TCP). Para simular varias IPs, manda la cabecera a mano:
 `-H 'X-Forwarded-For: 203.0.113.7'`.
+
+## Proveedor de LLM (HU-2.1)
+
+Rover **no habla con DeepSeek**: habla con `LLMProvider`, una interfaz. DeepSeek
+V4 Flash es hoy la única implementación, y es intercambiable — misma jugada que
+`RateLimitStore` en la HU-1.7. Nada fuera de `app/services/llm/deepseek.py`
+conoce la forma de la API del proveedor.
+
+```
+app/services/llm/
+├── base.py            # tipos de dominio (Message, Completion, CompletionChunk),
+│                      # Capability y el Protocol LLMProvider
+├── errors.py          # excepciones de dominio (LLMRateLimited, LLMUnavailable…)
+├── prompt.py          # system prompt por defecto (placeholder hasta la HU-2.2)
+├── deepseek.py        # implementación concreta (endpoint OpenAI-compatible)
+├── instrumentation.py # uso/latencia/caché por llamada (semilla del router futuro)
+└── registry.py        # quién atiende cada capacidad (seam de selección)
+```
+
+Uso desde el resto del backend — siempre por el registro, nunca construyendo el
+proveedor a mano:
+
+```python
+from app.services.llm import Message, Role, get_llm_provider
+
+provider = get_llm_provider()                       # capacidad: texto
+respuesta = await provider.complete([Message(role=Role.USER, content="hola")])
+
+async for trozo in provider.stream(mensajes):       # camino de la HU-2.4 (SSE)
+    enviar(trozo.text)                              # los text son DELTAS
+```
+
+### Configuración
+
+| Variable                       | Default                    | Descripción                                                                  |
+| ------------------------------ | -------------------------- | ---------------------------------------------------------------------------- |
+| `ROVER_LLM_API_KEY`            | —                          | **SECRETO.** Key del proveedor. Obligatoria en producción.                     |
+| `ROVER_LLM_BASE_URL`           | `https://api.deepseek.com` | URL base. Se le concatena `/chat/completions`, así que admite sufijo (`…/v1`). |
+| `ROVER_LLM_MODEL`              | `deepseek-v4-flash`        | Modelo.                                                                        |
+| `ROVER_LLM_TEMPERATURE`        | `0.7`                      | Variedad de la respuesta (0.0–2.0).                                            |
+| `ROVER_LLM_MAX_OUTPUT_TOKENS`  | `2048`                     | Techo de tokens de salida (costo y protección).                                |
+| `ROVER_LLM_TIMEOUT_SECONDS`    | `60`                       | Timeout de una llamada.                                                        |
+
+Cambiar de proveedor OpenAI-compatible (OpenRouter, Together, un vLLM propio)
+es cambiar estas variables: **no hay código que tocar**.
+
+### Por qué httpx directo y no el SDK de OpenAI
+
+El endpoint es OpenAI-compatible, así que el SDK apuntado a otra `base_url` era
+la alternativa obvia. Se descartó porque (1) devuelve sus propios modelos que
+traduciríamos acto seguido a los tipos de dominio —una capa de más—, (2) el
+`prompt_cache_hit_tokens` de DeepSeek **no existe** en su esquema tipado y es
+media razón de ser de la instrumentación, (3) queremos controlar la traducción
+de errores en vez de desempacar su jerarquía de excepciones, y (4) `httpx` ya
+está en el proyecto y su async es real (el SDK lo usa por debajo). Es el mismo
+razonamiento que llevó a hablar con GoTrue por HTTP en vez de con `supabase-py`.
+El detalle completo, con lo que se renuncia, está en el docstring de
+`deepseek.py`.
+
+### Streaming
+
+`provider.stream(...)` es un async generator de `CompletionChunk`; sus `text`
+son **deltas** (concatenarlos en orden reconstruye la respuesta). El último
+trozo llega sin texto y con el `usage`, porque se pide
+`stream_options.include_usage` — sin eso, el camino de streaming (el normal del
+producto) sería un agujero ciego en las métricas. El tipo de retorno es
+`AsyncGenerator` y no `AsyncIterator` a propósito: obliga a que exista
+`aclose()`, y así el endpoint SSE puede cerrar la conexión con el proveedor en
+el momento en que el usuario se va, en vez de dejarla colgando hasta que pase el
+recolector.
+
+### System prompt como prefijo estable
+
+El prompt viaja como parámetro aparte, no como "un mensaje más", y la
+implementación lo antepone siempre en la misma posición. Es lo que hace que el
+**caché automático de DeepSeek** acierte: el orden es
+`system prompt → (tools, HU-2.6) → historial → mensaje nuevo`. Un prompt
+interpolado con la fecha de hoy invalidaría el prefijo en cada llamada y
+multiplicaría el costo de la entrada sin que nada se pusiera rojo.
+
+### Seam de selección por capacidad
+
+`get_llm_provider(Capability.VISION)` es el punto donde entraría un segundo
+modelo, sin tocar el agente: hoy levanta `LLMCapabilityUnavailable` en vez de
+caer al de texto en silencio (un modelo de texto al que le mandas una imagen no
+protesta, responde mal). El router por **dificultad** es otra cosa y está
+**diferido**; su disparador son los datos de la instrumentación de abajo.
+
+### Instrumentación (semilla del router por dificultad)
+
+Cada llamada emite **una** línea del logger `app.llm` con campos `llm_*`:
+modelo, proveedor, capacidad, si fue streaming, resultado (`ok` / `error` /
+`cancelled`), latencia total, latencia hasta el primer trozo (`llm_ttfc_ms`),
+tokens de entrada/salida, tokens servidos de caché y su ratio, motivo de fin, y
+tamaño del contexto (número de mensajes y **caracteres**).
+
+Lo que **no** se registra: el texto de los mensajes, el system prompt, la
+respuesta del modelo ni la key. El tamaño en caracteres es el sustituto
+deliberado del contenido — sirve para correlacionar contexto grande con latencia
+o fallos, que es para lo que se querría mirar el prompt, sin copiar una
+conversación privada a un sistema de logs.
+
+Esta serie es la base de datos que dispararía el router por dificultad y la que
+alimentará el control de consumo por plan (HU-2.8).
+
+### Verificarlo en local (con tu key real)
+
+```bash
+# con ROVER_LLM_API_KEY en apps/backend/.env
+uv run python -m scripts.check_llm
+uv run python -m scripts.check_llm "¿qué llevo a Cartagena en julio?"
+```
+
+Hace una llamada completa y otra en streaming, e imprime la línea de
+instrumentación de cada una (tokens, latencia, cache hit). Los **tests no usan
+la key**: simulan el transporte HTTP con `httpx.MockTransport`, así que el CI
+pasa sin secretos (`tests/test_llm.py`).
 
 ## Observabilidad: logs estructurados y id de petición (HU-1.12)
 

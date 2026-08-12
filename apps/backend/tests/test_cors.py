@@ -51,6 +51,7 @@ def _settings_produccion(cors_origins: str | None = None) -> Settings:
         supabase_url="https://x.supabase.co",
         supabase_anon_key="anon",
         supabase_service_role_key="service",
+        llm_api_key="llm",
     )
 
 

@@ -158,12 +158,49 @@ class Settings(BaseSettings):
     # app/services/auth.py).
     supabase_service_role_key: SecretStr | None = None
 
+    # --- Proveedor de LLM (HU-2.1) -------------------------------------------
+    # El backend habla con la INTERFAZ de app/services/llm, nunca con un
+    # proveedor concreto. Estas tres variables son las que deciden CUÁL hay
+    # detrás, y por eso ninguna está hardcodeada: cambiar de proveedor
+    # OpenAI-compatible (o de modelo) es cambiar entorno, no código.
+
+    # API key del proveedor (SECRETO). Hoy la de DeepSeek. Obligatoria en
+    # producción: sin ella el agente no existe.
+    llm_api_key: SecretStr | None = None
+
+    # URL base del proveedor. No es secreta. El default apunta a DeepSeek; se
+    # respeta el path que traiga (``https://host/v1`` también vale), porque la
+    # ruta del endpoint se le CONCATENA — ver app/services/llm/deepseek.py.
+    llm_base_url: str = "https://api.deepseek.com"
+
+    # Modelo a usar. Single-model por decisión de arquitectura de la Épica 2;
+    # la selección por CAPACIDAD (visión) entraría por el registro de
+    # proveedores, no cambiando esta variable (ver app/services/llm/registry.py).
+    llm_model: str = "deepseek-v4-flash"
+
+    # --- Parámetros de generación (también de config, no del código) ---------
+    # 0.7: conversación con algo de variedad sin irse a inventar. Subirlo hace
+    # las respuestas más creativas y menos predecibles; bajarlo a 0 las vuelve
+    # casi deterministas (útil para tool-calling, HU-2.6).
+    llm_temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+
+    # Techo de tokens de SALIDA por respuesta. Es a la vez un límite de costo y
+    # una protección: sin él, un prompt desafortunado puede generar (y cobrar)
+    # miles de tokens.
+    llm_max_output_tokens: int = Field(default=2048, ge=1)
+
+    # Timeout de una llamada al LLM. Generoso a propósito comparado con el de
+    # Supabase Auth (10 s): generar una respuesta larga tarda, y cortar a mitad
+    # gasta los tokens igual sin entregar nada.
+    llm_timeout_seconds: float = Field(default=60.0, gt=0)
+
     # Campos que no pueden faltar cuando env == "production".
     _REQUIRED_IN_PRODUCTION: ClassVar[tuple[str, ...]] = (
         "database_url",
         "supabase_url",
         "supabase_anon_key",
         "supabase_service_role_key",
+        "llm_api_key",
     )
 
     @property

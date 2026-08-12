@@ -266,6 +266,7 @@ def test_el_formato_por_defecto_lo_decide_el_ambiente() -> None:
         supabase_url="https://x.supabase.co",
         supabase_anon_key="anon",
         supabase_service_role_key="service",
+        llm_api_key="llm",
     )
     assert produccion.effective_log_format == "json"
     # La variable dedicada manda sobre el ambiente.
