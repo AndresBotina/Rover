@@ -546,6 +546,7 @@ async for trozo in provider.stream(mensajes):       # camino de la HU-2.4 (SSE)
 | `ROVER_LLM_TEMPERATURE`        | `0.7`                      | Variedad de la respuesta (0.0–2.0).                                            |
 | `ROVER_LLM_MAX_OUTPUT_TOKENS`  | `2048`                     | Techo de tokens de salida (costo y protección).                                |
 | `ROVER_LLM_TIMEOUT_SECONDS`    | `60`                       | Timeout de una llamada.                                                        |
+| `ROVER_LLM_THINKING`           | `disabled`                 | Modo de razonamiento: `disabled` \| `enabled` \| `provider_default` (ver abajo).|
 
 Cambiar de proveedor OpenAI-compatible (OpenRouter, Together, un vLLM propio)
 es cambiar estas variables: **no hay código que tocar**.
@@ -605,6 +606,38 @@ reglas de edición están junto al archivo
 `tests/test_prompt.py` (sin marcadores, sin la fecha de hoy, largo mínimo para
 que el caché muerda —DeepSeek cachea en bloques de 64 tokens—, y que lo que se
 manda sea exactamente el archivo).
+
+### Razonamiento desactivado (non-think)
+
+DeepSeek V4 **razona por defecto**, con esfuerzo alto, y ese razonamiento **se
+factura como salida**. Medido contra el proveedor real, una respuesta
+conversacional de cuatro frases costaba **~1.163 tokens de salida y ~15 s**, de
+los que el usuario veía una fracción mínima. Para el chat de Rover eso es pagar
+y hacer esperar por deliberación que no mejora la respuesta, así que el cuerpo
+lleva `thinking: {"type": "disabled"}`.
+
+Es **config y no una constante** (`ROVER_LLM_THINKING`) porque el router por
+dificultad —diferido— querrá justo lo contrario para lo que sí lo vale: un
+itinerario de tres ciudades con fechas y presupuesto. Misma filosofía que
+`ROVER_LLM_MODEL`: se reactiva cambiando entorno, no código. El tercer valor,
+`provider_default`, **omite el campo** del cuerpo — `thinking` es una extensión
+propietaria de DeepSeek, y un proveedor OpenAI-compatible que rechace
+parámetros desconocidos se atiende sin editar `deepseek.py`.
+
+Tres consecuencias, todas documentadas en el docstring del módulo:
+
+1. **No llega `reasoning_content`** — y el parseo nunca dependió de él (lee
+   `message.content` y `delta.content`), así que reactivar el razonamiento no
+   rompe nada. Hay tests de los dos caminos.
+2. **`temperature` y `top_p` vuelven a contar**: en modo razonamiento DeepSeek
+   los ignora, en non-think mandan otra vez, así que `ROVER_LLM_TEMPERATURE`
+   pasa a tener efecto real.
+3. **Aviso para la HU-2.6 (tool-calling):** con el razonamiento activado,
+   DeepSeek **exige** que las peticiones multi-turno con tools devuelvan el
+   `reasoning_content` del turno anterior, o responde 400. Hoy no aplica; quien
+   lo reactive tendrá que preservar ese campo en los pasos intermedios (HU-2.3)
+   y reenviarlo en el loop. Se descubre con un 400 en la **segunda** vuelta del
+   loop, no en la primera.
 
 ### Seam de selección por capacidad
 

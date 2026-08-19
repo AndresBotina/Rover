@@ -116,6 +116,25 @@ def test_una_temperatura_fuera_de_rango_impide_arrancar() -> None:
         Settings(_env_file=None, llm_temperature=5.0)
 
 
+def test_el_razonamiento_viene_desactivado_por_defecto() -> None:
+    """Non-think para el chat: el razonamiento de DeepSeek se cobra como salida
+    y no mejora una respuesta conversacional corta."""
+    assert Settings(_env_file=None).llm_thinking == "disabled"
+
+
+def test_el_razonamiento_se_reactiva_por_entorno(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ROVER_LLM_THINKING", "enabled")
+
+    assert Settings(_env_file=None).llm_thinking == "enabled"
+
+
+def test_un_modo_de_razonamiento_desconocido_impide_arrancar() -> None:
+    """Un typo (``ROVER_LLM_THINKING=disable``) tiene que cortar el arranque, no
+    caer en silencio a un modo que cuesta 15 s y mil tokens por respuesta."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, llm_thinking="disable")
+
+
 def test_la_key_del_llm_es_obligatoria_en_produccion() -> None:
     """Sin cerebro no hay agente: la app no debe arrancar a medias."""
     with pytest.raises(ValidationError) as excinfo:

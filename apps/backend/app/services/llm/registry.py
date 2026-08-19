@@ -63,6 +63,7 @@ def _construir_proveedor_de_texto() -> LLMProvider:
         temperature=settings.llm_temperature,
         max_output_tokens=settings.llm_max_output_tokens,
         timeout_seconds=settings.llm_timeout_seconds,
+        thinking=settings.llm_thinking,
     )
 
 

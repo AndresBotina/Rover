@@ -49,7 +49,7 @@ from app.services.llm import (
     get_llm_provider,
     set_llm_provider,
 )
-from app.services.llm.deepseek import DeepSeekProvider
+from app.services.llm.deepseek import DeepSeekProvider, ThinkingMode
 
 API_KEY = "clave-de-mentira-que-no-debe-aparecer-en-ningun-log"
 MENSAJES = [Message(role=Role.USER, content="¿qué tal el clima en Bogotá?")]
@@ -141,8 +141,18 @@ class Espia:
         return body
 
 
-def _proveedor(handler: Any, *, model: str = "deepseek-v4-flash") -> tuple[DeepSeekProvider, Espia]:
-    """Proveedor real enchufado a un transporte simulado."""
+def _proveedor(
+    handler: Any,
+    *,
+    model: str = "deepseek-v4-flash",
+    thinking: ThinkingMode = "disabled",
+) -> tuple[DeepSeekProvider, Espia]:
+    """Proveedor real enchufado a un transporte simulado.
+
+    El default de ``thinking`` es el mismo que el de producción a propósito: si
+    algún día cambia el default de verdad, estos tests hablan del modo en que
+    corre el producto y no de uno inventado para el test.
+    """
     espia = Espia()
 
     def envolver(request: httpx.Request) -> httpx.Response:
@@ -157,6 +167,7 @@ def _proveedor(handler: Any, *, model: str = "deepseek-v4-flash") -> tuple[DeepS
         temperature=0.7,
         max_output_tokens=2048,
         timeout_seconds=5.0,
+        thinking=thinking,
         transport=httpx.MockTransport(envolver),
     )
     return proveedor, espia
@@ -295,6 +306,118 @@ def test_el_prefijo_es_identico_entre_llamadas(loop_de_test: BlockingPortal) -> 
     segundo = espia.cuerpo["messages"][0]
 
     assert primero == segundo
+
+
+# --- Modo de razonamiento (non-think) ----------------------------------------
+
+
+def test_el_razonamiento_va_desactivado_por_defecto(loop_de_test: BlockingPortal) -> None:
+    """DeepSeek V4 razona por defecto y lo cobra como salida.
+
+    Medido contra el proveedor real: ~1.163 tokens de salida y ~15 s para una
+    respuesta conversacional de cuatro frases. El chat de Rover va en non-think.
+    """
+    proveedor, espia = _proveedor(_json_handler(_respuesta_completa()))
+
+    loop_de_test.call(lambda: proveedor.complete(MENSAJES))
+
+    assert espia.cuerpo["thinking"] == {"type": "disabled"}
+
+
+def test_el_stream_tambien_va_en_non_think(loop_de_test: BlockingPortal) -> None:
+    """El streaming es el camino normal del producto: si el ahorro no llegara
+    aquí, no llegaría a casi ninguna petición real."""
+    proveedor, espia = _proveedor(_sse_handler(_stream_de_ejemplo(["hola"])))
+
+    async def consumir() -> None:
+        async for _ in proveedor.stream(MENSAJES):
+            pass
+
+    loop_de_test.call(consumir)
+
+    assert espia.cuerpo["thinking"] == {"type": "disabled"}
+
+
+def test_el_razonamiento_se_puede_reactivar_por_configuracion(
+    loop_de_test: BlockingPortal,
+) -> None:
+    """Es config y no una constante porque el router por dificultad (diferido)
+    querrá lo contrario para lo que sí lo vale: un itinerario multi-ciudad."""
+    proveedor, espia = _proveedor(_json_handler(_respuesta_completa()), thinking="enabled")
+
+    loop_de_test.call(lambda: proveedor.complete(MENSAJES))
+
+    assert espia.cuerpo["thinking"] == {"type": "enabled"}
+
+
+def test_con_provider_default_el_campo_no_viaja(loop_de_test: BlockingPortal) -> None:
+    """``thinking`` es una extensión propietaria de DeepSeek: un proveedor
+    OpenAI-compatible que rechace parámetros desconocidos se atiende cambiando
+    entorno, no editando ``deepseek.py``."""
+    proveedor, espia = _proveedor(_json_handler(_respuesta_completa()), thinking="provider_default")
+
+    loop_de_test.call(lambda: proveedor.complete(MENSAJES))
+
+    assert "thinking" not in espia.cuerpo
+
+
+def test_la_respuesta_se_parsea_sin_reasoning_content(loop_de_test: BlockingPortal) -> None:
+    """En non-think ese campo NO llega. El parseo nunca dependió de él."""
+    cuerpo = {
+        "id": "chatcmpl-1",
+        "model": "deepseek-v4-flash",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "Lleva chaqueta."},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 656, "completion_tokens": 12},
+    }
+    proveedor, _ = _proveedor(_json_handler(cuerpo))
+
+    respuesta = loop_de_test.call(lambda: proveedor.complete(MENSAJES))
+
+    assert respuesta.text == "Lleva chaqueta."
+    assert respuesta.usage == Usage(input_tokens=656, output_tokens=12)
+
+
+def test_si_llegara_reasoning_content_no_se_cuela_en_la_respuesta(
+    loop_de_test: BlockingPortal,
+) -> None:
+    """Reactivar ``thinking`` no debe cambiar lo que ve el usuario: lo que el
+    modelo rumia no es la respuesta."""
+    cuerpo = _respuesta_completa(texto="Lleva chaqueta.")
+    cuerpo["choices"][0]["message"]["reasoning_content"] = "Bogotá está a 2.600 m, así que…"
+    proveedor, _ = _proveedor(_json_handler(cuerpo), thinking="enabled")
+
+    respuesta = loop_de_test.call(lambda: proveedor.complete(MENSAJES))
+
+    assert respuesta.text == "Lleva chaqueta."
+
+
+def test_el_stream_no_enseña_el_razonamiento(loop_de_test: BlockingPortal) -> None:
+    """Con ``thinking`` activo, los eventos de la fase de pensamiento traen
+    ``reasoning_content`` y ``content`` a ``null``: salen como texto vacío y no
+    tumban el stream."""
+    cuerpo = (
+        _evento_sse(
+            {
+                "model": "m",
+                "choices": [{"index": 0, "delta": {"reasoning_content": "pensando…"}}],
+            }
+        )
+        + _evento_sse({"model": "m", "choices": [{"index": 0, "delta": {"content": "Lleva"}}]})
+        + _evento_sse({"model": "m", "choices": [{"index": 0, "delta": {"content": " chaqueta."}}]})
+        + "data: [DONE]\n\n"
+    )
+    proveedor, _ = _proveedor(_sse_handler(cuerpo), thinking="enabled")
+
+    async def recolectar() -> str:
+        return "".join([trozo.text async for trozo in proveedor.stream(MENSAJES)])
+
+    assert loop_de_test.call(recolectar) == "Lleva chaqueta."
 
 
 # --- Streaming ---------------------------------------------------------------

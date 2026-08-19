@@ -50,6 +50,35 @@ key. El path del endpoint se CONCATENA a la URL base, así que una base con
 sufijo (``https://openrouter.ai/api/v1``) también funciona. Lo único
 propietario que se lee es ``prompt_cache_hit_tokens``, y su ausencia degrada
 sola: sin ese campo, el acierto de caché se reporta como 0.
+
+
+## Razonamiento DESACTIVADO por defecto (non-think)
+
+DeepSeek V4 razona por defecto, con esfuerzo alto, y ese razonamiento **se
+factura como salida**. Medido contra el proveedor real, una respuesta
+conversacional de cuatro frases costaba **~1.163 tokens de salida y ~15 s**,
+de los que el usuario veía una fracción mínima. Para el chat de Rover —"¿qué
+llevo a Cartagena?"— eso es pagar y hacer esperar por deliberación que no
+mejora la respuesta. Por eso el cuerpo lleva ``thinking: {"type": "disabled"}``
+salvo que la config diga otra cosa (``ROVER_LLM_THINKING``).
+
+Tres consecuencias que conviene tener presentes:
+
+1. **No llega ``reasoning_content``.** El parseo nunca dependió de él —lee
+   ``message.content`` y ``delta.content``, y un campo extra se ignora—, así
+   que reactivar el razonamiento no rompe nada: solo vuelven a aparecer
+   eventos de stream sin texto mientras el modelo piensa.
+2. **``temperature`` y ``top_p`` vuelven a contar.** En modo razonamiento
+   DeepSeek los ignora; en non-think mandan otra vez, así que el
+   ``ROVER_LLM_TEMPERATURE`` de la config (0.7) pasa a tener efecto real sobre
+   la variedad de las respuestas.
+3. **Ojo con reactivarlo en la HU-2.6 (tool-calling).** Con el razonamiento
+   activado, DeepSeek EXIGE que las peticiones multi-turno con tools devuelvan
+   el ``reasoning_content`` del turno anterior, o responde 400. Hoy eso no nos
+   afecta —está desactivado—, pero quien reactive ``thinking`` tendrá que
+   preservar ese campo en la persistencia de los pasos intermedios (HU-2.3) y
+   reenviarlo en el loop de tools. No es un detalle menor: se descubre con un
+   400 en la segunda vuelta del loop, no en la primera.
 """
 
 import json
@@ -57,7 +86,7 @@ import logging
 import time
 from collections.abc import AsyncGenerator, Iterable, Sequence
 from contextlib import aclosing
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 import httpx
 
@@ -91,6 +120,13 @@ _CHAT_PATH: Final = "/chat/completions"
 #: Marca de fin del stream SSE en la API OpenAI-compatible.
 _SSE_DONE: Final = "[DONE]"
 
+#: Modo de razonamiento pedido al proveedor. ``provider_default`` no manda el
+#: campo (ver ``_payload``); los otros dos viajan como ``{"type": ...}``.
+ThinkingMode = Literal["disabled", "enabled", "provider_default"]
+
+#: Valor de ``llm_thinking`` que significa "no mandes el campo".
+_THINKING_OMITIDO: Final = "provider_default"
+
 #: Mensajes SEGUROS para el usuario (los detalles del proveedor van al log).
 _MSG_UNAVAILABLE: Final = "El asistente no está disponible en este momento; inténtalo de nuevo."
 _MSG_RATE_LIMITED: Final = "El asistente está saturado; inténtalo de nuevo en unos segundos."
@@ -120,6 +156,7 @@ class DeepSeekProvider:
         temperature: float,
         max_output_tokens: int,
         timeout_seconds: float,
+        thinking: ThinkingMode = "disabled",
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._api_key = api_key
@@ -128,6 +165,7 @@ class DeepSeekProvider:
         self._temperature = temperature
         self._max_output_tokens = max_output_tokens
         self._timeout = timeout_seconds
+        self._thinking = thinking
         self._transport = transport
 
     # --- Contrato de LLMProvider ---------------------------------------------
@@ -355,6 +393,17 @@ class DeepSeekProvider:
         depende de lo que mande el llamador. Cuando la HU-2.6 traiga las
         definiciones de tools, irán justo detrás del prompt y antes del
         historial, por la misma razón.
+
+        ``thinking`` es lo único de aquí que NO es de la API de OpenAI: es la
+        extensión propietaria con la que DeepSeek activa o apaga el
+        razonamiento. Su forma —``{"type": "disabled"}``, no un booleano ni una
+        cadena suelta— vive en este módulo y no sale de él, igual que
+        ``prompt_cache_hit_tokens``: fuera se habla de "modo de razonamiento",
+        que es lo que un proveedor distinto expresaría a su manera
+        (``reasoning_effort``, ``reasoning: {...}``). Por eso también existe
+        ``provider_default``: un proveedor OpenAI-compatible que no conozca el
+        campo y rechace parámetros desconocidos se atiende cambiando entorno,
+        sin tocar este archivo.
         """
         prompt = DEFAULT_SYSTEM_PROMPT if system_prompt is None else system_prompt
         cuerpo: dict[str, Any] = {
@@ -369,6 +418,8 @@ class DeepSeekProvider:
             ),
             "stream": stream,
         }
+        if self._thinking != _THINKING_OMITIDO:
+            cuerpo["thinking"] = {"type": self._thinking}
         if stream:
             # Sin esto, el stream NO reporta tokens y la instrumentación del
             # camino principal quedaría vacía.
@@ -498,6 +549,12 @@ def _parse_completion(body: dict[str, Any], *, fallback_model: str) -> Completio
     Un 2xx sin ``choices`` utilizable es una respuesta incoherente, no una
     respuesta vacía: se trata como fallo del proveedor en vez de devolver un
     texto en blanco que el usuario vería como "el asistente no dijo nada".
+
+    Solo se lee ``message.content``. Con el razonamiento activado el proveedor
+    añade ahí un ``reasoning_content``, y con non-think —el modo por defecto,
+    ver el docstring del módulo— no aparece: el parseo funciona igual en los
+    dos casos porque **nunca dependió de ese campo**. Lo que el modelo pensó no
+    es la respuesta al usuario, así que tampoco se propaga hacia arriba.
     """
     opcion = _primera_opcion(body)
     mensaje = opcion.get("message")
@@ -521,6 +578,13 @@ def _parse_chunk(evento: dict[str, Any], *, fallback_model: str) -> tuple[Comple
     puede ser MÁS preciso que el configurado (un alias como ``deepseek-chat``
     resuelve a una versión concreta): la instrumentación debe registrar el que
     respondió de verdad.
+
+    Solo se lee ``delta.content``. Con el razonamiento activado, los eventos de
+    la fase de pensamiento traen ``delta.reasoning_content`` y ``content`` a
+    ``null``: salen como trozos de texto vacío, que es exactamente lo que
+    queremos (no se enseña al usuario lo que el modelo está rumiando). Con
+    non-think esos eventos ni siquiera existen. Ninguno de los dos caminos
+    necesita conocer el campo.
     """
     opcion = _primera_opcion(evento)
     delta = opcion.get("delta")

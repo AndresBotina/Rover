@@ -194,6 +194,22 @@ class Settings(BaseSettings):
     # gasta los tokens igual sin entregar nada.
     llm_timeout_seconds: float = Field(default=60.0, gt=0)
 
+    # Modo de razonamiento del modelo. DESACTIVADO por defecto, y no por
+    # ahorrar unos tokens: DeepSeek V4 razona por defecto con esfuerzo alto y
+    # ese razonamiento se FACTURA como salida. Medido contra el proveedor real,
+    # una respuesta conversacional de cuatro frases costaba ~1.163 tokens de
+    # salida y ~15 s. Para el chat de Rover —preguntas de viaje, respuestas
+    # cortas— eso es pagar y hacer esperar por un razonamiento que no mejora la
+    # respuesta.
+    #
+    # Es config y no una constante porque el router por dificultad (diferido)
+    # querrá justo lo contrario para lo que sí lo vale: un itinerario de tres
+    # ciudades con presupuesto y fechas. Misma filosofía que ``llm_model``.
+    # ``provider_default`` omite el campo del cuerpo, para un proveedor
+    # OpenAI-compatible que no lo conozca y rechace parámetros desconocidos
+    # (ver app/services/llm/deepseek.py).
+    llm_thinking: Literal["disabled", "enabled", "provider_default"] = "disabled"
+
     # Campos que no pueden faltar cuando env == "production".
     _REQUIRED_IN_PRODUCTION: ClassVar[tuple[str, ...]] = (
         "database_url",
