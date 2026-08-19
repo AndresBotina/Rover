@@ -514,7 +514,10 @@ app/services/llm/
 ├── base.py            # tipos de dominio (Message, Completion, CompletionChunk),
 │                      # Capability y el Protocol LLMProvider
 ├── errors.py          # excepciones de dominio (LLMRateLimited, LLMUnavailable…)
-├── prompt.py          # system prompt por defecto (placeholder hasta la HU-2.2)
+├── prompt.py          # carga del system prompt (el texto vive en prompts/)
+├── prompts/
+│   ├── rover.md       # LA PERSONALIDAD: editar esto es cambiar cómo habla Rover
+│   └── README.md      # reglas de edición (por qué es una constante)
 ├── deepseek.py        # implementación concreta (endpoint OpenAI-compatible)
 ├── instrumentation.py # uso/latencia/caché por llamada (semilla del router futuro)
 └── registry.py        # quién atiende cada capacidad (seam de selección)
@@ -581,6 +584,28 @@ implementación lo antepone siempre en la misma posición. Es lo que hace que el
 interpolado con la fecha de hoy invalidaría el prefijo en cada llamada y
 multiplicaría el costo de la entrada sin que nada se pusiera rojo.
 
+### La personalidad de Rover (HU-2.2)
+
+El **texto** vive en [`app/services/llm/prompts/rover.md`](app/services/llm/prompts/rover.md),
+versionado en el repo: cambiar cómo habla Rover es **editar ese archivo** y
+mirar el diff en git — ni base de datos (invisible en un PR, distinta por
+ambiente) ni un string incrustado en un endpoint. `prompt.py` solo lo carga,
+**una vez al importar**, y expone `DEFAULT_SYSTEM_PROMPT`; si el archivo falta
+o está vacío la app **no arranca** (mismo fail-fast que una variable
+obligatoria ausente: un Rover sin personalidad responde igual de bien a un
+`curl`, así que el fallo sería invisible hasta leer una conversación sosa en
+producción).
+
+**Regla innegociable: el prompt es una CONSTANTE.** Nada de fecha, nombre del
+usuario, destino ni marcadores de plantilla dentro del prefijo — lo variable va
+detrás, como un mensaje más del contexto. Romperlo no rompe nada visible: la
+app responde igual, solo que pagando la entrada completa en cada petición. Las
+reglas de edición están junto al archivo
+([`prompts/README.md`](app/services/llm/prompts/README.md)) y las vigila
+`tests/test_prompt.py` (sin marcadores, sin la fecha de hoy, largo mínimo para
+que el caché muerda —DeepSeek cachea en bloques de 64 tokens—, y que lo que se
+manda sea exactamente el archivo).
+
 ### Seam de selección por capacidad
 
 `get_llm_provider(Capability.VISION)` es el punto donde entraría un segundo
@@ -614,10 +639,24 @@ uv run python -m scripts.check_llm
 uv run python -m scripts.check_llm "¿qué llevo a Cartagena en julio?"
 ```
 
-Hace una llamada completa y otra en streaming, e imprime la línea de
-instrumentación de cada una (tokens, latencia, cache hit). Los **tests no usan
-la key**: simulan el transporte HTTP con `httpx.MockTransport`, así que el CI
-pasa sin secretos (`tests/test_llm.py`).
+Hace tres llamadas —un completado, **el mismo completado otra vez** y un
+streaming— e imprime la línea de instrumentación de cada una (tokens, latencia,
+cache hit). La segunda es la que importa para el prefijo estable: la primera
+llena el caché del proveedor y la segunda debe acertar. El script lo dice
+explícitamente:
+
+```
+--- 2) la MISMA llamada otra vez (caché del prefijo estable) ---
+[usage: Usage(input_tokens=..., output_tokens=..., cached_input_tokens=...)]
+  ✓ caché acertado: 320/384 tokens de entrada servidos de caché (83%)
+```
+
+Un `cached_input_tokens = 0` en la **segunda** llamada significa que algo está
+invalidando el prefijo (¿se interpoló algo en el system prompt?) o que no llega
+al bloque mínimo de 64 tokens del proveedor.
+
+Los **tests no usan la key**: simulan el transporte HTTP con
+`httpx.MockTransport`, así que el CI pasa sin secretos (`tests/test_llm.py`).
 
 ## Observabilidad: logs estructurados y id de petición (HU-1.12)
 

@@ -21,7 +21,7 @@ Mapa de los módulos:
 
 - ``base.py``            — tipos de dominio, ``Capability`` y el ``Protocol``.
 - ``errors.py``          — excepciones de dominio (nada del proveedor sale de aquí).
-- ``prompt.py``          — system prompt por defecto (placeholder hasta la HU-2.2).
+- ``prompt.py``          — carga del system prompt; el texto vive en ``prompts/``.
 - ``deepseek.py``        — implementación concreta sobre el endpoint OpenAI-compatible.
 - ``instrumentation.py`` — uso/latencia/caché por llamada; semilla del router futuro.
 - ``registry.py``        — quién atiende cada capacidad (el *seam* de selección).

@@ -271,6 +271,20 @@ def test_sin_system_prompt_explicito_se_usa_el_del_repo(loop_de_test: BlockingPo
     assert espia.cuerpo["messages"][0]["content"] == DEFAULT_SYSTEM_PROMPT
 
 
+def test_el_stream_tambien_manda_el_prompt_del_repo(loop_de_test: BlockingPortal) -> None:
+    """El camino normal del producto es el streaming: si aquí faltara el prompt,
+    Rover tendría personalidad solo en las llamadas que casi nadie hace."""
+    proveedor, espia = _proveedor(_sse_handler(_stream_de_ejemplo(["hola"])))
+
+    async def consumir() -> None:
+        async for _ in proveedor.stream(MENSAJES):
+            pass
+
+    loop_de_test.call(consumir)
+
+    assert espia.cuerpo["messages"][0] == {"role": "system", "content": DEFAULT_SYSTEM_PROMPT}
+
+
 def test_el_prefijo_es_identico_entre_llamadas(loop_de_test: BlockingPortal) -> None:
     """Si variara (una fecha interpolada, p. ej.) el caché no acertaría nunca."""
     proveedor, espia = _proveedor(_json_handler(_respuesta_completa()))
