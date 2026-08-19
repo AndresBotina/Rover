@@ -37,7 +37,7 @@ Una HU está **Done** solo cuando:
 |-------|--------|----------|--------|
 | 0 | Fundación | Monorepo, tooling, CI/CD desplegando desde el día uno | Completada ✅ |
 | 1 | Backend core | API `/v1`, async Supabase, Alembic, auth vía Supabase Auth, rate limiting, errores, CORS, observabilidad | Completada ✅ |
-| **2** | El agente | Conversación con memoria, streaming SSE, sesiones y tool-calling con datos en vivo (clima primero) | **En curso** 🚧 (1/8) |
+| **2** | El agente | Conversación con memoria, streaming SSE, sesiones y tool-calling con datos en vivo (clima primero) | **En curso** 🚧 (2/8) |
 | 3 | Web | Next.js con auth, chat con streaming, pricing | Pendiente |
 | 4 | Mobile | Expo reusando la capa compartida | Pendiente |
 | 5 | Monetización | Stripe / Play Billing / Apple IAP, freemium | Diferida |
@@ -515,7 +515,7 @@ La sesión y su renovación están resueltas **por escrito** en [`docs/auth.md`]
 
 **Objetivo:** el corazón del producto. Un agente que **conversa con memoria, en streaming, y consulta datos en vivo** — empezando por el clima. Text-first, con personalidad en el system prompt y un cerebro económico (DeepSeek V4 Flash) tras una abstracción de proveedor. Se apoya en toda la Épica 1: base async, auth, rate limiting, contrato único de error y logs correlacionables.
 
-> **Progreso: 1 de 8 HU.** ✅ HU-2.1 (capa de LLM). Siguiente: **HU-2.2** (personalidad vía system prompt), que aterriza sobre la estructura de prefijo estable que la 2.1 dejó lista.
+> **Progreso: 2 de 8 HU.** ✅ HU-2.1 (capa de LLM) · ✅ HU-2.2 (personalidad vía system prompt). Siguiente: **HU-2.3** (modelo de datos de conversaciones), primera HU de la épica que toca base de datos — y la primera que estrena el patrón de fixtures limpio de la HU-1.13.
 
 > **Alcance deliberado de la v1:** RAG, caché semántico, voz y router por dificultad **no entran**. Cada uno queda abajo, en *Diferido a segunda iteración*, con su detalle técnico intacto y un **disparador** explícito. El criterio: hasta que el núcleo —conversar, recordar, consultar en vivo— no esté sólido, cualquiera de esas piezas es peso que se arrastra sin saber todavía si hace falta.
 
@@ -555,23 +555,29 @@ La sesión y su renovación están resueltas **por escrito** en [`docs/auth.md`]
 > **Nota:** la tarea original decía `services/agent/llm.py`, un archivo. Se implementó como **paquete** `services/llm/` porque la HU pide seis cosas que quieren vivir separadas (contrato, errores, prompt, implementación, instrumentación, registro) y meterlas en un módulo habría hecho que el archivo del *contrato* —lo único que el resto del backend debería leer— llegara mezclado con el parseo de SSE de un proveedor concreto.
 
 > **Contexto que hereda la HU-2.2 — `cached_input_tokens = 0` es lo ESPERADO hoy, no un fallo.** En las llamadas de verificación el acierto de caché salió en cero, y así debe ser: el system prompt real llega en la HU-2.2 y hoy `prompt.py` tiene un placeholder de una línea. **Sin un prefijo estable largo no hay nada que cachear** — DeepSeek cachea por bloques del prefijo común, y una frase suelta no llega. Lo que esta HU deja listo es la **estructura** (el prompt va primero, aparte y sin interpolar); el ahorro aparece cuando la HU-2.2 ponga un prompt de verdad delante, y **la métrica ya está instrumentada para comprobarlo**: si tras la HU-2.2 `llm_cache_hit_ratio` sigue en cero llamada tras llamada, hay algo invalidando el prefijo y se está pagando de más.
+>
+> **Confirmado en la HU-2.2:** con el prompt real delante (656 tokens de entrada), la segunda llamada idéntica sirvió **640 de caché — el 98 %**. La predicción de esta nota se cumplió tal cual.
 
 ---
 
-### HU-2.2 — Personalidad vía system prompt
+### ✅ HU-2.2 — Personalidad vía system prompt
 *Como* producto, *quiero* la personalidad de Rover en un system prompt versionado, *para* iterarla rápido y mantenerla portable entre modelos (sin fine-tuning).
 
-> **Lo que ya está hecho por la HU-2.1:** la estructura (el prompt va primero, como parámetro aparte y sin interpolar), el punto donde aterriza (`app/services/llm/prompt.py`, hoy un placeholder de una línea) y la métrica para comprobar que sirve (`llm_cache_hit_ratio`). Falta el **texto**. Ojo con la lectura de la métrica: el acierto de caché está en **cero** hoy y eso es correcto —sin prefijo estable largo no hay nada que cachear—; el número que importa es el de **después** de poner un prompt de verdad.
+**Criterios de aceptación (como se construyó):**
+- **El texto vive en `app/services/llm/prompts/rover.md`**, versionado en el repo. Cambiar cómo habla Rover es **editar ese archivo** y ver el diff en git — no una fila de base de datos (invisible en un PR, distinta por ambiente, sin historial) ni un string incrustado en un endpoint. `prompt.py` queda como lo que debe ser —el **cargador**— y sigue exponiendo `DEFAULT_SYSTEM_PROMPT`, así que **nada del resto del backend cambió**: la capa de la HU-2.1 ya lo anteponía como prefijo estable.
+- **Un directorio `prompts/`, no un archivo suelto,** porque la HU-2.6 puede querer un prompt propio para el loop de tools y el sitio ya está. Junto al prompt vive su `README.md` con las reglas de edición: es donde mira quien va a **editar el texto**, que no es necesariamente quien lee Python.
+- **La personalidad refleja las decisiones de producto:** amigo cercano que además sabe de viajes (tuteo, energía **contenida** — sin exclamaciones ni emojis en cascada, el entusiasmo se nota en el interés, no en la puntuación); **recomienda con criterio** en vez de enumerar (dice cuál es la trampa de turistas y por qué), y pregunta lo justo **después** de dar valor, no antes; responde **en el idioma en que le escriben**; se mantiene en viajes y **reconduce con gracia** lo que se sale, sin sonar a política recitada; y es **honesto por encima de sonar seguro** — no inventa horarios, precios ni requisitos, y dice explícitamente que no tiene datos en tiempo real ni sabe qué día es hoy.
+- **Carga UNA vez, al importar.** Es la definición operativa de "prefijo estable" (todas las llamadas de un despliegue mandan **los mismos bytes**; leer en cada petición abriría la puerta a que el prompt cambiara a mitad de la vida del proceso) y evita una **syscall bloqueante** en el camino de cada petición async. El precio, dicho claro: editar el archivo no entra en caliente en producción — entra con el deploy. Barato a cambio de la estabilidad del prefijo.
+- **Un archivo ausente o vacío TUMBA el arranque**, con `RuntimeError` y **no** con `LLMNotConfigured`: esa la capturan los llamadores para devolver un `503` por petición, y esto no es un problema de una petición sino un **despliegue mal construido**. Mismo fail-fast que una variable obligatoria ausente (HU-0.8), y por la misma razón: un Rover sin personalidad **responde igual de bien a un `curl`**, así que el fallo sería invisible hasta que alguien leyera una conversación sosa en producción.
+- **Normaliza CRLF y los espacios de los extremos, y nada más:** el prefijo depende del **commit**, no del editor con que se guardó. Sin eso, el mismo commit podría producir cachés distintos según el checkout.
+- **La regla del prefijo estable está documentada donde se edita** (`prompts/README.md`), con lo que **no** puede entrar (fecha, nombre o plan del usuario, destino, marcadores de plantilla) y **dónde va lo variable**: detrás, como un mensaje más del contexto. Incluye la nota del **registro** (tú/vos/usted): cambiarlo exige tocar **la instrucción y la voz del propio texto**, porque el modelo imita el registro en que está escrito el prompt.
+- **Tests (10 nuevos; 252 en el backend, 53 en `@rover/shared`).** `tests/test_prompt.py` vigila justo la propiedad que **no falla ruidosamente**: que el prompt sea una **constante**. Un prefijo dinámico no rompe nada visible —la app responde igual, solo que pagando la entrada completa en cada llamada—, así que el síntoma sería **una factura, no un fallo**. Cubre: que lo que se manda es **exactamente el archivo** (nada añadido por código), que no lleva **marcadores de plantilla** (`{…}`, `%s`, `${…}`), que **no lleva la fecha de hoy** (canario contra el error clásico de interpolarla), que **llega al mínimo para que el caché muerda**, que los finales de línea no lo cambian, y el fail-fast de archivo ausente/vacío. En `test_llm.py` se añadió que el prompt **también viaja en el camino de streaming** — el normal del producto: si faltara ahí, Rover tendría personalidad solo en las llamadas que casi nadie hace.
+- **El test del largo mínimo (400 caracteres) es de negocio, no de estilo:** DeepSeek cachea en **bloques de 64 tokens** y lo que no llegue a un bloque **no se cachea nunca**. Sin ese test, un recorte "de limpieza" mataría el ahorro de esta HU en silencio.
+- **Verificado contra DeepSeek REAL** con `scripts/check_llm.py`, que ahora hace **la misma llamada dos veces** y da un veredicto explícito: prompt de **1.946 caracteres → 656 tokens de entrada**; primera llamada `cached_input_tokens=0` (es la que **llena** el caché), segunda **`cached_input_tokens=640` — el 98 % de la entrada servida de caché**. Es el criterio observable de la HU cumplido: el prefijo estable funciona. La personalidad se ve en la respuesta (tuteo, tono cercano, consejo concreto: *"no te olvides de la chaqueta y el paraguas"*).
 
-**Criterios de aceptación:**
-- El system prompt vive **en el repo, versionado**: ni en base de datos ni incrustado en el endpoint.
-- Cambiar la personalidad es **editar un archivo**, sin tocar lógica.
-- Se inyecta como **prefijo estable**, primero, en cada llamada (caché-friendly, coherente con la HU-2.1).
-- **Es una constante, no una plantilla:** nada de interpolar la fecha, el nombre del usuario ni el destino en el prefijo — invalidaría el caché en cada llamada y multiplicaría el costo de la entrada **sin que ningún test se pusiera rojo**. Lo variable va en los mensajes, detrás.
-- Existe un test que verifica que el prompt viaja en la petición al LLM.
-- Tras ponerlo, `llm_cache_hit_ratio` deja de ser cero en llamadas sucesivas con el mismo prefijo: es la **verificación de que el prefijo estable funciona**, no solo de que el texto viaja.
+**Tareas técnicas (como se hizo):** `app/services/llm/prompts/rover.md` (el texto) y `prompts/README.md` (reglas de edición) · `prompt.py` convertido en cargador (`load_system_prompt` + `DEFAULT_SYSTEM_PROMPT`, con normalización y fail-fast) · `tests/test_prompt.py` · test de streaming en `tests/test_llm.py` · `scripts/check_llm.py` con la segunda llamada y el informe de caché · README del backend (§ La personalidad de Rover, y el bloque de verificación con el ejemplo de salida).
 
-**Tareas técnicas:** archivo de prompt versionado · carga en el servicio del agente · test de inclusión · comprobar el acierto de caché con `scripts/check_llm.py`.
+> **Observación para la HU-2.8 (control de consumo), anotada al verificar:** en las llamadas reales los `output_tokens` salieron muy por encima del texto visible (706 tokens para una respuesta de una frase). El modelo está gastando salida que no se ve — presumiblemente razonamiento interno. No afecta a esta HU, pero es **justo el dato que la HU-2.8 va a necesitar**: la cuota por plan no puede calcularse sobre los caracteres que ve el usuario. La instrumentación de la HU-2.1 ya lo registra por llamada.
 
 ---
 
