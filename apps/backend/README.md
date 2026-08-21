@@ -698,9 +698,9 @@ usuario (HU-1.7), y responde en **Server-Sent Events**: el texto aparece
 mientras el modelo lo escribe en vez de después de quince segundos en blanco.
 La conversación queda persistida en las tablas de la HU-2.3.
 
-Sin herramientas todavía (HU-2.6) y con memoria de **un turno**: la ventana
-multi-turno es la HU-2.5, y su punto de extensión está marcado en
-`app/services/chat.py::build_context`.
+Sin herramientas todavía (HU-2.6). **Con memoria multi-turno** desde la HU-2.5:
+en cada turno se le reenvía al modelo lo que ya se habló, recortado a un
+presupuesto de tokens (§ La memoria de Rover).
 
 ### El cuerpo de la petición
 
@@ -858,6 +858,160 @@ respuesta**.
 
 Los **tests no usan la key ni la base real**: el proveedor se sustituye por un
 doble y la base es SQLite (`tests/test_chat.py`).
+
+## La memoria de Rover: ventana de contexto y sesiones (HU-2.5)
+
+El modelo **no recuerda nada entre llamadas**. Rover recuerda porque en cada
+turno se le vuelve a contar la conversación: se relee lo guardado (HU-2.3), se
+recorta a lo que quepa en un presupuesto y se manda por delante del mensaje
+nuevo. Eso se paga **en cada turno**, así que la pregunta no es *"¿cuánto
+cabe?"* sino *"¿cuánto conviene?"*.
+
+### Se recorta por TOKENS, no por número de turnos
+
+Diez turnos pueden ser 300 tokens o 30.000 según lo que se haya escrito. Un
+tope por turnos deja el costo —y el riesgo de reventar el contexto— a merced de
+lo larga que fuera una respuesta. Y no es solo costo: con entradas largas los
+modelos **atienden peor a lo que queda por el medio** (*lost in the middle*),
+así que mandar todo el historial "por si acaso" empeora las respuestas además
+de encarecerlas.
+
+| Variable | Default | Qué hace |
+|----------|---------|----------|
+| `ROVER_CHAT_CONTEXT_TOKEN_BUDGET` | `4000` | Tokens de **historial**. No incluye el system prompt (constante, casi siempre cacheado) ni el mensaje nuevo (innegociable): esos van encima. |
+| `ROVER_CHAT_CONTEXT_CHARS_PER_TOKEN` | `3.0` | Caracteres por token que asume el estimador. |
+
+### Cómo se cuentan los tokens (y con qué margen)
+
+**Con una aproximación por caracteres, no con un tokenizador.** DeepSeek no
+publica un tokenizador instalable para su V4; el de OpenAI (`tiktoken`) es otro
+BPE, así que daría una cifra precisa **de un modelo distinto** —precisión falsa—
+y además descarga un fichero de modelo en el primer uso: una llamada a la red en
+el arranque, en un CI que corre sin secretos y en un plan free que se duerme.
+
+Lo que hace falta aquí no es contar exacto, es **no pasarse**: quedarse corto en
+la cuenta manda de más y el proveedor responde `400`; pasarse manda de menos y
+solo se pierde algo de memoria vieja. Los dos errores no cuestan lo mismo, así
+que el estimador se inclina al barato: cuenta a **3,0 caracteres por token**
+cuando el español real ronda 3,5–4,0, o sea **sobreestima ~20 %** y recorta
+antes de tiempo. Se suman 4 tokens por mensaje por el envoltorio del formato
+(rol y delimitadores), que se paga aunque el texto sea de una palabra.
+
+Ese margen es **medible, no una corazonada**: la instrumentación de la HU-2.1 ya
+registra el `llm_input_tokens` real de cada llamada, así que comparar esa serie
+con lo estimado dice si el 3,0 sobra o falta — y ajustarlo es cambiar entorno,
+no código.
+
+### Qué entra y qué no
+
+- **Se conserva lo RECIENTE.** Se recorre el historial de atrás hacia adelante:
+  lo que da sentido a la pregunta de ahora es lo último; lo viejo es lo
+  prescindible.
+- **No se salta un mensaje del medio** para encajar uno más viejo que sí cabría.
+  Un hueco haría que el modelo leyera la secuencia como continua y atribuyera a
+  una pregunta la respuesta de otra.
+- **El historial nunca empieza por una respuesta huérfana.** Si el corte parte
+  un par pregunta/respuesta, el `assistant` que quedaría primero **se descarta**:
+  el modelo lo leería como algo que Rover dijo por su cuenta, y lo que suele
+  haber ahí es media respuesta a algo invisible que invita a "continuarla" en
+  vez de atender lo que se pregunta ahora. Cuesta tirar un mensaje que sí cabía;
+  a cambio, el borde deja de existir.
+- **Los `tool_steps` NO se reenvían.** Se guardan (HU-2.3) pero no vuelven al
+  contexto, por tres razones que no cambian cuando existan (HU-2.6): están
+  **caducados** (el JSON de una API del clima era cierto *aquel* momento, y
+  reenviarlo tres turnos después le enseña al modelo como vigente algo que ya no
+  lo es), **cuestan mucho y aportan poco** (una respuesta de API puede ocupar
+  más que toda la conversación), y **la conclusión ya está en `content`**. Lo
+  que sí necesita el formato de cable de la tool es el *loop del turno en
+  curso*, que la HU-2.6 arma en memoria y tira al terminar.
+- **Stable-prefix-first.** El system prompt va primero, aparte e invariable (lo
+  antepone la capa de LLM); lo variable, detrás. Es lo que hace que el caché de
+  DeepSeek muerda — en la HU-2.2 se midió **98 %** de la entrada servida de
+  caché con el prefijo estable delante.
+
+### Sesiones: `/v1/chat/sessions`
+
+| Ruta | Qué hace |
+|------|----------|
+| `GET /v1/chat/sessions` | Las conversaciones **vivas** del usuario, por actividad reciente. Solo cabeceras (id, título, timestamps). `limit` 1–100, por defecto 50. |
+| `GET /v1/chat/sessions/{id}` | Una conversación con su historial en orden. **Solo texto conversacional.** |
+| `DELETE /v1/chat/sessions/{id}` | **Soft-delete**: se marca `deleted_at`. Responde `204`. |
+
+Todas protegidas y con cuota por usuario, declarada a nivel de router.
+
+**Los `tool_steps` no salen nunca, y la frontera está en el TIPO:**
+`SessionMessage` no declara ese campo, así que no hay filtro que alguien pueda
+olvidar. Los pasos intermedios llevan respuestas crudas de APIs de terceros —
+exactamente la clase de dato que nadie revisa hasta que aparece en la pantalla
+de alguien.
+
+**Todo lo ajeno responde `404`.** "No existe", "es de otra persona" y "está
+borrada" dan la misma respuesta byte a byte, y no por disciplina: colapsan
+dentro de la **consulta** (`select_live_conversations` ya filtra `deleted_at IS
+NULL`), así que un refactor no puede separarlos sin querer.
+
+**Borrar dos veces devuelve `404` la segunda**, no `204`. Es la tensión conocida
+entre idempotencia y no filtrar: un `204` sobre una ya borrada diría "ese id
+existió y era tuyo". Para el cliente el desenlace es el mismo —no está—, así que
+se prefiere no filtrar.
+
+**`updated_at` refleja la actividad.** Cada mensaje **toca su conversación** en
+la misma transacción; sin eso el `onupdate` de la columna nunca saltaría (añadir
+un mensaje no actualiza esa fila) y la lista acabaría ordenando por fecha de
+creación, con una conversación vieja que se retoma sin subir. Era la deuda que
+dejaron anotada la HU-2.3 y la HU-2.4. El orden desempata por `id`, porque
+`updated_at` no es único y una lista que se baraja sola entre refrescos es un
+bug — además de romper la paginación por keyset el día que llegue.
+
+### Verificarlo en local (con tu key real)
+
+Que Rover **recuerde** se comprueba en dos turnos donde el segundo no se
+entienda sin el primero:
+
+```bash
+TOKEN=$(curl -s localhost:8000/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"tu@email.com","password":"tu-password"}' | jq -r .session.access_token)
+AUTH="Authorization: Bearer $TOKEN"; JSON='Content-Type: application/json'
+
+# Turno 1: se crea la conversación. Guarda el conversation_id del evento start.
+curl -N --no-buffer localhost:8000/v1/chat -H "$AUTH" -H "$JSON" \
+  -d '{"message":"Voy a Cartagena tres días en julio."}'
+
+# Turno 2: NO se nombra Cartagena ni julio. Si Rover responde con sentido,
+# es porque el historial le llegó.
+curl -N --no-buffer localhost:8000/v1/chat -H "$AUTH" -H "$JSON" \
+  -d '{"message":"¿Y qué ropa llevo?","conversation_id":"<el-id-de-arriba>"}'
+```
+
+Una respuesta que hable del calor y la humedad del Caribe en julio **es** la
+memoria funcionando; una que pregunte "¿a dónde viajas?" sería la señal de que
+el contexto no llegó. La prueba negativa es igual de útil: manda ese mismo
+segundo mensaje **sin** `conversation_id` y Rover no tendrá de dónde saberlo.
+
+En el log del servidor se ve el costo de la memoria — `llm_input_tokens` crece
+turno a turno mientras `llm_cache_hit_ratio` se mantiene alto (el prefijo
+estable sigue delante):
+
+```
+INFO [app.llm] llamada al LLM deepseek-v4-flash → ok (3218.4 ms)
+  llm_input_tokens=698  llm_cached_input_tokens=640  llm_cache_hit_ratio=0.917
+INFO [app.llm] llamada al LLM deepseek-v4-flash → ok (2904.1 ms)
+  llm_input_tokens=921  llm_cached_input_tokens=832  llm_cache_hit_ratio=0.903
+```
+
+Ese `llm_input_tokens` es también con lo que se calibra el estimador: si crece
+mucho más despacio de lo estimado, `ROVER_CHAT_CONTEXT_CHARS_PER_TOKEN` puede
+subir y caber más memoria en el mismo presupuesto.
+
+Y las sesiones:
+
+```bash
+curl -s localhost:8000/v1/chat/sessions -H "$AUTH" | jq
+curl -s localhost:8000/v1/chat/sessions/<id> -H "$AUTH" | jq '.messages[] | {sequence, role, content}'
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE localhost:8000/v1/chat/sessions/<id> -H "$AUTH"
+# 204 · y luego: no está en la lista, GET da 404 y POST /v1/chat con ese id da 404.
+```
 
 ## Observabilidad: logs estructurados y id de petición (HU-1.12)
 

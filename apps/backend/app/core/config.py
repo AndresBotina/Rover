@@ -210,6 +210,28 @@ class Settings(BaseSettings):
     # (ver app/services/llm/deepseek.py).
     llm_thinking: Literal["disabled", "enabled", "provider_default"] = "disabled"
 
+    # --- Ventana de contexto del chat (HU-2.5) -------------------------------
+    # Cuánto historial se le reenvía al modelo en cada turno. Es la palanca de
+    # COSTO y de CALIDAD a la vez: cada token de historial se paga en cada
+    # turno, y un contexto largo empeora las respuestas ("lost in the middle":
+    # el modelo atiende peor a lo que queda en la mitad de una entrada larga).
+
+    # Presupuesto para el HISTORIAL, en tokens. No incluye el system prompt
+    # (constante y casi siempre servido de caché) ni el mensaje nuevo (que es
+    # innegociable): esos van encima. 4.000 son unos 20-30 turnos de
+    # conversación normal — bastante más de lo que un hilo de viaje usa antes
+    # de cambiar de tema, y muy lejos del techo del modelo.
+    chat_context_token_budget: int = Field(default=4000, ge=0)
+
+    # Caracteres por token que asume el ESTIMADOR (ver app/services/chat.py).
+    # 3,0 es deliberadamente PESIMISTA: el español real ronda 3,5-4,0
+    # caracteres por token, así que contar a 3,0 sobreestima ~20 % y recorta
+    # de más antes que pasarse. Es configurable justamente para poder ajustarlo
+    # contra datos: la instrumentación de la HU-2.1 ya reporta el
+    # ``llm_input_tokens`` real de cada llamada, así que el error del estimador
+    # se MIDE, no se adivina.
+    chat_context_chars_per_token: float = Field(default=3.0, gt=0)
+
     # Campos que no pueden faltar cuando env == "production".
     _REQUIRED_IN_PRODUCTION: ClassVar[tuple[str, ...]] = (
         "database_url",

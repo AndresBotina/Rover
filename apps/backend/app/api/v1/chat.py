@@ -278,9 +278,13 @@ async def chat_stream(
         if conversacion is None:
             raise ApiError(status.HTTP_404_NOT_FOUND, ErrorCode.NOT_FOUND, _NO_ENCONTRADA)
 
-    # ``historial`` vacío: esta HU es de un turno. La HU-2.5 lo llenará leyendo
-    # los mensajes de la conversación con presupuesto de tokens.
-    contexto = chat.build_context(mensaje=payload.message)
+    # La MEMORIA (HU-2.5): se relee lo ya guardado y se recorta a lo que quepa
+    # en el presupuesto de tokens. En una conversación nueva esto es una lista
+    # vacía y el contexto queda igual que en la HU-2.4.
+    historial = chat.trim_to_budget(
+        await chat.load_history(db, conversacion.id) if conversacion is not None else []
+    )
+    contexto = chat.build_context(mensaje=payload.message, historial=historial)
 
     try:
         provider = get_llm_provider()

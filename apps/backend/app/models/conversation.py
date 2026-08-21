@@ -265,7 +265,13 @@ def select_live_conversations(user_id: uuid.UUID) -> Select[tuple[Conversation]]
     return (
         select(Conversation)
         .where(Conversation.user_id == user_id, Conversation.deleted_at.is_(None))
-        .order_by(Conversation.updated_at.desc())
+        # El ``id`` desempata, y no es cosmético: ``updated_at`` NO es único
+        # (dos conversaciones tocadas en el mismo instante empatan), y un orden
+        # indefinido hace que la lista se baraje sola entre dos refrescos. Con
+        # el desempate, además, ``updated_at`` sirve de cursor para paginar por
+        # keyset el día que haga falta — sobre una clave no única, esa
+        # paginación se saltaría filas o las repetiría en el borde de página.
+        .order_by(Conversation.updated_at.desc(), Conversation.id.desc())
     )
 
 

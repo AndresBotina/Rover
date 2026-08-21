@@ -36,6 +36,18 @@ export {
 } from "./types/chat.ts";
 
 export {
+  isChatSession,
+  isChatSessionList,
+  isChatSessionMessage,
+  isChatSessionSummary,
+  type ChatRole,
+  type ChatSession,
+  type ChatSessionList,
+  type ChatSessionMessage,
+  type ChatSessionSummary,
+} from "./types/session.ts";
+
+export {
   isApiErrorResponse,
   parseRetryAfter,
   RATE_LIMITED,

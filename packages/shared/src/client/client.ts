@@ -30,6 +30,12 @@ import {
 } from "../types/chat.ts";
 import { isProfile, type Profile, type ProfileUpdate } from "../types/profile.ts";
 import {
+  isChatSession,
+  isChatSessionList,
+  type ChatSession,
+  type ChatSessionList,
+} from "../types/session.ts";
+import {
   isDbHealthResponse,
   isHealthResponse,
   type DbHealthResponse,
@@ -323,6 +329,80 @@ export class ApiClient {
         yield evento;
       }
     }
+  }
+
+  /**
+   * GET /v1/chat/sessions — las conversaciones **vivas** del usuario, de la más
+   * activa a la más vieja (cada mensaje toca su conversación, HU-2.5).
+   *
+   * Solo cabeceras: id, título y timestamps. El historial se pide conversación
+   * por conversación con `getChatSession`, para que pintar una barra lateral no
+   * signifique descargar toda la cuenta.
+   *
+   * Las borradas no aparecen. `limit` acota (1–100, por defecto 50); si
+   * `items.length === limit` puede haber más.
+   */
+  async listChatSessions(
+    accessToken: string,
+    options: { limit?: number } = {},
+  ): Promise<ChatSessionList> {
+    const query = options.limit === undefined ? "" : `?limit=${String(options.limit)}`;
+    const url = `${this.baseUrl}/v1/chat/sessions${query}`;
+    const { status, data } = await getJson(url, { Authorization: `Bearer ${accessToken}` });
+    if (!isChatSessionList(data)) {
+      throw new ApiError(`Respuesta de ${url} con forma inesperada`, { url, status });
+    }
+    return data;
+  }
+
+  /**
+   * GET /v1/chat/sessions/{id} — una conversación con su historial en orden.
+   *
+   * Solo texto conversacional: los pasos internos de tool-calling se guardan
+   * pero no se exponen, y `ChatSessionMessage` ni siquiera los declara.
+   *
+   * Si la conversación no existe, está borrada o **es de otra persona**, el
+   * backend responde 404 en los tres casos y esto lanza `ApiError` con
+   * `code === "not_found"`. Es deliberado que no se distingan: un 403 para la
+   * ajena confirmaría que ese id existe.
+   */
+  async getChatSession(accessToken: string, sessionId: string): Promise<ChatSession> {
+    const url = `${this.baseUrl}/v1/chat/sessions/${encodeURIComponent(sessionId)}`;
+    const { status, data } = await getJson(url, { Authorization: `Bearer ${accessToken}` });
+    if (!isChatSession(data)) {
+      throw new ApiError(`Respuesta de ${url} con forma inesperada`, { url, status });
+    }
+    return data;
+  }
+
+  /**
+   * DELETE /v1/chat/sessions/{id} — borra una conversación (**soft-delete**).
+   *
+   * Deja de aparecer en la lista, deja de ser accesible y `streamChat` con ese
+   * id responde 404. Los mensajes siguen en la base: es lo que permite un
+   * purgado por retención con fecha y una recuperación por soporte.
+   *
+   * **Borrar dos veces lanza `ApiError` la segunda** (404), no vuelve a
+   * responder 204: un 204 sobre una ya borrada diría "ese id existió y era
+   * tuyo", que es justo lo que el 404 uniforme evita. Para el cliente el
+   * desenlace es el mismo, así que conviene tratar el `not_found` de un borrado
+   * como "ya no está" y no como un fallo que mostrar.
+   */
+  async deleteChatSession(accessToken: string, sessionId: string): Promise<void> {
+    const url = `${this.baseUrl}/v1/chat/sessions/${encodeURIComponent(sessionId)}`;
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: "DELETE",
+        headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}` },
+      });
+    } catch (cause) {
+      throw new ApiError(`Fallo de red llamando a ${url}`, { url, status: null, cause });
+    }
+    if (!response.ok) {
+      throw await toApiError(url, response);
+    }
+    // 204 sin cuerpo: no hay nada que parsear ni que devolver.
   }
 }
 

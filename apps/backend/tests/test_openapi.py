@@ -18,6 +18,9 @@ _RUTAS_PROTEGIDAS = {
     ("/v1/users/me", "get"),
     ("/v1/users/me", "patch"),
     ("/v1/chat", "post"),
+    ("/v1/chat/sessions", "get"),
+    ("/v1/chat/sessions/{session_id}", "get"),
+    ("/v1/chat/sessions/{session_id}", "delete"),
 }
 
 

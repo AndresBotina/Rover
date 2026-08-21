@@ -14,7 +14,7 @@ from typing import Any
 
 from fastapi import APIRouter
 
-from app.api.v1 import auth, chat, health, users
+from app.api.v1 import auth, chat, health, sessions, users
 
 # Prefijo de versión en un solo sitio (los routers de dominio no lo repiten).
 API_V1_PREFIX = "/v1"
@@ -55,7 +55,9 @@ TAGS_METADATA: list[dict[str, Any]] = [
             "Conversación con Rover. `POST /v1/chat` responde en **streaming "
             "(SSE)**: el cuerpo no es un JSON sino una secuencia de eventos "
             "`data: {...}` discriminados por `type`. La conversación queda "
-            "persistida, y su dueño es **siempre** el usuario del token."
+            "persistida y se **reenvía como contexto** en los turnos siguientes "
+            "(ventana por tokens). `/v1/chat/sessions` lista, lee y borra esas "
+            "conversaciones; su dueño es **siempre** el usuario del token."
         ),
     },
 ]
@@ -65,3 +67,4 @@ router.include_router(health.router)
 router.include_router(auth.router)
 router.include_router(users.router)
 router.include_router(chat.router)
+router.include_router(sessions.router)

@@ -653,3 +653,117 @@ test("un 429 al abrir el stream conserva Retry-After", async () => {
     (error: unknown) => isRateLimitedError(error) && (error as ApiError).retryAfterSeconds === 30,
   );
 });
+
+// --- Sesiones de chat --------------------------------------------------------
+
+const SESSION_SUMMARY = {
+  id: "0f6c2f9e-1f2a-4c3b-9d5e-8a7b6c5d4e3f",
+  title: "¿Qué hago en Medellín?",
+  created_at: "2026-08-20T15:04:05Z",
+  updated_at: "2026-08-20T15:11:22Z",
+};
+
+test("listChatSessions pide /v1/chat/sessions con el Bearer y tipa la lista", async () => {
+  let request: Request | undefined;
+  globalThis.fetch = async (input, init) => {
+    request = new Request(String(input), init);
+    return jsonResponse({ items: [SESSION_SUMMARY], limit: 50 });
+  };
+
+  const lista = await new ApiClient({ baseUrl: "http://api.test" }).listChatSessions("t0k3n");
+
+  assert.equal(request?.url, "http://api.test/v1/chat/sessions");
+  assert.equal(request?.headers.get("Authorization"), "Bearer t0k3n");
+  assert.deepEqual(lista.items, [SESSION_SUMMARY]);
+});
+
+test("listChatSessions propaga el limit como query", async () => {
+  let calledUrl: string | undefined;
+  globalThis.fetch = async (input) => {
+    calledUrl = String(input);
+    return jsonResponse({ items: [], limit: 10 });
+  };
+
+  await new ApiClient({ baseUrl: "http://api.test" }).listChatSessions("t0k3n", { limit: 10 });
+
+  assert.equal(calledUrl, "http://api.test/v1/chat/sessions?limit=10");
+});
+
+test("getChatSession devuelve el historial en orden", async () => {
+  globalThis.fetch = async () =>
+    jsonResponse({
+      ...SESSION_SUMMARY,
+      messages: [
+        { role: "user", content: "hola", sequence: 0, created_at: "2026-08-20T15:04:05Z" },
+        {
+          role: "assistant",
+          content: "¿a dónde?",
+          sequence: 1,
+          created_at: "2026-08-20T15:04:06Z",
+        },
+      ],
+    });
+
+  const sesion = await new ApiClient({ baseUrl: "http://api.test" }).getChatSession("t0k3n", "abc");
+
+  assert.deepEqual(
+    sesion.messages.map((m) => [m.role, m.sequence]),
+    [
+      ["user", 0],
+      ["assistant", 1],
+    ],
+  );
+});
+
+test("una conversación ajena o inexistente lanza ApiError con not_found", async () => {
+  globalThis.fetch = async () =>
+    jsonResponse(
+      {
+        error: {
+          code: "not_found",
+          message: "No encontramos esa conversación.",
+          details: null,
+          error_id: null,
+        },
+      },
+      404,
+    );
+
+  await assert.rejects(
+    () => new ApiClient({ baseUrl: "http://api.test" }).getChatSession("t0k3n", "de-otro"),
+    (error: unknown) => error instanceof ApiError && error.code === "not_found",
+  );
+});
+
+test("deleteChatSession acepta el 204 sin cuerpo", async () => {
+  let request: Request | undefined;
+  globalThis.fetch = async (input, init) => {
+    request = new Request(String(input), init);
+    return new Response(null, { status: 204 });
+  };
+
+  await new ApiClient({ baseUrl: "http://api.test" }).deleteChatSession("t0k3n", "abc");
+
+  assert.equal(request?.method, "DELETE");
+  assert.equal(request?.url, "http://api.test/v1/chat/sessions/abc");
+});
+
+test("borrar dos veces lanza en la segunda (404 uniforme, no idempotencia)", async () => {
+  globalThis.fetch = async () =>
+    jsonResponse(
+      {
+        error: {
+          code: "not_found",
+          message: "No encontramos esa conversación.",
+          details: null,
+          error_id: null,
+        },
+      },
+      404,
+    );
+
+  await assert.rejects(
+    () => new ApiClient({ baseUrl: "http://api.test" }).deleteChatSession("t0k3n", "ya-borrada"),
+    (error: unknown) => error instanceof ApiError && error.code === "not_found",
+  );
+});
