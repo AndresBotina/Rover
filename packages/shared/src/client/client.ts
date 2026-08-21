@@ -22,6 +22,12 @@ import {
   REQUEST_ID_HEADER,
   type ApiErrorCode,
 } from "../types/error.ts";
+import {
+  parseChatStreamEvent,
+  readSseFrames,
+  type ChatRequest,
+  type ChatStreamEvent,
+} from "../types/chat.ts";
 import { isProfile, type Profile, type ProfileUpdate } from "../types/profile.ts";
 import {
   isDbHealthResponse,
@@ -240,6 +246,83 @@ export class ApiClient {
       throw new ApiError(`Respuesta de ${url} con forma inesperada`, { url, status });
     }
     return data;
+  }
+
+  /**
+   * POST /v1/chat — conversa con Rover y **entrega la respuesta trozo a trozo**.
+   *
+   * Se usa como un `for await`, y cada vuelta es un evento ya tipado:
+   *
+   * ```ts
+   * let texto = "";
+   * for await (const evento of client.streamChat(token, { message: "hola" })) {
+   *   if (evento.type === "start") conversationId = evento.conversation_id;
+   *   else if (evento.type === "delta") texto += evento.text;   // pintar aquí
+   *   else if (evento.type === "error") mostrarError(evento.error.message);
+   * }
+   * ```
+   *
+   * **Los dos sitios por los que puede fallar, y no son el mismo:**
+   *
+   * - *Antes* de que empiece la respuesta (sin token, cuota agotada,
+   *   conversación ajena, el modelo caído) el backend responde con un status
+   *   HTTP normal, así que esto **lanza `ApiError`** como cualquier otro método
+   *   del cliente — con su `code`, su `retryAfterSeconds` y su `requestId`.
+   * - *A mitad* del stream ya no hay status que cambiar: llega un evento
+   *   `{ type: "error" }` con el mismo cuerpo, y el bucle termina después de
+   *   él. No se lanza, porque para entonces puede haber texto en pantalla que
+   *   el usuario está leyendo y tirar una excepción lo borraría.
+   *
+   * Abandonar el `for await` (un `break`, o desmontar la vista) cancela la
+   * lectura y suelta la conexión: el backend lo detecta, cierra su lado y
+   * **descarta la respuesta a medias** — la conversación queda con la pregunta
+   * y sin respuesta, nunca con media respuesta.
+   *
+   * `signal` permite cancelar desde fuera (un botón de "parar"), con la misma
+   * consecuencia.
+   */
+  async *streamChat(
+    accessToken: string,
+    request: ChatRequest,
+    options: { signal?: AbortSignal } = {},
+  ): AsyncGenerator<ChatStreamEvent, void, undefined> {
+    const url = `${this.baseUrl}/v1/chat`;
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          // SSE, no JSON: es lo que se va a recibir y lo que un proxy debe
+          // ver para no intentar transformarlo.
+          Accept: "text/event-stream",
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify(request),
+        // ``?? null`` y no ``options.signal``: con ``exactOptionalPropertyTypes``
+        // el `undefined` explícito no encaja donde el DOM declara `| null`.
+        signal: options.signal ?? null,
+      });
+    } catch (cause) {
+      throw new ApiError(`Fallo de red llamando a ${url}`, { url, status: null, cause });
+    }
+
+    if (!response.ok) {
+      throw await toApiError(url, response);
+    }
+    if (response.body === null) {
+      throw new ApiError(`Respuesta de ${url} sin cuerpo`, { url, status: response.status });
+    }
+
+    for await (const data of readSseFrames(response.body)) {
+      const evento = parseChatStreamEvent(data);
+      // Un marco ilegible o de un tipo desconocido se descarta y el stream
+      // sigue: misma política que el backend con los eventos rotos del
+      // proveedor. Una respuesta a medias en pantalla vale más que un corte.
+      if (evento !== null) {
+        yield evento;
+      }
+    }
   }
 }
 

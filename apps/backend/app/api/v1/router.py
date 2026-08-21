@@ -1,7 +1,8 @@
 """Router agregador de la versión **v1** de la API.
 
 Punto ÚNICO donde se monta `/v1`: los routers de dominio (``health``,
-``auth``, ``users``) se declaran sin versión y este módulo les pone el prefijo.
+``auth``, ``users``, ``chat``) se declaran sin versión y este módulo les pone
+el prefijo.
 Así ``main.py`` no conoce los dominios uno por uno, y publicar una futura
 ``/v2`` es añadir otro agregador en vez de tocar cada `include_router`.
 
@@ -13,7 +14,7 @@ from typing import Any
 
 from fastapi import APIRouter
 
-from app.api.v1 import auth, health, users
+from app.api.v1 import auth, chat, health, users
 
 # Prefijo de versión en un solo sitio (los routers de dominio no lo repiten).
 API_V1_PREFIX = "/v1"
@@ -48,9 +49,19 @@ TAGS_METADATA: list[dict[str, Any]] = [
             "responde *quién soy* además de *cuál es mi perfil*."
         ),
     },
+    {
+        "name": "chat",
+        "description": (
+            "Conversación con Rover. `POST /v1/chat` responde en **streaming "
+            "(SSE)**: el cuerpo no es un JSON sino una secuencia de eventos "
+            "`data: {...}` discriminados por `type`. La conversación queda "
+            "persistida, y su dueño es **siempre** el usuario del token."
+        ),
+    },
 ]
 
 router = APIRouter(prefix=API_V1_PREFIX)
 router.include_router(health.router)
 router.include_router(auth.router)
 router.include_router(users.router)
+router.include_router(chat.router)

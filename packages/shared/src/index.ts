@@ -20,6 +20,22 @@ export {
 export { isProfile, type Profile, type ProfileUpdate } from "./types/profile.ts";
 
 export {
+  isChatDeltaEvent,
+  isChatDoneEvent,
+  isChatErrorEvent,
+  isChatStartEvent,
+  isChatStreamEvent,
+  parseChatStreamEvent,
+  readSseFrames,
+  type ChatDeltaEvent,
+  type ChatDoneEvent,
+  type ChatErrorEvent,
+  type ChatRequest,
+  type ChatStartEvent,
+  type ChatStreamEvent,
+} from "./types/chat.ts";
+
+export {
   isApiErrorResponse,
   parseRetryAfter,
   RATE_LIMITED,

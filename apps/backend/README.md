@@ -691,6 +691,174 @@ al bloque mínimo de 64 tokens del proveedor.
 Los **tests no usan la key**: simulan el transporte HTTP con
 `httpx.MockTransport`, así que el CI pasa sin secretos (`tests/test_llm.py`).
 
+## Chat en streaming — `POST /v1/chat` (HU-2.4)
+
+El endpoint por el que se conversa con Rover. Protegido (HU-1.6), con cuota por
+usuario (HU-1.7), y responde en **Server-Sent Events**: el texto aparece
+mientras el modelo lo escribe en vez de después de quince segundos en blanco.
+La conversación queda persistida en las tablas de la HU-2.3.
+
+Sin herramientas todavía (HU-2.6) y con memoria de **un turno**: la ventana
+multi-turno es la HU-2.5, y su punto de extensión está marcado en
+`app/services/chat.py::build_context`.
+
+### El cuerpo de la petición
+
+```jsonc
+{
+  "message": "¿Qué hago tres días en Medellín?",
+  "conversation_id": null   // ausente o null → conversación nueva
+}
+```
+
+`extra="forbid"`: un campo de más responde 422. Importa más que en un PATCH
+normal — el **dueño de la conversación sale siempre del token**, y un campo que
+pareciera aceptarse invitaría a un cliente a intentarlo.
+
+Si se manda un `conversation_id` que no existe, está borrado o **es de otra
+persona**, la respuesta es la misma en los tres casos: **404 `not_found`**. Un
+403 para el ajeno confirmaría que ese id existe, y convertiría el endpoint en un
+oráculo para averiguar qué conversaciones hay. Es el mismo criterio que hace que
+la ruta de perfil sea `/users/me` y no `/users/{id}`.
+
+### Los eventos del stream
+
+Un marco `data:` por evento, con un JSON **discriminado por `type`**. No se usa
+el campo `event:` del estándar: `EventSource` no sirve aquí (solo hace GET y no
+deja poner cabeceras, así que no podría mandar ni el mensaje ni el Bearer), y
+tener el nombre en dos sitios solo permitiría que discreparan.
+
+| `type` | Cuándo | Contenido |
+|--------|--------|-----------|
+| `start` | siempre, primero | `conversation_id` y `created` (si acaba de nacer) |
+| `delta` | por cada trozo | `text`: el **delta**, no el acumulado |
+| `done`  | fin correcto | `sequence` del mensaje del asistente |
+| `error` | fallo **a mitad** | `error` con el cuerpo de la HU-1.8 |
+
+Concatenar los `text` en orden reconstruye la respuesta. `@rover/shared` trae
+los tipos, los type guards y `client.streamChat(token, { message })`, que lo
+entrega ya tipado con un `for await`.
+
+### Los tres fallos de un endpoint que hace streaming
+
+Un endpoint normal tiene un momento para fallar; este tiene tres, y cambia lo
+que ya se le mandó al cliente:
+
+1. **Antes de abrir el stream** — todavía no salió ninguna cabecera, así que se
+   responde con un **status HTTP normal** y el cuerpo de error de siempre
+   (`503` si el proveedor está caído o sin saldo, `429` si nos limita, `422` si
+   rechazó el mensaje). Para poder hacerlo, el endpoint **le pide el primer
+   trozo al modelo antes de devolver la respuesta**. El precio es que el tiempo
+   hasta la primera cabecera incluye la latencia del modelo; a cambio, "el
+   proveedor está caído" es un error HTTP y no un `200 OK` que se desdice dos
+   bytes después.
+2. **A mitad** — el `200` ya salió. El error va **dentro del SSE**, como evento
+   `type: "error"` con el mismo catálogo de `code`. La causa real (status y
+   mensaje del proveedor) va al log con el `request_id`, nunca al cliente.
+3. **El cliente se va** — no hay a quién responder; lo que importa es cerrar el
+   generador del proveedor (`aclosing`) para no dejar la conexión colgando. La
+   instrumentación lo registra como `llm_outcome=cancelled`: no fue un fallo,
+   pero los tokens se gastaron.
+
+### Qué se persiste (y qué no)
+
+Una sola regla: **el mensaje del usuario se guarda al arrancar el turno; el del
+asistente solo si el stream terminó completo.**
+
+- *Fallo antes del stream* → **no se escribe nada**. Reintentar es limpio: sin
+  conversaciones vacías ni preguntas duplicadas.
+- *Fallo a mitad* y *cliente que se va* → queda la pregunta, **se descarta la
+  respuesta parcial**.
+
+Descartar la parcial es la decisión menos obvia, y no se toma por comodidad:
+esa fila volvería a entrar en el contexto del modelo en el turno siguiente
+(HU-2.5) y el modelo la leería como *"esto respondió Rover"* — una frase cortada
+a mitad, para siempre, contaminando cada turno posterior. Guardarla "para no
+perder los tokens gastados" confunde dos cosas: el consumo ya quedó anotado en
+la línea de instrumentación de la HU-2.1, que es donde se factura (HU-2.8); la
+tabla de mensajes es la **memoria**, no el libro de cuentas.
+
+El resultado es un invariante que cabe en una línea: **toda fila `assistant` es
+una respuesta completa.**
+
+### Que el stream llegue trozo a trozo hasta producción
+
+La respuesta sale con `Cache-Control: no-cache, no-transform`, `Connection:
+keep-alive` y `X-Accel-Buffering: no` (`app/api/sse.py`). Sin ellas el endpoint
+**funciona igual… y llega entero al final**, que es justo lo que esta HU existe
+para evitar. El detalle de los proxies está en [`docs/deploy.md`](../../docs/deploy.md).
+
+### Verificarlo en local (con tu key real)
+
+```bash
+# 1) levanta el backend con ROVER_LLM_API_KEY y ROVER_DATABASE_URL en .env
+uv run uvicorn app.main:app --reload
+
+# 2) consigue un access token (o usa el de tu sesión de Supabase)
+TOKEN=$(curl -s localhost:8000/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"tu@email.com","password":"tu-password"}' | jq -r .session.access_token)
+
+# 3) conversa. --no-buffer es lo que hace visible el streaming en curl:
+#    sin él, curl acumula y lo imprime todo junto al final.
+curl -N --no-buffer localhost:8000/v1/chat \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"¿Qué hago tres días en Medellín?"}'
+```
+
+Se ve aparecer, poco a poco:
+
+```
+data: {"type":"start","conversation_id":"3f1c9d02-…","created":true}
+
+data: {"type":"delta","text":"Tres"}
+
+data: {"type":"delta","text":" días"}
+…
+data: {"type":"done","sequence":1}
+```
+
+Continuar esa misma conversación es mandar su id:
+
+```bash
+curl -N --no-buffer localhost:8000/v1/chat \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"message":"¿Y si llueve?","conversation_id":"3f1c9d02-…"}'
+```
+
+Y comprobar que quedó guardada (contra la base de Supabase, con `psql`):
+
+```sql
+select id, title, created_at from conversations order by created_at desc limit 5;
+
+select sequence, role, left(content, 60) as inicio, tool_steps
+from messages
+where conversation_id = '3f1c9d02-…'
+order by sequence;
+```
+
+```
+ sequence |   role    |                     inicio                      | tool_steps
+----------+-----------+-------------------------------------------------+------------
+        0 | user      | ¿Qué hago tres días en Medellín?                 | []
+        1 | assistant | Tres días dan para conocer Medellín sin correr…  | []
+        2 | user      | ¿Y si llueve?                                   | []
+        3 | assistant | Si llueve, Medellín tiene con qué…              | []
+```
+
+Los `role` alternan y el `sequence` crece sin huecos: ese es el orden que se le
+va a devolver al modelo en la HU-2.5. `tool_steps` sigue vacío — las
+herramientas son la HU-2.6.
+
+Para ver el aborto (fallo 3), corta el `curl` con `Ctrl-C` a mitad de una
+respuesta larga: en el log del servidor sale `llm_outcome=cancelled` con los
+tokens ya gastados, y en la base esa conversación queda **con la pregunta y sin
+respuesta**.
+
+Los **tests no usan la key ni la base real**: el proveedor se sustituye por un
+doble y la base es SQLite (`tests/test_chat.py`).
+
 ## Observabilidad: logs estructurados y id de petición (HU-1.12)
 
 ### Dos formatos, uno por audiencia

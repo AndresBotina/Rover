@@ -490,3 +490,166 @@ test("sin la cabecera (p. ej. un error de proxy) el id queda en null", async () 
   assert.equal(error.requestId, null);
   assert.equal(error.status, 502);
 });
+
+// --- streamChat (SSE) --------------------------------------------------------
+
+/** Respuesta SSE con los chunks dados, como los partiría la red. */
+function sseResponse(...chunks: string[]): Response {
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(encoder.encode(chunk));
+      }
+      controller.close();
+    },
+  });
+  return new Response(body, {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream; charset=utf-8" },
+  });
+}
+
+function marco(payload: unknown): string {
+  return `data: ${JSON.stringify(payload)}\n\n`;
+}
+
+test("streamChat entrega los eventos tipados en orden y manda el Bearer", async () => {
+  let request: Request | undefined;
+  globalThis.fetch = async (input, init) => {
+    request = new Request(String(input), init);
+    return sseResponse(
+      marco({ type: "start", conversation_id: "c-1", created: true }),
+      marco({ type: "delta", text: "Hola, " }),
+      marco({ type: "delta", text: "soy Rover." }),
+      marco({ type: "done", sequence: 1 }),
+    );
+  };
+
+  const eventos = [];
+  let texto = "";
+  for await (const evento of new ApiClient({ baseUrl: "http://api.test" }).streamChat("t0k3n", {
+    message: "hola",
+  })) {
+    eventos.push(evento.type);
+    if (evento.type === "delta") {
+      texto += evento.text;
+    }
+  }
+
+  assert.deepEqual(eventos, ["start", "delta", "delta", "done"]);
+  assert.equal(texto, "Hola, soy Rover.");
+  assert.equal(request?.url, "http://api.test/v1/chat");
+  assert.equal(request?.method, "POST");
+  assert.equal(request?.headers.get("Authorization"), "Bearer t0k3n");
+  assert.equal(request?.headers.get("Accept"), "text/event-stream");
+  assert.deepEqual(await request?.json(), { message: "hola" });
+});
+
+test("un fallo ANTES del stream llega como ApiError, no como evento", async () => {
+  // El backend todavía no había mandado cabeceras: pudo usar un status normal.
+  globalThis.fetch = async () =>
+    jsonResponse(
+      {
+        error: {
+          code: "not_found",
+          message: "No encontramos esa conversación.",
+          details: null,
+          error_id: null,
+        },
+      },
+      404,
+    );
+
+  const stream = new ApiClient({ baseUrl: "http://api.test" }).streamChat("t0k3n", {
+    message: "hola",
+    conversation_id: "de-otro",
+  });
+
+  await assert.rejects(
+    async () => {
+      for await (const evento of stream) {
+        assert.fail(`no debería llegar ningún evento, llegó ${evento.type}`);
+      }
+    },
+    (error: unknown) => error instanceof ApiError && error.code === "not_found",
+  );
+});
+
+test("un fallo A MITAD llega como evento y NO lanza", async () => {
+  // Para entonces puede haber texto en pantalla: lanzar lo borraría.
+  globalThis.fetch = async () =>
+    sseResponse(
+      marco({ type: "start", conversation_id: "c-1", created: true }),
+      marco({ type: "delta", text: "Te cuento: " }),
+      marco({
+        type: "error",
+        error: {
+          code: "service_unavailable",
+          message: "Rover no está disponible en este momento.",
+          details: null,
+          error_id: null,
+        },
+      }),
+    );
+
+  const eventos = [];
+  for await (const evento of new ApiClient({ baseUrl: "http://api.test" }).streamChat("t0k3n", {
+    message: "hola",
+  })) {
+    eventos.push(evento);
+  }
+
+  assert.deepEqual(
+    eventos.map((e) => e.type),
+    ["start", "delta", "error"],
+  );
+  const ultimo = eventos.at(-1);
+  assert.equal(ultimo?.type === "error" && ultimo.error.code, "service_unavailable");
+});
+
+test("streamChat descarta un marco ilegible y sigue", async () => {
+  globalThis.fetch = async () =>
+    sseResponse(
+      marco({ type: "start", conversation_id: "c-1", created: false }),
+      "data: {roto\n\n",
+      marco({ type: "delta", text: "sigo aquí" }),
+    );
+
+  const eventos = [];
+  for await (const evento of new ApiClient({ baseUrl: "http://api.test" }).streamChat("t0k3n", {
+    message: "hola",
+  })) {
+    eventos.push(evento.type);
+  }
+
+  assert.deepEqual(eventos, ["start", "delta"]);
+});
+
+test("un 429 al abrir el stream conserva Retry-After", async () => {
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        error: {
+          code: "rate_limited",
+          message: "Demasiadas peticiones.",
+          details: null,
+          error_id: null,
+        },
+      }),
+      { status: 429, headers: { "Content-Type": "application/json", "Retry-After": "30" } },
+    );
+
+  const stream = new ApiClient({ baseUrl: "http://api.test" }).streamChat("t0k3n", {
+    message: "hola",
+  });
+
+  await assert.rejects(
+    async () => {
+      for await (const evento of stream) {
+        assert.fail(`no debería llegar ningún evento, llegó ${evento.type}`);
+      }
+    },
+    (error: unknown) => isRateLimitedError(error) && (error as ApiError).retryAfterSeconds === 30,
+  );
+});

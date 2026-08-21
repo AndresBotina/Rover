@@ -14,7 +14,11 @@ from app.core.config import Settings, settings
 from app.main import app, create_app
 
 # Rutas protegidas por el middleware: deben declarar el esquema de seguridad.
-_RUTAS_PROTEGIDAS = {("/v1/users/me", "get"), ("/v1/users/me", "patch")}
+_RUTAS_PROTEGIDAS = {
+    ("/v1/users/me", "get"),
+    ("/v1/users/me", "patch"),
+    ("/v1/chat", "post"),
+}
 
 
 @pytest.fixture
@@ -36,7 +40,7 @@ def test_metadatos_de_la_app(spec: dict[str, Any]) -> None:
 
 def test_cada_operacion_tiene_tag_de_dominio_y_resumen(spec: dict[str, Any]) -> None:
     tags_declarados = {tag["name"] for tag in spec["tags"]}
-    assert tags_declarados == {"health", "auth", "users"}
+    assert tags_declarados == {"health", "auth", "users", "chat"}
 
     for path, operaciones in spec["paths"].items():
         for metodo, operacion in operaciones.items():
