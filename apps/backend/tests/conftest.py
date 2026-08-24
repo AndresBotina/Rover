@@ -4,11 +4,11 @@ Dos cosas viven aquí porque son transversales y porque tenerlas repetidas en
 cada módulo ya causó problemas:
 
 1. **Aislamiento del estado global del proceso**: el contador del rate limiting
-   (HU-1.7) y el registro de proveedores de LLM (HU-2.1) viven en la memoria
-   del proceso y sobreviven entre tests. Sin reiniciarlos, un módulo agotaría
-   el cupo del siguiente —haciendo fallar tests que no van de límites— y un
-   doble de proveedor inyectado en un test seguiría atendiendo en el
-   siguiente.
+   (HU-1.7), el registro de proveedores de LLM (HU-2.1) y el catálogo de
+   herramientas con su proveedor de clima (HU-2.6) viven en la memoria del
+   proceso y sobreviven entre tests. Sin reiniciarlos, un módulo agotaría el
+   cupo del siguiente —haciendo fallar tests que no van de límites— y un doble
+   inyectado en un test seguiría atendiendo en el siguiente.
 
 2. **La base de datos de test** (HU-1.13, deuda de la Épica 1). Antes cada
    módulo montaba la suya con ``asyncio.run(...)``, y eso repartía el MISMO
@@ -58,6 +58,8 @@ from sqlalchemy.pool import NullPool
 from app.core import database
 from app.core.rate_limit import reset_rate_limit_store
 from app.services.llm import reset_llm_providers
+from app.services.tools import reset_tool_registry
+from app.services.weather import reset_weather_provider
 
 T = TypeVar("T")
 
@@ -79,6 +81,24 @@ def proveedores_de_llm_aislados() -> Iterator[None]:
     reset_llm_providers()
     yield
     reset_llm_providers()
+
+
+@pytest.fixture(autouse=True)
+def herramientas_aisladas() -> Iterator[None]:
+    """Cada test arranca con el catálogo por defecto y sin proveedor de clima.
+
+    Mismo motivo que la fixture de arriba, y con un filo extra: el catálogo por
+    defecto depende de la CONFIGURACIÓN (la herramienta del clima solo se
+    registra si hay key, ver ``services/tools/registry.py``), así que sin este
+    reinicio un doble inyectado —o un ``monkeypatch`` de los settings— podría
+    sobrevivir al test que lo puso y cambiar qué herramientas ve el modelo en
+    el siguiente.
+    """
+    reset_tool_registry()
+    reset_weather_provider()
+    yield
+    reset_tool_registry()
+    reset_weather_provider()
 
 
 @pytest.fixture

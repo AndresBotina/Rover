@@ -24,6 +24,7 @@ export {
   isChatDoneEvent,
   isChatErrorEvent,
   isChatStartEvent,
+  isChatStatusEvent,
   isChatStreamEvent,
   parseChatStreamEvent,
   readSseFrames,
@@ -32,6 +33,7 @@ export {
   type ChatErrorEvent,
   type ChatRequest,
   type ChatStartEvent,
+  type ChatStatusEvent,
   type ChatStreamEvent,
 } from "./types/chat.ts";
 

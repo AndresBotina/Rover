@@ -8,6 +8,7 @@ import {
   isChatDoneEvent,
   isChatErrorEvent,
   isChatStartEvent,
+  isChatStatusEvent,
   isChatStreamEvent,
   parseChatStreamEvent,
   readSseFrames,
@@ -15,6 +16,7 @@ import {
 
 const START = { type: "start", conversation_id: "c-1", created: true };
 const DELTA = { type: "delta", text: "Hola" };
+const STATUS = { type: "status", tool: "get_weather", message: "Consultando el clima…" };
 const DONE = { type: "done", sequence: 1 };
 const ERROR = {
   type: "error",
@@ -52,6 +54,7 @@ async function recoger(stream: ReadableStream<Uint8Array>): Promise<string[]> {
 test("cada evento se reconoce por su propio guard", () => {
   assert.equal(isChatStartEvent(START), true);
   assert.equal(isChatDeltaEvent(DELTA), true);
+  assert.equal(isChatStatusEvent(STATUS), true);
   assert.equal(isChatDoneEvent(DONE), true);
   assert.equal(isChatErrorEvent(ERROR), true);
 });
@@ -62,6 +65,8 @@ test("los guards NO se confunden entre sí: el discriminante manda", () => {
   assert.equal(isChatDeltaEvent(START), false);
   assert.equal(isChatStartEvent(DELTA), false);
   assert.equal(isChatDoneEvent(ERROR), false);
+  assert.equal(isChatStatusEvent(DELTA), false);
+  assert.equal(isChatDeltaEvent(STATUS), false);
   assert.equal(isChatErrorEvent({ ...DELTA, error: ERROR.error }), false);
 });
 
@@ -70,6 +75,8 @@ test("rechaza eventos con la forma equivocada", () => {
   assert.equal(isChatStartEvent({ ...START, created: "sí" }), false);
   assert.equal(isChatDeltaEvent({ type: "delta", text: 42 }), false);
   assert.equal(isChatDoneEvent({ type: "done", sequence: "1" }), false);
+  assert.equal(isChatStatusEvent({ type: "status", tool: "get_weather" }), false);
+  assert.equal(isChatStatusEvent({ ...STATUS, message: 42 }), false);
   assert.equal(isChatErrorEvent({ type: "error", error: { code: "x" } }), false);
   assert.equal(isChatStreamEvent(null), false);
   assert.equal(isChatStreamEvent([DELTA]), false);
@@ -80,6 +87,27 @@ test("un tipo desconocido no se acepta", () => {
   // A diferencia de ApiErrorCode (que sí admite códigos futuros), aquí el
   // cliente tendría que saber qué HACER con la carga útil.
   assert.equal(isChatStreamEvent({ type: "tool_step", name: "clima" }), false);
+});
+
+test("el evento de estado NO lleva argumentos ni resultado de la herramienta", () => {
+  // El contrato solo tiene `tool` y `message`: lo demás es interno del backend
+  // (se persiste en tool_steps y no se expone). Si alguien añadiera esos campos
+  // al tipo, este test seguiría pasando — lo que vigila es lo contrario: que un
+  // evento con esos campos de más se acepte igual, porque el guard mira lo que
+  // el cliente NECESITA, y que el cliente nunca los lea de aquí.
+  const parseado = parseChatStreamEvent(JSON.stringify(STATUS));
+  assert.deepEqual(parseado, STATUS);
+  assert.deepEqual(Object.keys(STATUS).sort(), ["message", "tool", "type"]);
+});
+
+test("un cliente viejo descarta el evento de estado sin romperse", () => {
+  // La razón por la que el contrato pudo crecer en la HU-2.6 sin versionar
+  // nada: un guard estricto devuelve null para lo que no conoce, y el bucle de
+  // lectura sigue con el marco siguiente en vez de lanzar.
+  const guardViejo = (v: unknown) =>
+    isChatStartEvent(v) || isChatDeltaEvent(v) || isChatDoneEvent(v) || isChatErrorEvent(v);
+  assert.equal(guardViejo(STATUS), false);
+  assert.equal(isChatStreamEvent(STATUS), true);
 });
 
 // --- Parseo de un marco ------------------------------------------------------

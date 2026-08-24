@@ -232,6 +232,61 @@ class Settings(BaseSettings):
     # se MIDE, no se adivina.
     chat_context_chars_per_token: float = Field(default=3.0, gt=0)
 
+    # --- Herramientas del agente (HU-2.6) ------------------------------------
+    # Cuántas llamadas al modelo puede gastar UN turno. El camino normal usa 2
+    # (el modelo pide una herramienta → redacta con el resultado); la tercera
+    # deja sitio a un encadenamiento legítimo —consultar dos ciudades, o
+    # reintentar con el nombre corregido— sin abrirle la puerta a un bucle.
+    #
+    # El límite acota COSTO, no un cuelgue: cada vuelta es una llamada
+    # facturada con un contexto que además crece (arrastra la petición y el
+    # resultado de la anterior), así que un loop descontrolado no se nota como
+    # lentitud sino como una factura. Al llegar al límite la última llamada se
+    # hace SIN ofrecer herramientas, así que el turno siempre termina en una
+    # respuesta escrita (ver app/services/tools/loop.py).
+    tool_loop_max_iterations: int = Field(default=3, ge=1)
+
+    # --- Proveedor de clima (HU-2.6) -----------------------------------------
+    # La herramienta del clima habla con la INTERFAZ de app/services/weather,
+    # nunca con un proveedor concreto. Hoy detrás hay OpenWeatherMap; el punto
+    # de cambio a Open-Meteo (que NO necesita key) es una línea en
+    # app/services/weather/registry.py.
+
+    # API key del proveedor de clima (SECRETO). Hoy la de OpenWeatherMap.
+    #
+    # NO está en _REQUIRED_IN_PRODUCTION, y es deliberado: sin ella la
+    # herramienta del clima simplemente NO SE REGISTRA (el modelo no puede
+    # pedir algo que no se le ofrece) y Rover conversa igual, solo que sin
+    # datos del tiempo. Negarse a arrancar castigaría todo lo demás por una
+    # capacidad opcional — mismo criterio que ROVER_CORS_ORIGINS. El aviso se
+    # da por log al armar el catálogo de herramientas.
+    #
+    # OJO: una key recién creada en OpenWeatherMap tarda un rato en activarse y
+    # responde 401 mientras tanto. Eso se degrada como cualquier otro fallo de
+    # herramienta, con un log explícito que lo dice (ver openweathermap.py).
+    weather_api_key: SecretStr | None = None
+
+    # URL base del proveedor de clima. No es secreta. El default apunta a
+    # OpenWeatherMap; con Open-Meteo cambiaría (o desaparecería) junto con la
+    # implementación.
+    weather_base_url: str = "https://api.openweathermap.org"
+
+    # Idioma en el que el proveedor devuelve la descripción del tiempo
+    # ("nubes dispersas" vs. "scattered clouds") y, si lo tiene, el nombre
+    # local del lugar ("Bogotá", no "Bogota"). El modelo repite lo que le
+    # damos, así que esto se nota en la respuesta.
+    #
+    # Es una sola constante y no "el idioma de la conversación" a propósito: el
+    # modelo traduce mucho mejor de lo que este parámetro selecciona, y hacerlo
+    # variable por petición no aportaría nada a cambio de un camino más.
+    weather_language: str = "es"
+
+    # Timeout de una consulta de clima. Mucho más corto que el del LLM (60 s):
+    # esto ocurre DENTRO de un turno, con el usuario esperando y con una
+    # llamada al modelo todavía por delante. Si el servicio no responde en 10
+    # segundos, la respuesta útil es degradar y seguir, no seguir esperando.
+    weather_timeout_seconds: float = Field(default=10.0, gt=0)
+
     # Campos que no pueden faltar cuando env == "production".
     _REQUIRED_IN_PRODUCTION: ClassVar[tuple[str, ...]] = (
         "database_url",

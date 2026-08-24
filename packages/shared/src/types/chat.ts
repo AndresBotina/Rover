@@ -52,6 +52,30 @@ export interface ChatDeltaEvent {
 }
 
 /**
+ * Rover está consultando una herramienta (HU-2.6).
+ *
+ * Es **informativo**: llega mientras el agente busca un dato en vivo (el clima
+ * de un destino, por ejemplo) y sirve para que la interfaz enseñe algo durante
+ * el silencio de esa fase, que puede durar varios segundos. Ignorarlo no cambia
+ * la respuesta — el texto sigue llegando por `delta` como siempre.
+ *
+ * Trae **solo** el nombre técnico de la herramienta (útil para elegir un icono)
+ * y una frase ya redactada para mostrar. Los argumentos con los que se llamó y
+ * lo que devolvió son internos y **no salen nunca** del backend: se guardan con
+ * el mensaje pero no se exponen ni aquí ni en el historial.
+ *
+ * Puede llegar más de uno en un turno, y puede no llegar ninguno (lo normal:
+ * la mayoría de las preguntas no necesitan herramientas).
+ */
+export interface ChatStatusEvent {
+  type: "status";
+  /** Nombre técnico de la herramienta, p. ej. `"get_weather"`. */
+  tool: string;
+  /** Frase lista para mostrar, en el idioma del backend. */
+  message: string;
+}
+
+/**
  * Fin correcto. Solo llega si la respuesta se completó — que es exactamente
  * cuando el backend la persiste. `sequence` es la posición del mensaje del
  * asistente dentro de la conversación.
@@ -75,7 +99,12 @@ export interface ChatErrorEvent {
 }
 
 /** Cualquier evento del stream de chat. Discriminado por `type`. */
-export type ChatStreamEvent = ChatStartEvent | ChatDeltaEvent | ChatDoneEvent | ChatErrorEvent;
+export type ChatStreamEvent =
+  | ChatStartEvent
+  | ChatDeltaEvent
+  | ChatStatusEvent
+  | ChatDoneEvent
+  | ChatErrorEvent;
 
 /** Type guard de un evento `start`. */
 export function isChatStartEvent(value: unknown): value is ChatStartEvent {
@@ -92,6 +121,17 @@ export function isChatStartEvent(value: unknown): value is ChatStartEvent {
 export function isChatDeltaEvent(value: unknown): value is ChatDeltaEvent {
   const v = asRecord(value);
   return v !== null && v["type"] === "delta" && typeof v["text"] === "string";
+}
+
+/** Type guard del aviso de herramienta en curso. */
+export function isChatStatusEvent(value: unknown): value is ChatStatusEvent {
+  const v = asRecord(value);
+  return (
+    v !== null &&
+    v["type"] === "status" &&
+    typeof v["tool"] === "string" &&
+    typeof v["message"] === "string"
+  );
 }
 
 /** Type guard del fin correcto. */
@@ -116,11 +156,17 @@ export function isChatErrorEvent(value: unknown): value is ChatErrorEvent {
  * admite códigos futuros — allí el cliente solo tiene que MOSTRAR un mensaje
  * que ya viene hecho, mientras que aquí tendría que saber qué hacer con la
  * carga útil de un evento que no existía cuando se compiló.
+ *
+ * Esa estricteza es también lo que hace que el contrato pueda CRECER sin romper
+ * a nadie: cuando el backend estrenó `status` (HU-2.6), los clientes ya
+ * publicados lo descartaron en silencio y siguieron pintando el texto. Un
+ * evento nuevo se ignora; nunca rompe el parseo.
  */
 export function isChatStreamEvent(value: unknown): value is ChatStreamEvent {
   return (
     isChatStartEvent(value) ||
     isChatDeltaEvent(value) ||
+    isChatStatusEvent(value) ||
     isChatDoneEvent(value) ||
     isChatErrorEvent(value)
   );

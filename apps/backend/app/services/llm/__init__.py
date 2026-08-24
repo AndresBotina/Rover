@@ -17,6 +17,13 @@ Cómo se usa desde el resto del backend — siempre así, nunca importando
     async for trozo in provider.stream(mensajes):      # camino de la HU-2.4
         enviar_por_sse(trozo.text)
 
+Con herramientas (HU-2.6) la forma es la misma, con un argumento más: se pasan
+las declaraciones (``tools=[ToolSpec(...)]``) y el modelo puede responder con
+peticiones de herramienta (``Completion.tool_calls``, o fragmentos
+``CompletionChunk.tool_calls`` en streaming) en vez de —o además de— texto.
+Quién las ejecuta y cómo vuelve el resultado es ``app/services/tools``: esta
+capa solo sabe declararlas y traducir lo que el modelo pide.
+
 Mapa de los módulos:
 
 - ``base.py``            — tipos de dominio, ``Capability`` y el ``Protocol``.
@@ -34,6 +41,10 @@ from app.services.llm.base import (
     LLMProvider,
     Message,
     Role,
+    ToolCall,
+    ToolCallAccumulator,
+    ToolCallDelta,
+    ToolSpec,
     Usage,
 )
 from app.services.llm.errors import (
@@ -71,6 +82,10 @@ __all__ = [
     "LLMUnavailable",
     "Message",
     "Role",
+    "ToolCall",
+    "ToolCallAccumulator",
+    "ToolCallDelta",
+    "ToolSpec",
     "Usage",
     "get_llm_provider",
     "reset_llm_providers",

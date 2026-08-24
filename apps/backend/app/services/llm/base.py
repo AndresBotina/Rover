@@ -46,10 +46,10 @@ demuestre con datos reales dónde falla el modelo barato (ver
 ``instrumentation.py`` y docs/backlog.md § Diferido).
 """
 
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol
 
 
 class Capability(StrEnum):
@@ -84,16 +84,149 @@ class Role(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class ToolSpec:
+    """La DECLARACIÓN de una herramienta, tal y como se le presenta al modelo.
+
+    Es lo único que esta capa sabe de las herramientas: un nombre, para qué
+    sirve y qué argumentos admite. **No sabe ejecutarlas** — eso vive en
+    ``app/services/tools`` (HU-2.6), que construye estos ``ToolSpec`` a partir
+    de sus propias herramientas.
+
+    La dependencia va en ese sentido y no al revés a propósito: si el tipo
+    viviera en el paquete de tools, la capa de LLM tendría que importarlo y el
+    proveedor pasaría a depender del registro de herramientas para poder
+    compilar. Así, ``deepseek.py`` traduce una declaración a la forma de su API
+    sin enterarse de que existe una herramienta del clima.
+
+    ``parameters`` es un **JSON Schema** (el objeto ``{"type": "object",
+    "properties": {...}, "required": [...]}``). No se inventa un lenguaje
+    propio de esquemas porque este es el que entienden todas las APIs de
+    function-calling; traducirlo a otra cosa para volver a traducirlo sería la
+    misma capa de más que se descartó con el SDK de OpenAI.
+    """
+
+    name: str
+    description: str
+    parameters: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCall:
+    """El modelo PIDE ejecutar una herramienta. Petición, no resultado.
+
+    ``arguments`` es la cadena JSON **tal cual la emitió el modelo**, sin
+    parsear. Es deliberado: un modelo puede mandar JSON roto o argumentos que
+    no cumplen el esquema, y eso es un caso normal —no una excepción rara— del
+    tool-calling. Si este tipo exigiera un ``dict``, el parseo tendría que
+    ocurrir dentro del proveedor, que es el sitio con menos contexto para
+    decidir qué hacer cuando falla; dejándolo crudo, quien decide es el loop
+    (que puede devolverle el error al modelo para que se corrija).
+
+    ``id`` lo asigna el proveedor y sirve para correlacionar cada resultado con
+    su petición cuando el modelo pide varias herramientas de una vez: el
+    mensaje de rol ``tool`` viaja con ese mismo id.
+    """
+
+    id: str
+    name: str
+    arguments: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallDelta:
+    """Un FRAGMENTO de una petición de herramienta que llega por el stream.
+
+    En streaming, una petición de tool no llega entera: llega repartida en
+    eventos (primero el ``id`` y el nombre, después los argumentos carácter a
+    carácter), y varias peticiones simultáneas se distinguen por ``index``.
+    Reconstruirlas es trabajo de ``ToolCallAccumulator``, que está aquí y no en
+    el proveedor para que cualquier implementación futura lo herede en vez de
+    reimplementar el mismo pegado.
+    """
+
+    index: int
+    id: str | None = None
+    name: str | None = None
+    arguments: str = ""
+
+
+class ToolCallAccumulator:
+    """Pega los ``ToolCallDelta`` de un stream hasta formar ``ToolCall`` enteros.
+
+    Mutable y de usar y tirar: uno por vuelta del loop de herramientas. Es la
+    única pieza con estado de este módulo, y lo es porque el problema lo tiene:
+    el stream entrega trozos y alguien debe acordarse de los anteriores.
+
+    Tolerante con lo que falte —un fragmento sin ``id``, sin nombre o sin
+    argumentos es normal— porque el objetivo es reconstruir lo que el modelo
+    quiso decir, no validarlo: la validación (¿existe esa herramienta? ¿los
+    argumentos son JSON?) es de quien ejecuta.
+    """
+
+    def __init__(self) -> None:
+        # dict y no lista: el ``index`` es la identidad del fragmento, y los
+        # proveedores no garantizan que empiece en 0 ni que llegue en orden.
+        self._partes: dict[int, dict[str, str]] = {}
+
+    def add(self, delta: ToolCallDelta) -> None:
+        """Incorpora un fragmento."""
+        parte = self._partes.setdefault(delta.index, {"id": "", "name": "", "arguments": ""})
+        if delta.id:
+            parte["id"] = delta.id
+        if delta.name:
+            parte["name"] = delta.name
+        # Los argumentos son lo ÚNICO que se concatena: el resto llega entero
+        # en el primer fragmento y se repite (o no) en los siguientes.
+        parte["arguments"] += delta.arguments
+
+    def result(self) -> tuple[ToolCall, ...]:
+        """Las peticiones completas, en el orden de su ``index``.
+
+        Las que se quedaron sin nombre se descartan: son un fragmento que llegó
+        suelto por un stream cortado, y una petición sin nombre no se puede ni
+        ejecutar ni reportarle al modelo como fallida.
+        """
+        return tuple(
+            ToolCall(
+                # Un ``id`` vacío es raro pero no impide seguir: se sintetiza
+                # uno estable con el índice para que el mensaje de resultado
+                # tenga con qué correlacionarse.
+                id=parte["id"] or f"call_{indice}",
+                name=parte["name"],
+                arguments=parte["arguments"],
+            )
+            for indice, parte in sorted(self._partes.items())
+            if parte["name"]
+        )
+
+    def __bool__(self) -> bool:
+        return bool(self._partes)
+
+
+@dataclass(frozen=True, slots=True)
 class Message:
     """Un turno del contexto que se le manda al modelo.
 
     Inmutable a propósito: el contexto se arma y se manda, no se parchea a
     mitad de camino (un ``Message`` mutado después de calcular el presupuesto
     de tokens de la HU-2.5 sería un bug silencioso).
+
+    Los dos campos de herramientas (HU-2.6) son lo que hace posible el
+    multi-turno con el proveedor: el turno del asistente que PIDIÓ herramientas
+    viaja con ``tool_calls``, y cada resultado vuelve como un mensaje de rol
+    ``tool`` con el ``tool_call_id`` de su petición. Ambos con default, así que
+    un ``Message(role=..., content=...)` normal —el 99 % del contexto— se
+    escribe igual que antes.
+
+    Estos mensajes viven SOLO en el turno en curso: no se persisten como filas
+    (ver ``app/models/conversation.py``) ni se reenvían en turnos siguientes
+    (ver ``services/chat.build_context``).
     """
 
     role: Role
     content: str
+    tool_calls: tuple[ToolCall, ...] = ()
+    tool_call_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,12 +267,20 @@ class Completion:
     ``usage`` es opcional porque es información que el proveedor REGALA, no
     algo que el contrato pueda garantizar: un proveedor que no la reporte debe
     poder implementar esta interfaz igual.
+
+    ``tool_calls`` es lo que convierte esto en una respuesta de agente y no de
+    chat: el modelo puede contestar con texto, con peticiones de herramienta, o
+    —aunque es poco común— con las dos cosas (una frase de preámbulo antes de
+    consultar). Por eso son campos independientes y no una unión: "texto O
+    tools" obligaría a un ``isinstance`` en cada llamador para descubrir que en
+    realidad puede haber ambos.
     """
 
     text: str
     model: str
     usage: Usage | None = None
     finish_reason: str | None = None
+    tool_calls: tuple[ToolCall, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,11 +294,18 @@ class CompletionChunk:
     trae ``usage`` y ``finish_reason``: el consumo solo se conoce cuando la
     generación termina, y hacer esperar a ese dato para emitir el último trozo
     de texto añadiría latencia percibida a cambio de nada.
+
+    ``tool_calls`` son FRAGMENTOS (``ToolCallDelta``), no peticiones completas:
+    en streaming los argumentos llegan partidos igual que el texto. Quien
+    consuma el stream los va metiendo en un ``ToolCallAccumulator`` y pide el
+    resultado cuando el stream termina — antes de eso, una petición a medias no
+    se puede ejecutar.
     """
 
     text: str
     finish_reason: str | None = None
     usage: Usage | None = None
+    tool_calls: tuple[ToolCallDelta, ...] = ()
 
 
 class LLMProvider(Protocol):
@@ -191,12 +339,19 @@ class LLMProvider(Protocol):
         system_prompt: str | None = None,
         temperature: float | None = None,
         max_output_tokens: int | None = None,
+        tools: Sequence[ToolSpec] | None = None,
     ) -> Completion:
         """Genera la respuesta completa y la devuelve de una vez.
 
         ``system_prompt`` va SIEMPRE primero (ver el docstring del módulo); si
         es ``None`` se usa el de ``prompt.py``. ``temperature`` y
         ``max_output_tokens`` a ``None`` significan "los de config".
+
+        ``tools`` son las herramientas que el modelo PUEDE pedir en esta
+        llamada (HU-2.6). ``None`` o vacío = ninguna, y entonces esto se
+        comporta exactamente como antes de aquella HU. Ofrecerlas no obliga al
+        modelo a usarlas: decide él, y lo que decidió llega en
+        ``Completion.tool_calls``.
 
         Levanta las excepciones de ``errors.py``: nunca un error del proveedor.
         """
@@ -209,6 +364,7 @@ class LLMProvider(Protocol):
         system_prompt: str | None = None,
         temperature: float | None = None,
         max_output_tokens: int | None = None,
+        tools: Sequence[ToolSpec] | None = None,
     ) -> AsyncGenerator[CompletionChunk]:
         """Igual que ``complete``, pero emitiendo la respuesta por trozos.
 
@@ -230,5 +386,11 @@ class LLMProvider(Protocol):
         petición fue rechazada) o A MITAD del stream (se cortó la conexión);
         en ambos casos salen como excepciones de ``errors.py`` desde el
         ``async for``.
+
+        Con ``tools``, un turno puede no traer NADA de texto: si el modelo
+        decide llamar a una herramienta, todos los chunks vienen con
+        ``text == ""`` y con fragmentos en ``tool_calls``. Quien consuma esto
+        debe estar preparado para ese stream "mudo" — es lo normal en la
+        primera vuelta del loop de herramientas, no un fallo.
         """
         ...

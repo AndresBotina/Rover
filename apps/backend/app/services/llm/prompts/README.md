@@ -9,6 +9,20 @@ medio de la lógica de un endpoint.
 | ---------- | ----------------------------------------------------------------- |
 | `rover.md` | System prompt de personalidad (HU-2.2). Lo carga `../prompt.py`.  |
 
+## Las herramientas NO se enumeran aquí
+
+`rover.md` habla de herramientas **en abstracto** ("cuando las tengas
+disponibles…"), nunca por nombre. Las que existen en cada llamada viajan en su
+propia clave del cuerpo, con su descripción y su esquema
+(`app/services/tools/registry.py`), y esa es la única lista de la que el modelo
+debe fiarse.
+
+Repetirlas en el prompt crearía **dos fuentes de verdad**: el día que se añada
+o se quite una —o que la del clima no se registre por falta de key— el prompt
+seguiría prometiéndola, y el modelo intentaría llamar a algo que no existe. Lo
+que sí vive aquí es la **política**: cuándo usarlas, que no se anuncian, y qué
+hacer cuando fallan.
+
 ## La regla que no se puede romper: esto es una CONSTANTE
 
 El system prompt viaja **primero y siempre igual** en cada llamada al modelo

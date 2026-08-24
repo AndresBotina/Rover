@@ -21,6 +21,8 @@ app/
 ├── api/deps.py        # get_current_user + cuota por usuario + esquema Bearer
 ├── services/auth.py   # Supabase Auth: TODO el acoplamiento al proveedor, aquí
 ├── services/llm/      # proveedor de LLM tras una interfaz (DeepSeek detrás)
+├── services/tools/    # tool-calling: registro, loop y la herramienta del clima
+├── services/weather/  # proveedor de clima tras su interfaz (OpenWeatherMap)
 └── api/v1/
     ├── router.py      # AGREGADOR: monta /v1 y describe los tags de OpenAPI
     ├── health.py      # GET /v1/health y /v1/health/db
@@ -33,9 +35,13 @@ tests/
 ├── test_config.py     # tests de config por ambiente y fail-fast
 ├── test_rate_limit.py # almacén, IP tras el proxy y límites aplicados
 ├── test_llm.py        # capa de LLM SIN llamar a DeepSeek (transporte simulado)
+├── test_tools.py      # registro, validación de argumentos y loop de tools
+├── test_chat_tools.py # el ciclo por /v1/chat: pasos guardados y NO expuestos
+├── test_weather.py    # proveedor de clima SIN llamar a OpenWeatherMap
 ├── conftest.py        # aísla el estado global del proceso entre tests
 └── test_database.py   # tests de la capa DB SIN base real (SQLite en memoria)
 scripts/check_llm.py   # comprobación manual contra el proveedor real (no es test)
+scripts/check_tools.py # el loop de tools contra DeepSeek + clima reales (no es test)
 .env.example           # plantilla de variables (el .env real NUNCA se commitea)
 Dockerfile             # imagen de producción (Python 3.12 slim + uv, no-root)
 docker-compose.yml     # servicio de desarrollo (hot-reload + puerto 8000)
@@ -732,6 +738,7 @@ tener el nombre en dos sitios solo permitiría que discreparan.
 |--------|--------|-----------|
 | `start` | siempre, primero | `conversation_id` y `created` (si acaba de nacer) |
 | `delta` | por cada trozo | `text`: el **delta**, no el acumulado |
+| `status` | mientras se consulta una herramienta (HU-2.6) | `tool` y `message` — **nunca** argumentos ni resultados |
 | `done`  | fin correcto | `sequence` del mensaje del asistente |
 | `error` | fallo **a mitad** | `error` con el cuerpo de la HU-1.8 |
 
@@ -1012,6 +1019,256 @@ curl -s localhost:8000/v1/chat/sessions/<id> -H "$AUTH" | jq '.messages[] | {seq
 curl -s -o /dev/null -w '%{http_code}\n' -X DELETE localhost:8000/v1/chat/sessions/<id> -H "$AUTH"
 # 204 · y luego: no está en la lista, GET da 404 y POST /v1/chat con ese id da 404.
 ```
+
+## Herramientas: tool-calling y el clima (HU-2.6)
+
+Hasta aquí Rover sabía lo que sabía su modelo. Con las herramientas puede
+**consultar datos en vivo**: el modelo decide que necesita uno, el backend lo
+busca, se lo devuelve, y el modelo redacta la respuesta con él — todo dentro del
+mismo turno y con el texto final saliendo por SSE como siempre.
+
+El tool-calling es **directo contra la API del modelo** (function calling nativo,
+formato OpenAI-compatible), sin framework de agentes de por medio: la decisión
+de arquitectura de la épica. Lo que hay es un registro de herramientas, un loop
+y una primera herramienta concreta.
+
+```
+app/services/tools/          la MAQUINARIA (no sabe qué es el clima)
+├── base.py        Tool (Protocol), ToolFailed, parseo/validación de argumentos
+├── registry.py    qué herramientas existen y cómo se le declaran al modelo
+├── loop.py        preguntar → ejecutar → volver a preguntar
+└── weather.py     la primera herramienta concreta
+
+app/services/weather/        el PROVEEDOR de clima, tras su propia abstracción
+├── base.py            WeatherProvider (Protocol) + tipos y errores de dominio
+├── openweathermap.py  implementación (geocoding + clima)
+└── registry.py        quién sirve el clima — EL PUNTO DE CAMBIO
+```
+
+### Añadir una herramienta son dos pasos, y el loop no cambia
+
+1. Una clase que cumpla el `Protocol` `Tool` (nombre, descripción, esquema JSON
+   de parámetros, etiqueta de estado y un `run` async). `weather.py` es el
+   ejemplo a copiar.
+2. Registrarla en `_catalogo_por_defecto` (`registry.py`).
+
+Eso es todo: el loop, el endpoint y el contrato del stream no se tocan.
+
+### El loop, en una frase por caso
+
+- **Cero herramientas** — el modelo responde directo. Es el camino de la mayoría
+  de los turnos, y es byte a byte el de la HU-2.4.
+- **Una** — vuelta 1 pide, se ejecuta, vuelta 2 redacta.
+- **Varias** — o en la misma vuelta (se ejecutan en orden, cada resultado vuelve
+  con el `tool_call_id` de su petición) o encadenadas en vueltas distintas.
+
+**El límite es `ROVER_TOOL_LOOP_MAX_ITERATIONS` (3).** El camino normal gasta 2;
+la tercera deja sitio a un encadenamiento legítimo sin abrirle la puerta a un
+bucle. Acota **costo** más que tiempo: cada vuelta es una llamada facturada con
+un contexto que **crece**, así que un loop descontrolado no se nota como
+lentitud sino como una factura. Y al llegar al límite **no se corta la
+conversación**: la última llamada se hace **sin ofrecer herramientas**, así que
+al modelo solo le queda redactar en prosa con lo que ya tiene.
+
+### Las herramientas se ofrecen SIEMPRE
+
+Todas, en cada llamada, en el mismo orden, y decide el modelo. Filtrar por
+"parece pertinente" exigiría un clasificador —una lista de palabras clave que
+falla con *"¿me llevo chaqueta a Bogotá?"*, u otra llamada a un modelo, más cara
+que la herramienta que se quería ahorrar— y además **rompería el prefijo
+estable**: las definiciones viajan en el mismo cuerpo que el system prompt, así
+que un catálogo que cambia entre turnos tira el caché de DeepSeek en cada
+llamada. La degradación que describe la literatura aparece con catálogos
+**grandes**; con una herramienta no hay problema que resolver. Se revisa cuando
+el catálogo pase de ~10, y la respuesta entonces será **agrupar**, no filtrar.
+
+### Qué ve el cliente durante la fase de herramienta
+
+Un evento `status` con el nombre de la herramienta y una frase hecha
+(`"Consultando el clima…"`). Se emite porque esa fase abre un **silencio de
+varios segundos** —una llamada al modelo que no imprime nada, más una llamada
+HTTP a un tercero— justo en un producto cuya promesa es ver el texto aparecer
+palabra a palabra; sin señal, la pausa es indistinguible de un cuelgue.
+
+Lo que **no** viaja: los argumentos (los escribe el modelo y pueden llevar una
+interpretación equivocada de la pregunta), el resultado (respuesta cruda de un
+tercero) y el estado de una herramienta **que no existe** (anunciar
+"consultando fantasía…" sería exponer una alucinación como si fuera una
+capacidad del producto).
+
+El contrato del stream **crece sin romper nada**: el type guard de
+`@rover/shared` es estricto y descarta lo que no conoce, así que un cliente ya
+publicado ignora el evento nuevo y sigue pintando el texto.
+
+### Fallo de una herramienta: se le cuenta al modelo
+
+Herramienta que no existe, argumentos que no son JSON, API caída o bug nuestro:
+los cuatro terminan en un **mensaje de rol `tool`** que le dice al modelo qué
+pasó. Nunca se aborta el turno.
+
+Que **toda** petición se conteste no es solo elegancia: el formato de cable lo
+**exige**. Si el turno del asistente viaja con tres `tool_calls` y solo se
+contestan dos, el proveedor responde **400** y se cae la conversación entera —
+un fallo de una herramienta convertido en un fallo del chat, que es justo lo que
+esto existe para evitar.
+
+Devolverle el error al modelo en vez de degradar con una frase enlatada, por
+tres razones: (1) **la personalidad ya sabe hacerlo** — el prompt le pide ser
+honesto cuando no tiene un dato, así que escribe *"no pude mirar el clima ahora
+mismo, pero en Bogotá en esta época…"* en el tono y el idioma de la
+conversación; (2) **el turno no era solo la herramienta** — *"¿qué hago en
+Medellín y qué tal el tiempo?"* merece la mitad que sí se puede contestar; (3)
+**a veces el error es corregible** — *"no encontré ningún lugar llamado X"* le
+permite reintentar con el nombre bien escrito.
+
+La causa real (status del proveedor, traza si fue un bug) va al **log** y a
+`tool_steps`; al modelo solo le llega una frase segura.
+
+### Los pasos intermedios: se guardan, no se enseñan
+
+Cada ejecución deja un paso en **`messages.tool_steps`** de la fila del
+asistente (HU-2.3): herramienta, argumentos, resultado o error, causa técnica,
+duración y en qué vuelta ocurrió. El `content` sigue siendo **solo texto
+conversacional**.
+
+Y **no salen por ninguna parte**: ni por el stream, ni por
+`GET /v1/chat/sessions/{id}` (el modelo de respuesta no declara el campo, así
+que no hay filtro que olvidar), ni vuelven al contexto de los turnos siguientes
+(decisión cerrada de la HU-2.5: están caducados, cuestan mucho y la conclusión
+ya vive en `content`). Hay un test que lo vigila con un señuelo dentro del
+resultado de la herramienta.
+
+Hay además una línea de log por ejecución, en `app.tools`, con la misma forma
+que `app.llm`: nombre, resultado y duración, sin una palabra de la conversación.
+
+### La herramienta del clima, y cómo se cambia de proveedor
+
+`get_weather(location, country_code?)`. El proveedor **geocodifica el nombre y
+pide el clima por dentro** (dos llamadas HTTP encadenadas): el llamador pasa
+`"Bogotá"` y recibe un objeto de dominio. Que OpenWeatherMap necesite
+coordenadas es problema suyo, no de la interfaz — si la interfaz fuera
+`geocode()` + `weather(coords)`, estaría copiando su forma y otro proveedor que
+lo resolviera en una llamada obligaría a reescribir a quien las orquesta.
+
+El resultado que ve el modelo es **recortado y con las unidades en el nombre de
+la clave** (`temperature_c`, `wind_kph`), no el JSON crudo:
+
+```json
+{"location":"Bogotá, CO","temperature_c":14.2,"feels_like_c":13.5,
+ "condition":"nubes dispersas","humidity_pct":77,"wind_kph":11.3}
+```
+
+Los errores del proveedor se traducen a **tres** casos de dominio —`NotFound`
+(el lugar no existe), `Unavailable` (caído, timeout, sin cuota, key sin activar)
+y `NotConfigured` (falta la key)— porque llevan a conversaciones distintas:
+*"no encontré ese lugar, ¿me lo concretas?"* y *"el servicio no responde"* no
+son lo mismo.
+
+**Por qué OpenWeatherMap hoy:** geocoding y clima en el mismo servicio y con la
+misma key (un proveedor que dar de alta, un sitio donde mirar cuota) y plan
+gratuito suficiente. No por ser mejor.
+
+**El punto de cambio a Open-Meteo** (la alternativa **sin key**), completo:
+
+1. Escribir `app/services/weather/openmeteo.py` cumpliendo el `Protocol` de
+   `base.py` — unas 80 líneas: dos GET y un parseo, porque su API tiene la misma
+   forma de dos pasos (`geocoding-api.open-meteo.com/v1/search` y
+   `api.open-meteo.com/v1/forecast`).
+2. Cambiar `_construir_proveedor()` en `app/services/weather/registry.py`.
+3. Borrar `ROVER_WEATHER_API_KEY` del entorno.
+
+No se toca el loop, ni el endpoint, ni la definición de la herramienta que ve el
+modelo, ni un solo test del ciclo — **ninguno importa el módulo del proveedor**.
+El único que lo hace es ese `registry.py`, y esa es exactamente la propiedad que
+se compró con la abstracción. (El **uso comercial** de cualquiera de los dos —los
+términos del plan gratuito de OpenWeatherMap, la licencia de atribución de
+Open-Meteo— se revisa en la Épica 5, junto al resto de las APIs de pago.)
+
+> **Sin key, la herramienta no se registra.** El modelo no puede pedir lo que no
+> se le ofrece, así que Rover conversa igual, solo que sin datos del tiempo, y
+> queda un warning en el log. Ofrecer una herramienta que solo puede fallar
+> cuesta tokens en cada llamada para acabar en una degradación evitable.
+>
+> **Una key recién creada tarda en activarse** (hasta un par de horas) y
+> responde **401** mientras tanto. Se degrada como cualquier otro fallo, y el
+> log lo dice explícitamente para que el síntoma no mande a revisar el código.
+
+### Verificarlo en local (con tus keys reales)
+
+**El camino corto**, sin servidor ni token — ejerce el turno completo contra
+DeepSeek y OpenWeatherMap de verdad, y **imprime los `tool_steps`**, que es lo
+único que no se puede mirar desde fuera:
+
+```bash
+cd apps/backend
+uv run python -m scripts.check_tools
+uv run python -m scripts.check_tools "¿me llevo chaqueta a Medellín?"
+```
+
+**El camino completo**, por el endpoint:
+
+```bash
+TOKEN=$(curl -s localhost:8000/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"tu@email.com","password":"tu-password"}' | jq -r .session.access_token)
+AUTH="Authorization: Bearer $TOKEN"; JSON='Content-Type: application/json'
+
+curl -N --no-buffer localhost:8000/v1/chat -H "$AUTH" -H "$JSON" \
+  -d '{"message":"¿Qué tal el clima en Bogotá ahora mismo?"}'
+```
+
+`--no-buffer` es imprescindible: sin él, quien acumula es `curl` y el
+diagnóstico sale mal por su culpa. Lo que debe verse, en este orden:
+
+```
+data: {"type":"start","conversation_id":"…","created":true}
+data: {"type":"status","tool":"get_weather","message":"Consultando el clima…"}
+data: {"type":"delta","text":"En Bogotá"}
+data: {"type":"delta","text":" ahora mismo hay"}
+…
+data: {"type":"done","sequence":1}
+```
+
+Que los **datos son reales** se comprueba contra la fuente, no leyendo la
+respuesta: la temperatura y la condición que diga Rover tienen que coincidir con
+
+```bash
+curl -s "https://api.openweathermap.org/data/2.5/weather?q=Bogota&units=metric&lang=es&appid=$ROVER_WEATHER_API_KEY" \
+  | jq '{temp: .main.temp, cond: .weather[0].description}'
+```
+
+En el log del servidor quedan la ejecución de la herramienta y **las dos**
+llamadas al modelo del turno (la que pidió y la que redactó):
+
+```
+INFO [app.tools] herramienta get_weather → ok (412.7 ms)  tool_iteration=1
+INFO [app.llm]  llamada al LLM deepseek-v4-flash → ok (1120.3 ms)  llm_finish_reason=tool_calls
+INFO [app.llm]  llamada al LLM deepseek-v4-flash → ok (2841.9 ms)  llm_finish_reason=stop
+```
+
+Y que los pasos **quedaron guardados sin haberse expuesto**, con las dos mitades
+de la afirmación:
+
+```bash
+# (a) NO están en el historial que devuelve la API…
+curl -s localhost:8000/v1/chat/sessions/<id> -H "$AUTH" | grep -c tool_steps   # → 0
+
+# (b) …pero SÍ están en la base (psql contra la URL de Supabase):
+psql "$ROVER_DATABASE_URL" -c \
+  "select sequence, role, left(content, 40) as texto,
+          jsonb_array_length(tool_steps) as pasos,
+          tool_steps->0->>'tool' as herramienta,
+          tool_steps->0->'result'->>'temperature_c' as temp
+     from messages where conversation_id = '<id>' order by sequence;"
+```
+
+La fila del asistente debe traer `pasos = 1`, `herramienta = get_weather` y la
+temperatura que se consultó — mientras que el `grep` de arriba devuelve `0`.
+
+Para probar la **degradación** sin romper nada, arranca con una key inválida
+(`ROVER_WEATHER_API_KEY=nope`) y pregunta lo mismo: Rover debe responder que no
+pudo consultarlo y seguir siendo útil, el stream **no** debe traer un evento
+`error`, y en el log debe aparecer la línea del 401 con el aviso de la key.
 
 ## Observabilidad: logs estructurados y id de petición (HU-1.12)
 

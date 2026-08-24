@@ -2,9 +2,34 @@
 
 El primer punto por el que un usuario habla con Rover de verdad: manda un
 mensaje, ve la respuesta aparecer trozo a trozo y la conversación queda
-guardada. Sin herramientas todavía (HU-2.6) y con memoria de UN turno (la
-ventana multi-turno es la HU-2.5, con el punto de extensión ya marcado en
-``services/chat.build_context``).
+guardada. Con memoria multi-turno (HU-2.5) y, desde la HU-2.6, con
+**herramientas**: si el modelo necesita un dato en vivo lo pide, el backend lo
+consulta y el modelo redacta con él.
+
+
+## El turno ya no es "un stream", es un LOOP (HU-2.6)
+
+Lo que este endpoint consume dejó de ser ``provider.stream(...)`` para pasar a
+ser ``ToolLoop.run(...)``, que puede hacer **varias** llamadas al modelo antes
+de que salga la respuesta final. Para el endpoint cambia menos de lo que
+parece, porque el loop emite el mismo flujo de texto y sigue siendo un
+``AsyncGenerator`` que se cierra con ``aclosing``. Lo que sí es nuevo:
+
+- Además de texto, el loop emite eventos de **estado** (``ToolStatus``), que
+  salen por SSE como ``{"type": "status", ...}``. Solo nombre de herramienta y
+  una frase hecha — nunca argumentos ni resultados (ver ``tools/loop.py``).
+- Al terminar, el loop tiene los **pasos intermedios** (``loop.steps``), que se
+  guardan en ``tool_steps`` del mensaje del asistente y **no salen** por el
+  stream ni por ``GET /v1/chat/sessions/{id}``.
+- Un fallo de una herramienta **no llega hasta aquí**: el loop se lo cuenta al
+  modelo y el modelo responde con gracia. Lo que sí sube igual que antes son
+  los fallos del proveedor de LLM (``LLMError``), con los mismos tres momentos
+  de abajo.
+
+Una consecuencia del loop que conviene tener presente: cuando el modelo decide
+usar una herramienta, la **primera** llamada no produce texto. El primer evento
+del turno es entonces el ``status``, y el momento (1) de abajo pasa a cubrir la
+primera llamada completa en vez de su primer token.
 
 
 ## Los tres fallos de un endpoint que hace streaming
@@ -16,8 +41,8 @@ admite una respuesta distinta porque cambia lo que ya se le mandó al cliente:
    key inválida, contexto demasiado largo). Todavía no salió ninguna cabecera,
    así que se responde con un **status HTTP normal** y el cuerpo de error de la
    HU-1.8. Para llegar a esto hay que saberlo antes de empezar a responder, y
-   por eso el endpoint **pide el primer trozo al modelo ANTES de devolver la
-   respuesta** (ver ``_primer_trozo``).
+   por eso el endpoint **pide el primer evento al turno ANTES de devolver la
+   respuesta** (ver ``_primer_evento``).
 
 2. **A MITAD del stream** — ya salió un `200 OK` y puede que texto. Cambiar el
    status es imposible, así que el error va **dentro del SSE**, como un evento
@@ -63,9 +88,9 @@ podría razonar sobre el historial sin conocer la historia de cada turno.
 
 import logging
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 from contextlib import aclosing
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import StreamingResponse
@@ -81,11 +106,17 @@ from app.models import MessageRole
 from app.services import chat
 from app.services.llm import (
     DEFAULT_SYSTEM_PROMPT,
-    CompletionChunk,
     LLMBadRequest,
     LLMError,
     LLMRateLimited,
     get_llm_provider,
+)
+from app.services.tools import (
+    TextDelta,
+    ToolLoop,
+    ToolStatus,
+    TurnEvent,
+    get_tool_registry,
 )
 
 logger = logging.getLogger(__name__)
@@ -206,8 +237,8 @@ class ChatRequest(BaseModel):
     )
 
 
-async def _primer_trozo(stream: AsyncGenerator[CompletionChunk]) -> CompletionChunk | None:
-    """Pide el primer trozo al modelo, aún con la respuesta HTTP sin abrir.
+async def _primer_evento(turno: AsyncGenerator[TurnEvent]) -> TurnEvent | None:
+    """Pide el primer evento al loop, aún con la respuesta HTTP sin abrir.
 
     Es lo que separa el fallo (1) del (2) del docstring del módulo: hasta que
     esto vuelve no se ha enviado ninguna cabecera, así que un rechazo del
@@ -221,9 +252,17 @@ async def _primer_trozo(stream: AsyncGenerator[CompletionChunk]) -> CompletionCh
     "el proveedor está caído" sea un error HTTP normal, que es como los
     clientes ya saben tratarlo.
 
-    Devuelve ``None`` si el modelo no emitió nada: raro, pero no es un fallo.
+    Con herramientas (HU-2.6) ese primer evento puede ser un ``ToolStatus`` en
+    vez de texto: significa que la primera llamada al modelo terminó pidiendo
+    una herramienta. La garantía que importa se mantiene —si el proveedor iba a
+    rechazar la petición, ya lo hizo— y el costo sube: ahora la espera hasta la
+    primera cabecera incluye una llamada entera al modelo, no solo su primer
+    token. Se asume por lo mismo que antes: a cambio, "el proveedor está caído"
+    sigue siendo un error HTTP normal.
+
+    Devuelve ``None`` si el turno no emitió nada: raro, pero no es un fallo.
     """
-    return await anext(stream, None)
+    return await anext(turno, None)
 
 
 @router.post(
@@ -236,7 +275,10 @@ async def _primer_trozo(stream: AsyncGenerator[CompletionChunk]) -> CompletionCh
                 "Stream de eventos SSE. Cada marco es `data: {...}` con un JSON "
                 "discriminado por `type`: `start` (trae el `conversation_id`), "
                 "`delta` (un trozo de texto: concatenarlos en orden reconstruye "
-                "la respuesta), `done` (fin correcto) y `error` (fallo **a mitad** "
+                "la respuesta), `status` (Rover está consultando una herramienta; "
+                "trae su nombre y una frase para mostrar, **nunca** argumentos ni "
+                "resultados, y es puramente informativo: ignorarlo no cambia la "
+                "respuesta), `done` (fin correcto) y `error` (fallo **a mitad** "
                 "del stream, con el mismo cuerpo que un error HTTP)."
             ),
             "content": {"text/event-stream": {"schema": {"type": "string"}}},
@@ -288,15 +330,19 @@ async def chat_stream(
 
     try:
         provider = get_llm_provider()
-        stream = provider.stream(contexto, system_prompt=DEFAULT_SYSTEM_PROMPT)
+        # El catálogo se pide POR PETICIÓN, no al arrancar: es barato y así una
+        # herramienta que depende de la configuración —o del plan del usuario,
+        # el día que eso exista— no queda congelada en el proceso.
+        loop = ToolLoop(provider, registry=get_tool_registry(), system_prompt=DEFAULT_SYSTEM_PROMPT)
+        turno = loop.run(contexto)
     except LLMError as exc:  # el proveedor ni siquiera está configurado
         _log_fallo_del_llm(exc, momento="antes")
         raise _api_error_de(exc) from exc
 
     try:
-        primero = await _primer_trozo(stream)
+        primero = await _primer_evento(turno)
     except LLMError as exc:
-        await stream.aclose()
+        await turno.aclose()
         _log_fallo_del_llm(exc, momento="antes")
         raise _api_error_de(exc) from exc
 
@@ -308,12 +354,13 @@ async def chat_stream(
     except BaseException:
         # Incluye la cancelación: si no se llega a devolver la respuesta, nadie
         # más va a cerrar el generador del proveedor.
-        await stream.aclose()
+        await turno.aclose()
         raise
 
     return StreamingResponse(
         _eventos(
-            stream,
+            turno,
+            loop=loop,
             primero=primero,
             conversation_id=conversacion.id,
             creada=creada,
@@ -324,51 +371,56 @@ async def chat_stream(
 
 
 async def _eventos(
-    stream: AsyncGenerator[CompletionChunk],
+    turno: AsyncGenerator[TurnEvent],
     *,
-    primero: CompletionChunk | None,
+    loop: ToolLoop,
+    primero: TurnEvent | None,
     conversation_id: uuid.UUID,
     creada: bool,
 ) -> AsyncGenerator[str]:
-    """El cuerpo del SSE: ``start`` → ``delta``* → (``done`` | ``error``).
+    """El cuerpo del SSE: ``start`` → (``delta``|``status``)* → (``done`` | ``error``).
 
-    ``aclosing`` sobre el stream del proveedor es lo que hace correcto el caso
+    ``aclosing`` sobre el generador del turno es lo que hace correcto el caso
     del cliente que se va: cuando Starlette detecta la desconexión, cancela la
     tarea que consume este generador, la cancelación entra por el ``yield`` y
-    el ``async with`` cierra el generador de abajo —y con él la conexión HTTP
-    con DeepSeek— en el momento, en vez de dejarla colgando hasta que pase el
-    recolector. Es la razón por la que la HU-2.1 tipó ``stream`` como
-    ``AsyncGenerator`` y no como ``AsyncIterator``.
+    el ``async with`` cierra el generador de abajo —y con él el del proveedor y
+    su conexión HTTP con DeepSeek— en el momento, en vez de dejarla colgando
+    hasta que pase el recolector. Es la razón por la que la HU-2.1 tipó
+    ``stream`` como ``AsyncGenerator`` y no como ``AsyncIterator``, y por la que
+    el loop encadena ``aclosing`` sobre el suyo.
 
     Como la cancelación NO es una ``LLMError``, no la captura nadie aquí: sube,
     el generador se desmonta y el mensaje del asistente no se escribe. Eso es
     lo previsto, no un descuido.
+
+    Solo el TEXTO se acumula en ``partes``: un ``status`` es señal de vida para
+    la interfaz, no parte de la respuesta, y guardarlo contaminaría el
+    ``content`` que vuelve al contexto en el turno siguiente.
     """
     partes: list[str] = []
     try:
         yield sse_event(
             {"type": "start", "conversation_id": str(conversation_id), "created": creada}
         )
-        async with aclosing(stream):
-            # El trozo que se pidió antes de abrir la respuesta no se pierde:
+        async with aclosing(turno):
+            # El evento que se pidió antes de abrir la respuesta no se pierde:
             # es el primero que sale por el cable.
-            if primero is not None and primero.text:
-                partes.append(primero.text)
-                yield sse_event({"type": "delta", "text": primero.text})
-            async for trozo in stream:
-                # El trozo final del proveedor viene sin texto y solo con el
-                # consumo: no hay nada que mandarle al cliente.
-                if not trozo.text:
-                    continue
-                partes.append(trozo.text)
-                yield sse_event({"type": "delta", "text": trozo.text})
+            if primero is not None:
+                yield _marco(primero, partes)
+            async for evento in turno:
+                yield _marco(evento, partes)
     except LLMError as exc:
         _log_fallo_del_llm(exc, momento="a mitad")
         yield sse_error_event(ErrorCode.SERVICE_UNAVAILABLE, _MSG_NO_DISPONIBLE)
         return
 
     try:
-        sequence = await _persistir_respuesta(conversation_id, "".join(partes))
+        # Los pasos intermedios se guardan CON la respuesta, en la misma fila y
+        # en la misma escritura: si el turno no llega a persistirse, tampoco
+        # quedan pasos huérfanos de una respuesta que nadie vio.
+        sequence = await _persistir_respuesta(
+            conversation_id, "".join(partes), tool_steps=loop.steps
+        )
     except SQLAlchemyError:
         # Ni traza ni mensaje: pueden llevar la URL de la base con credenciales
         # (mismo criterio que ``get_current_user``).
@@ -379,8 +431,32 @@ async def _eventos(
     yield sse_event({"type": "done", "sequence": sequence})
 
 
-async def _persistir_respuesta(conversation_id: uuid.UUID, texto: str) -> int:
+def _marco(evento: TurnEvent, partes: list[str]) -> str:
+    """Traduce un evento del turno a su marco SSE, acumulando el texto.
+
+    Un ``match`` exhaustivo y no un ``if`` con un ``else`` genérico: cuando el
+    loop gane un tipo de evento, mypy señalará ESTA función en vez de dejar que
+    el evento nuevo se caiga en silencio por el camino del ``else``.
+    """
+    match evento:
+        case TextDelta(text=texto):
+            partes.append(texto)
+            return sse_event({"type": "delta", "text": texto})
+        case ToolStatus(tool=herramienta, label=etiqueta):
+            # Nombre y frase, y nada más: los argumentos y el resultado son
+            # internos (ver ``tools/loop.py``). El nombre viaja para que un
+            # cliente pueda elegir un icono sin parsear la frase.
+            return sse_event({"type": "status", "tool": herramienta, "message": etiqueta})
+
+
+async def _persistir_respuesta(
+    conversation_id: uuid.UUID, texto: str, *, tool_steps: Sequence[dict[str, Any]] = ()
+) -> int:
     """Guarda el mensaje del asistente en su PROPIA sesión y devuelve su ``sequence``.
+
+    ``tool_steps`` va a su columna, que es **interna**: no la declara ningún
+    modelo de respuesta de la API (ver ``api/v1/sessions.py``), así que no hay
+    filtro que alguien pueda olvidarse de aplicar.
 
     No se reutiliza la sesión que inyectó ``Depends(get_db)`` en el endpoint: el
     cuerpo de un ``StreamingResponse`` se ejecuta DESPUÉS de que la función del
@@ -402,6 +478,7 @@ async def _persistir_respuesta(conversation_id: uuid.UUID, texto: str) -> int:
                 conversation_id=conversation_id,
                 role=MessageRole.ASSISTANT,
                 content=texto,
+                tool_steps=tool_steps,
             )
             return mensaje.sequence
     raise RuntimeError("get_db no entregó una sesión")  # pragma: no cover

@@ -45,6 +45,7 @@ import logging
 import uuid
 from collections.abc import Sequence
 from math import ceil
+from typing import Any
 
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -134,8 +135,17 @@ async def append_message(
     conversation_id: uuid.UUID,
     role: MessageRole,
     content: str,
+    tool_steps: Sequence[dict[str, Any]] | None = None,
 ) -> Message:
     """Añade un mensaje al final del hilo y lo commitea.
+
+    ``tool_steps`` son los pasos intermedios del tool-calling que produjeron
+    este mensaje (HU-2.6): qué herramienta, con qué argumentos, qué devolvió.
+    Van en la MISMA fila y en su propia columna —``content`` es lo público,
+    ``tool_steps`` es lo interno (ver ``models/conversation.py``)— y el default
+    ``None`` deja la lista vacía, que es lo que tiene un turno sin
+    herramientas. Se copia a una lista nueva porque quien la pasa (el loop)
+    sigue siendo dueño de la suya.
 
     Reintenta UNA vez ante ``IntegrityError``: dos peticiones simultáneas de la
     misma conversación (dos pestañas abiertas) pueden calcular el mismo
@@ -166,6 +176,7 @@ async def append_message(
             role=role,
             sequence=await next_sequence(db, conversation_id),
             content=content,
+            tool_steps=[] if tool_steps is None else [dict(paso) for paso in tool_steps],
         )
         db.add(mensaje)
         await db.execute(

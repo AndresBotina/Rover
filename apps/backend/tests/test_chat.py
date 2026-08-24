@@ -14,6 +14,7 @@ falla ruidosamente si se rompe.
 import json
 import uuid
 from collections.abc import AsyncGenerator, Iterator, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -37,10 +38,13 @@ from app.services.llm import (
     LLMProvider,
     LLMRateLimited,
     LLMUnavailable,
+    ToolCallDelta,
+    ToolSpec,
     set_llm_provider,
 )
 from app.services.llm import Message as LLMMessage
 from app.services.llm import Role as LLMRole
+from app.services.tools import ToolLoop, ToolRegistry
 from tests import auth_utils
 from tests.conftest import BaseDeTest
 
@@ -53,14 +57,33 @@ def _entorno(monkeypatch: pytest.MonkeyPatch) -> None:
 # --- Doble del proveedor -----------------------------------------------------
 
 
-class ProveedorDeChat:
-    """Proveedor de mentira con los tres finales del stream y contador de cierres.
+@dataclass(frozen=True)
+class Vuelta:
+    """Lo que el proveedor de mentira responde en UNA llamada del loop (HU-2.6).
 
-    ``fallo_en`` inyecta un error del proveedor: en ``0`` falla ANTES del primer
-    trozo (el caso que todavía puede salir como status HTTP), y en ``n > 0``
-    falla ya empezado el stream. ``cerrado`` registra si alguien llamó a
-    ``aclose()`` — es lo único que distingue un cliente que se va limpiamente
-    de una conexión con DeepSeek que queda colgando.
+    Un turno con herramientas son varias vueltas: la primera pide, la última
+    redacta. ``tool_calls`` es ``(nombre, argumentos_json)`` — los argumentos
+    van crudos a propósito, que es como llegan del modelo real.
+    """
+
+    trozos: Sequence[str] = ()
+    tool_calls: Sequence[tuple[str, str]] = ()
+
+
+class ProveedorDeChat:
+    """Proveedor de mentira: los tres finales del stream y el guion del loop.
+
+    ``fallo_en`` inyecta un error del proveedor **en la primera vuelta**: en
+    ``0`` falla ANTES del primer trozo (el caso que todavía puede salir como
+    status HTTP), y en ``n > 0`` falla ya empezado el stream. ``cerrado``
+    registra si alguien llamó a ``aclose()`` — es lo único que distingue un
+    cliente que se va limpiamente de una conexión con DeepSeek que queda
+    colgando.
+
+    ``guion`` describe el turno vuelta a vuelta (HU-2.6). Si el loop pide más
+    vueltas de las escritas, se repite la última: así se simula un modelo que
+    INSISTE en llamar a la herramienta, y lo que corta es el límite del loop y
+    no el doble.
     """
 
     def __init__(
@@ -69,14 +92,20 @@ class ProveedorDeChat:
         *,
         fallo_en: int | None = None,
         error: LLMError | None = None,
+        guion: Sequence[Vuelta] | None = None,
     ) -> None:
-        self._trozos = list(trozos)
+        self._guion = list(guion) if guion else [Vuelta(trozos=list(trozos))]
         self._fallo_en = fallo_en
         self._error = error or LLMUnavailable("Rover no está disponible.")
         self.cerrado = False
         self.recibido: list[LLMMessage] = []
         self.system_prompt: str | None = None
         self.llamadas = 0
+        #: El contexto de CADA vuelta, para poder afirmar que el resultado de
+        #: la herramienta volvió al modelo.
+        self.contextos: list[list[LLMMessage]] = []
+        #: Los nombres de herramienta ofrecidos en cada vuelta.
+        self.tools_ofrecidas: list[tuple[str, ...]] = []
 
     @property
     def model(self) -> str:
@@ -93,8 +122,9 @@ class ProveedorDeChat:
         system_prompt: str | None = None,
         temperature: float | None = None,
         max_output_tokens: int | None = None,
+        tools: Sequence[ToolSpec] | None = None,
     ) -> Completion:  # pragma: no cover - el chat solo usa streaming
-        return Completion(text="".join(self._trozos), model=self.model)
+        return Completion(text="".join(self._guion[0].trozos), model=self.model)
 
     async def stream(
         self,
@@ -103,21 +133,47 @@ class ProveedorDeChat:
         system_prompt: str | None = None,
         temperature: float | None = None,
         max_output_tokens: int | None = None,
+        tools: Sequence[ToolSpec] | None = None,
     ) -> AsyncGenerator[CompletionChunk]:
         self.recibido = list(messages)
+        self.contextos.append(list(messages))
+        self.tools_ofrecidas.append(tuple(t.name for t in tools) if tools else ())
         self.system_prompt = system_prompt
         self.llamadas += 1
+        primera = self.llamadas == 1
+        vuelta = self._guion[min(self.llamadas - 1, len(self._guion) - 1)]
         try:
-            for indice, trozo in enumerate(self._trozos):
-                if self._fallo_en == indice:
+            for indice, trozo in enumerate(vuelta.trozos):
+                if primera and self._fallo_en == indice:
                     raise self._error
                 yield CompletionChunk(text=trozo)
-            if self._fallo_en == len(self._trozos):
+            if primera and self._fallo_en == len(vuelta.trozos):
                 raise self._error
+            # Las peticiones de herramienta llegan FRAGMENTADAS, como en el
+            # proveedor real: primero el id y el nombre, después los argumentos
+            # a pedazos. Si el doble las mandara enteras, el acumulador de la
+            # HU-2.1 —que es justo la pieza que reconstruye esto— no se
+            # ejercería nunca.
+            for posicion, (nombre, argumentos) in enumerate(vuelta.tool_calls):
+                yield CompletionChunk(
+                    text="",
+                    tool_calls=(ToolCallDelta(index=posicion, id=f"call_{posicion}", name=nombre),),
+                )
+                for pedazo in _en_pedazos(argumentos):
+                    yield CompletionChunk(
+                        text="", tool_calls=(ToolCallDelta(index=posicion, arguments=pedazo),)
+                    )
             # Trozo final sin texto, como el real: solo trae el consumo.
-            yield CompletionChunk(text="", finish_reason="stop")
+            yield CompletionChunk(
+                text="", finish_reason="tool_calls" if vuelta.tool_calls else "stop"
+            )
         finally:
             self.cerrado = True
+
+
+def _en_pedazos(texto: str, tamano: int = 5) -> list[str]:
+    """Trocea una cadena, para simular argumentos que llegan por el stream."""
+    return [texto[i : i + tamano] for i in range(0, len(texto), tamano)] or [""]
 
 
 @pytest.fixture
@@ -627,10 +683,13 @@ def test_el_aborto_del_cliente_cierra_el_generador_y_no_persiste_nada(
     conversation_id = uuid.uuid4()
 
     async def a_medias() -> list[dict[str, Any]]:
-        stream = doble.stream([LLMMessage(role=LLMRole.USER, content="hola")])
-        primero = await anext(stream)
+        # Por el LOOP, que es lo que consume el endpoint desde la HU-2.6: el
+        # cierre tiene que atravesarlo hasta el generador del proveedor.
+        loop = ToolLoop(doble, registry=ToolRegistry())
+        turno = loop.run([LLMMessage(role=LLMRole.USER, content="hola")])
+        primero = await anext(turno)
         eventos = chat_endpoint._eventos(
-            stream, primero=primero, conversation_id=conversation_id, creada=True
+            turno, loop=loop, primero=primero, conversation_id=conversation_id, creada=True
         )
         leidos = [await anext(eventos), await anext(eventos)]
         # El cliente se va: nadie vuelve a pedir un trozo.

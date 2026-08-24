@@ -45,6 +45,10 @@ from app.services.llm import (
     LLMUnavailable,
     Message,
     Role,
+    ToolCall,
+    ToolCallAccumulator,
+    ToolCallDelta,
+    ToolSpec,
     Usage,
     get_llm_provider,
     set_llm_provider,
@@ -739,6 +743,7 @@ class _ProveedorDeMentira:
         system_prompt: str | None = None,
         temperature: float | None = None,
         max_output_tokens: int | None = None,
+        tools: Sequence[ToolSpec] | None = None,
     ) -> Completion:
         self.recibido = list(messages)
         return Completion(text="".join(self._trozos), model=self.model)
@@ -750,6 +755,7 @@ class _ProveedorDeMentira:
         system_prompt: str | None = None,
         temperature: float | None = None,
         max_output_tokens: int | None = None,
+        tools: Sequence[ToolSpec] | None = None,
     ) -> AsyncGenerator[CompletionChunk]:
         self.recibido = list(messages)
         for trozo in self._trozos:
@@ -865,3 +871,273 @@ def test_el_logger_del_llm_no_emite_nada_al_importar(caplog: pytest.LogCaptureFi
 
         assert capa.get_llm_provider is get_llm_provider
     assert caplog.records == []
+
+
+# --- Tool-calling en la capa de LLM (HU-2.6) ---------------------------------
+
+
+TOOL_DEL_CLIMA = ToolSpec(
+    name="get_weather",
+    description="Consulta el clima actual de un lugar.",
+    parameters={
+        "type": "object",
+        "properties": {"location": {"type": "string"}},
+        "required": ["location"],
+    },
+)
+
+
+def test_sin_tools_el_cuerpo_no_lleva_la_clave(loop_de_test: BlockingPortal) -> None:
+    """Una llamada sin herramientas es byte a byte la de antes de la HU-2.6.
+
+    Importa para el caché: si la clave apareciera vacía, el prefijo de TODAS
+    las peticiones cambiaría el día que se añadió el tool-calling.
+    """
+    proveedor, espia = _proveedor(_json_handler(_respuesta_completa()))
+
+    loop_de_test.call(lambda: proveedor.complete(MENSAJES))
+
+    assert "tools" not in espia.cuerpo
+
+
+def test_las_tools_viajan_en_el_formato_OpenAI(loop_de_test: BlockingPortal) -> None:
+    """El envoltorio ``{"type": "function", ...}`` es ruido del proveedor y se queda aquí."""
+    proveedor, espia = _proveedor(_json_handler(_respuesta_completa()))
+
+    loop_de_test.call(lambda: proveedor.complete(MENSAJES, tools=[TOOL_DEL_CLIMA]))
+
+    assert espia.cuerpo["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Consulta el clima actual de un lugar.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                },
+            },
+        }
+    ]
+
+
+def test_el_orden_del_prefijo_estable_no_cambia_con_tools(
+    loop_de_test: BlockingPortal,
+) -> None:
+    """El system prompt sigue primero y las tools van en su propia clave."""
+    proveedor, espia = _proveedor(_json_handler(_respuesta_completa()))
+
+    loop_de_test.call(lambda: proveedor.complete(MENSAJES, tools=[TOOL_DEL_CLIMA]))
+
+    cuerpo = espia.cuerpo
+    assert cuerpo["messages"][0]["role"] == "system"
+    assert cuerpo["messages"][0]["content"] == DEFAULT_SYSTEM_PROMPT
+    # Las definiciones NO son un mensaje más: van fuera de la lista.
+    assert all("tool" not in m["role"] for m in cuerpo["messages"])
+
+
+def test_el_multiturno_con_tools_viaja_completo(loop_de_test: BlockingPortal) -> None:
+    """Los tres tipos de mensaje del ida y vuelta, con el ``tool_call_id``.
+
+    Sin ese id el proveedor no sabe a qué petición responde el resultado y
+    devuelve 400 — y con varias herramientas a la vez es lo único que las
+    distingue.
+    """
+    proveedor, espia = _proveedor(_json_handler(_respuesta_completa()))
+    peticion = ToolCall(id="call_abc", name="get_weather", arguments='{"location":"Bogotá"}')
+    contexto = [
+        Message(role=Role.USER, content="¿qué tal el clima?"),
+        Message(role=Role.ASSISTANT, content="", tool_calls=(peticion,)),
+        Message(role=Role.TOOL, content='{"temperature_c": 14.2}', tool_call_id="call_abc"),
+    ]
+
+    loop_de_test.call(lambda: proveedor.complete(contexto))
+
+    _, usuario, asistente, resultado = espia.cuerpo["messages"]
+    assert usuario == {"role": "user", "content": "¿qué tal el clima?"}
+    assert asistente == {
+        "role": "assistant",
+        # ``content`` va como cadena vacía y NO se omite: algunos proveedores
+        # OpenAI-compatibles rechazan el mensaje sin la clave.
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_abc",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"location":"Bogotá"}'},
+            }
+        ],
+    }
+    assert resultado == {
+        "role": "tool",
+        "content": '{"temperature_c": 14.2}',
+        "tool_call_id": "call_abc",
+    }
+
+
+def test_una_respuesta_con_tool_calls_se_parsea_a_dominio(
+    loop_de_test: BlockingPortal,
+) -> None:
+    cuerpo = {
+        "id": "chatcmpl-1",
+        "model": "deepseek-v4-flash",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_0",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"location":"Bogotá"}',
+                            },
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+    }
+    proveedor, _ = _proveedor(_json_handler(cuerpo))
+
+    completion = loop_de_test.call(lambda: proveedor.complete(MENSAJES, tools=[TOOL_DEL_CLIMA]))
+
+    assert completion.text == ""
+    assert completion.finish_reason == "tool_calls"
+    (llamada,) = completion.tool_calls
+    assert llamada.id == "call_0"
+    assert llamada.name == "get_weather"
+    # Los argumentos van CRUDOS: el parseo es de quien ejecuta, que es quien
+    # puede decidir qué hacer si el modelo mandó JSON roto.
+    assert llamada.arguments == '{"location":"Bogotá"}'
+
+
+def test_una_peticion_sin_nombre_se_descarta(loop_de_test: BlockingPortal) -> None:
+    """No se puede ni ejecutar ni reportar como fallida: colarla es peor."""
+    cuerpo = {
+        "model": "deepseek-v4-flash",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "call_0", "function": {"arguments": "{}"}}],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+    }
+    proveedor, _ = _proveedor(_json_handler(cuerpo))
+
+    assert loop_de_test.call(lambda: proveedor.complete(MENSAJES)).tool_calls == ()
+
+
+def test_el_stream_reconstruye_una_peticion_partida_en_fragmentos(
+    loop_de_test: BlockingPortal,
+) -> None:
+    """El caso real: el nombre llega en un evento y los argumentos a pedazos."""
+    sse = "".join(
+        [
+            _evento_sse(
+                {
+                    "model": "deepseek-v4-flash",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_0",
+                                        "type": "function",
+                                        "function": {"name": "get_weather", "arguments": ""},
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                }
+            ),
+            *[
+                _evento_sse(
+                    {
+                        "model": "deepseek-v4-flash",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [{"index": 0, "function": {"arguments": pedazo}}]
+                                },
+                            }
+                        ],
+                    }
+                )
+                for pedazo in ['{"loc', 'ation"', ':"Bogo', 'tá"}']
+            ],
+            _evento_sse(
+                {
+                    "model": "deepseek-v4-flash",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+    proveedor, _ = _proveedor(_sse_handler(sse))
+
+    async def leer() -> tuple[str, tuple[ToolCall, ...]]:
+        acumulador = ToolCallAccumulator()
+        texto = ""
+        async with aclosing(proveedor.stream(MENSAJES, tools=[TOOL_DEL_CLIMA])) as stream:
+            async for trozo in stream:
+                texto += trozo.text
+                for fragmento in trozo.tool_calls:
+                    acumulador.add(fragmento)
+        return texto, acumulador.result()
+
+    texto, llamadas = loop_de_test.call(leer)
+
+    # El stream es "mudo": todo el turno vino sin una palabra de texto.
+    assert texto == ""
+    (llamada,) = llamadas
+    assert llamada.name == "get_weather"
+    assert llamada.arguments == '{"location":"Bogotá"}'
+
+
+def test_el_acumulador_distingue_varias_peticiones_por_su_indice() -> None:
+    acumulador = ToolCallAccumulator()
+    acumulador.add(ToolCallDelta(index=1, id="call_1", name="otra"))
+    acumulador.add(ToolCallDelta(index=0, id="call_0", name="una"))
+    acumulador.add(ToolCallDelta(index=0, arguments='{"a":'))
+    acumulador.add(ToolCallDelta(index=1, arguments='{"b":2}'))
+    acumulador.add(ToolCallDelta(index=0, arguments="1}"))
+
+    # Ordenadas por índice, no por orden de llegada.
+    assert [(c.id, c.name, c.arguments) for c in acumulador.result()] == [
+        ("call_0", "una", '{"a":1}'),
+        ("call_1", "otra", '{"b":2}'),
+    ]
+
+
+def test_el_acumulador_descarta_lo_que_llego_sin_nombre() -> None:
+    """Un fragmento suelto de un stream cortado no es una petición."""
+    acumulador = ToolCallAccumulator()
+    acumulador.add(ToolCallDelta(index=0, arguments='{"a":1}'))
+
+    assert bool(acumulador) is True
+    assert acumulador.result() == ()
+
+
+def test_el_acumulador_sintetiza_un_id_si_el_proveedor_no_lo_manda() -> None:
+    """Raro, pero sin id el resultado no tendría con qué correlacionarse."""
+    acumulador = ToolCallAccumulator()
+    acumulador.add(ToolCallDelta(index=3, name="una", arguments="{}"))
+
+    (llamada,) = acumulador.result()
+    assert llamada.id == "call_3"

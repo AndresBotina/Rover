@@ -95,6 +95,10 @@ from app.services.llm.base import (
     Completion,
     CompletionChunk,
     Message,
+    Role,
+    ToolCall,
+    ToolCallDelta,
+    ToolSpec,
     Usage,
 )
 from app.services.llm.errors import (
@@ -191,6 +195,7 @@ class DeepSeekProvider:
         system_prompt: str | None = None,
         temperature: float | None = None,
         max_output_tokens: int | None = None,
+        tools: Sequence[ToolSpec] | None = None,
     ) -> Completion:
         payload = self._payload(
             messages,
@@ -198,6 +203,7 @@ class DeepSeekProvider:
             temperature=temperature,
             max_output_tokens=max_output_tokens,
             stream=False,
+            tools=tools,
         )
         inicio = time.perf_counter()
         resultado: Outcome = "error"
@@ -234,6 +240,7 @@ class DeepSeekProvider:
         system_prompt: str | None = None,
         temperature: float | None = None,
         max_output_tokens: int | None = None,
+        tools: Sequence[ToolSpec] | None = None,
     ) -> AsyncGenerator[CompletionChunk]:
         """Reexpone el stream de DeepSeek como el async generator de la interfaz.
 
@@ -249,6 +256,7 @@ class DeepSeekProvider:
             temperature=temperature,
             max_output_tokens=max_output_tokens,
             stream=True,
+            tools=tools,
         )
         inicio = time.perf_counter()
         primer_trozo: float | None = None
@@ -385,6 +393,7 @@ class DeepSeekProvider:
         temperature: float | None,
         max_output_tokens: int | None,
         stream: bool,
+        tools: Sequence[ToolSpec] | None = None,
     ) -> dict[str, Any]:
         """Arma el cuerpo, con el system prompt SIEMPRE de primero.
 
@@ -410,7 +419,7 @@ class DeepSeekProvider:
             "model": self._model,
             "messages": [
                 {"role": "system", "content": prompt},
-                *({"role": m.role.value, "content": m.content} for m in messages),
+                *(_mensaje_de_cable(m) for m in messages),
             ],
             "temperature": self._temperature if temperature is None else temperature,
             "max_tokens": (
@@ -418,6 +427,16 @@ class DeepSeekProvider:
             ),
             "stream": stream,
         }
+        if tools:
+            # Las definiciones viajan en su propia clave del cuerpo, no como un
+            # mensaje: el proveedor las coloca donde le corresponde. Lo que sí
+            # depende de nosotros —y es lo que importa para el caché— es que
+            # sean IDÉNTICAS y en el MISMO ORDEN en cada llamada de un mismo
+            # despliegue. Por eso el registro las entrega ordenadas (ver
+            # ``services/tools/registry.py``) y aquí no se reordenan ni se
+            # filtran por petición: un catálogo que cambia de orden entre
+            # turnos invalidaría el prefijo sin que nada se pusiera rojo.
+            cuerpo["tools"] = [_tool_de_cable(t) for t in tools]
         if self._thinking != _THINKING_OMITIDO:
             cuerpo["thinking"] = {"type": self._thinking}
         if stream:
@@ -425,6 +444,56 @@ class DeepSeekProvider:
             # camino principal quedaría vacía.
             cuerpo["stream_options"] = {"include_usage": True}
         return cuerpo
+
+
+# --- Traducción al formato de cable ------------------------------------------
+
+
+def _tool_de_cable(tool: ToolSpec) -> dict[str, Any]:
+    """``ToolSpec`` → la forma que espera la API OpenAI-compatible.
+
+    El envoltorio ``{"type": "function", "function": {...}}`` existe porque el
+    formato preveía otros tipos de herramienta además de las funciones. Es
+    ruido del proveedor, y por eso se queda aquí: ``ToolSpec`` no lo conoce.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": dict(tool.parameters),
+        },
+    }
+
+
+def _mensaje_de_cable(mensaje: Message) -> dict[str, Any]:
+    """``Message`` → un elemento de ``messages``, con lo de tools si lo trae.
+
+    Los tres casos del multi-turno con herramientas, y por qué cada campo:
+
+    - **Turno normal** (user/assistant/system): ``role`` + ``content``, igual
+      que antes de la HU-2.6.
+    - **El asistente PIDE herramientas**: lleva además ``tool_calls``. El
+      ``content`` va como cadena vacía y no se omite — algunos proveedores
+      OpenAI-compatibles rechazan el mensaje sin la clave.
+    - **El RESULTADO de una herramienta**: ``role="tool"`` + el
+      ``tool_call_id`` de la petición que lo produjo. Sin ese id el proveedor
+      no sabe a qué petición responde y devuelve 400; con varias herramientas
+      pedidas a la vez, es lo único que las distingue.
+    """
+    cuerpo: dict[str, Any] = {"role": mensaje.role.value, "content": mensaje.content}
+    if mensaje.tool_calls:
+        cuerpo["tool_calls"] = [
+            {
+                "id": llamada.id,
+                "type": "function",
+                "function": {"name": llamada.name, "arguments": llamada.arguments},
+            }
+            for llamada in mensaje.tool_calls
+        ]
+    if mensaje.role is Role.TOOL and mensaje.tool_call_id is not None:
+        cuerpo["tool_call_id"] = mensaje.tool_call_id
+    return cuerpo
 
 
 # --- Traducción de errores ---------------------------------------------------
@@ -568,6 +637,7 @@ def _parse_completion(body: dict[str, Any], *, fallback_model: str) -> Completio
         model=modelo if isinstance(modelo, str) and modelo else fallback_model,
         usage=_parse_usage(body),
         finish_reason=finish if isinstance(finish, str) else None,
+        tool_calls=_parse_tool_calls(mensaje.get("tool_calls")),
     )
 
 
@@ -595,9 +665,81 @@ def _parse_chunk(evento: dict[str, Any], *, fallback_model: str) -> tuple[Comple
             text=_texto(delta.get("content")) if isinstance(delta, dict) else "",
             finish_reason=finish if isinstance(finish, str) else None,
             usage=_parse_usage(evento),
+            tool_calls=(
+                _parse_tool_call_deltas(delta.get("tool_calls")) if isinstance(delta, dict) else ()
+            ),
         ),
         modelo if isinstance(modelo, str) and modelo else fallback_model,
     )
+
+
+def _parse_tool_calls(valor: Any) -> tuple[ToolCall, ...]:
+    """``message.tool_calls`` → peticiones de herramienta del dominio.
+
+    Se descarta lo que llegue sin nombre: una petición sin nombre no se puede
+    ni ejecutar ni reportar como fallida, así que colarla obligaría a cada
+    consumidor a volver a comprobarlo.
+
+    ``arguments`` se deja como la CADENA que mandó el modelo, sin parsear —ver
+    ``ToolCall`` en ``base.py`` para por qué el parseo es de quien ejecuta y no
+    del proveedor.
+    """
+    if not isinstance(valor, list):
+        return ()
+    llamadas: list[ToolCall] = []
+    for indice, cruda in enumerate(valor):
+        if not isinstance(cruda, dict):
+            continue
+        funcion = cruda.get("function")
+        funcion = funcion if isinstance(funcion, dict) else {}
+        nombre = _texto(funcion.get("name"))
+        if not nombre:
+            continue
+        llamadas.append(
+            ToolCall(
+                id=_texto(cruda.get("id")) or f"call_{indice}",
+                name=nombre,
+                arguments=_texto(funcion.get("arguments")),
+            )
+        )
+    return tuple(llamadas)
+
+
+def _parse_tool_call_deltas(valor: Any) -> tuple[ToolCallDelta, ...]:
+    """``delta.tool_calls`` → FRAGMENTOS de peticiones (streaming).
+
+    En streaming una petición llega repartida: el primer evento trae el ``id``
+    y el nombre, y los siguientes van soltando los argumentos carácter a
+    carácter con el mismo ``index``. Aquí no se pega nada —eso es trabajo de
+    ``ToolCallAccumulator``, que es común a cualquier proveedor—: solo se
+    traduce la forma del cable.
+
+    ``index`` puede faltar en algún evento; se cae a la posición dentro de la
+    lista, que es lo que hacen los proveedores cuando solo hay una petición.
+    """
+    if not isinstance(valor, list):
+        return ()
+    fragmentos: list[ToolCallDelta] = []
+    for posicion, cruda in enumerate(valor):
+        if not isinstance(cruda, dict):
+            continue
+        funcion = cruda.get("function")
+        funcion = funcion if isinstance(funcion, dict) else {}
+        crudo_indice = cruda.get("index")
+        indice = (
+            crudo_indice
+            if isinstance(crudo_indice, int) and not isinstance(crudo_indice, bool)
+            else posicion
+        )
+        fragmentos.append(
+            ToolCallDelta(
+                index=indice,
+                id=_texto(cruda.get("id")) or None,
+                name=_texto(funcion.get("name")) or None,
+                arguments=_texto(funcion.get("arguments")),
+            )
+        )
+    return tuple(fragmentos)
 
 
 # --- Utilidades de instrumentación -------------------------------------------
