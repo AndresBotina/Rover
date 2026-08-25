@@ -42,6 +42,7 @@ tests/
 └── test_database.py   # tests de la capa DB SIN base real (SQLite en memoria)
 scripts/check_llm.py   # comprobación manual contra el proveedor real (no es test)
 scripts/check_tools.py # el loop de tools contra DeepSeek + clima reales (no es test)
+scripts/chat.py        # chatear en local sin sacar el token a mano (solo dev)
 .env.example           # plantilla de variables (el .env real NUNCA se commitea)
 Dockerfile             # imagen de producción (Python 3.12 slim + uv, no-root)
 docker-compose.yml     # servicio de desarrollo (hot-reload + puerto 8000)
@@ -1506,6 +1507,125 @@ uv run uvicorn app.main:app --reload           # arranca en http://127.0.0.1:800
 # healthcheck:
 curl http://127.0.0.1:8000/v1/health
 ```
+
+## Chatear desde la terminal (`scripts/chat.py`) — solo desarrollo
+
+Probar el agente a mano son dos `curl` encadenados: uno al login para sacar el
+`access_token` y otro a `/v1/chat` con ese token en la cabecera. Este script
+hace las dos cosas y te deja escribir una frase:
+
+```bash
+cd apps/backend
+uv run python -m scripts.chat "¿Qué tal el clima en Bogotá?"
+```
+
+> **Es tooling, no producto.** No corre en CI, no lo importa nadie y no toca la
+> lógica del agente: habla con la API por HTTP como cualquier otro cliente.
+
+### Configurarlo
+
+Necesita un **usuario de pruebas** ya registrado y confirmado. Añade a
+`apps/backend/.env` (el real, que está git-ignorado — la plantilla lleva estas
+líneas comentadas):
+
+```dotenv
+ROVER_DEV_TEST_EMAIL=dev@example.com
+ROVER_DEV_TEST_PASSWORD=la-contrasena-de-ese-usuario
+```
+
+**Que sea una cuenta de usar y tirar**, nunca la de una persona real ni una de
+producción: aquí la contraseña va en claro en un archivo del disco. Si no
+tienes una:
+
+```bash
+curl -s localhost:8000/v1/auth/register -H 'Content-Type: application/json' \
+  -d '{"email":"dev@example.com","password":"una-contrasena-larga"}'
+```
+
+…y confírmala desde el enlace que manda Supabase (o márcala como confirmada en
+Authentication → Users). El backend **ignora** estas variables al arrancar
+(`Settings` usa `extra="ignore"`), así que tenerlas en el `.env` no afecta a
+nada.
+
+Si faltan, el script lo dice y no manda nada:
+
+```
+✗ Faltan las credenciales del usuario de pruebas.
+  Añade esto a apps/backend/.env (es SOLO para desarrollo local; …)
+```
+
+Contra qué backend habla lo decide `ROVER_DEV_BASE_URL`
+(default `http://localhost:8000`), por si algún día apunta a staging.
+
+### Usarlo
+
+**Mensaje nuevo** (crea la conversación):
+
+```bash
+uv run python -m scripts.chat "¿Qué tal el clima en Bogotá?"
+```
+
+```
+→ login como dev@example.com en http://localhost:8000
+  token obtenido
+→ conversación nueva
+  conversación 0f6c2f9e-1f2a-4c3b-9d5e-8a7b6c5d4e3f (nueva)
+
+  [get_weather] Consultando el clima…
+En Bogotá hay 14 grados y nubes dispersas…
+
+conversation_id: 0f6c2f9e-1f2a-4c3b-9d5e-8a7b6c5d4e3f
+para continuar:  uv run python -m scripts.chat "…" 0f6c2f9e-1f2a-4c3b-9d5e-8a7b6c5d4e3f
+```
+
+**Continuar esa conversación** — segundo argumento, el `conversation_id` que
+imprimió la línea de arriba (está pensada para copiarla y cambiarle el texto):
+
+```bash
+uv run python -m scripts.chat "¿Y me llevo chaqueta?" 0f6c2f9e-1f2a-4c3b-9d5e-8a7b6c5d4e3f
+```
+
+La respuesta llega **en streaming**, trozo a trozo, igual que con
+`curl -N --no-buffer`. Los eventos `status` de la fase de herramienta (HU-2.6)
+se ven como `[get_weather] Consultando el clima…`.
+
+> **La respuesta del modelo va a `stdout` y todo lo demás a `stderr`.** Así
+> `uv run python -m scripts.chat "…" > respuesta.txt` guarda **solo** lo que
+> dijo Rover, y el `conversation_id` se sigue viendo en la terminal.
+>
+> Un `Ctrl-C` a mitad sale limpio: el backend lo registra como
+> `llm_outcome=cancelled` y **no** persiste la respuesta a medias (HU-2.4).
+
+### Cuando algo falla
+
+El script traduce el `code` del contrato de errores (HU-1.8) a una pista
+accionable en vez de mandar un `curl` con el token vacío:
+
+| Qué pasó | Qué dice |
+|----------|----------|
+| Backend sin levantar | `No hay nadie escuchando en http://localhost:8000` + cómo arrancarlo |
+| Credenciales malas (`401`) | Qué dos variables del `.env` revisar (el 401 es el mismo si el email no existe o si la contraseña está mal) |
+| Email sin confirmar (`403`) | Que las credenciales **sí** son correctas y dónde confirmarlo |
+| Rate limit (`429`) | Que el login va a 10/min por IP y hay que esperar |
+| `200` sin `access_token` | Que el contrato del login cambió, con el cuerpo recibido |
+| `conversation_id` ajeno o borrado (`404`) | Que los tres casos responden igual y que empiece una nueva |
+| Fallo **a mitad** del stream | El `code` del evento de error… y **aun así el `conversation_id`**, porque la pregunta sí quedó guardada |
+
+### Por qué Python y no un `chat.sh`
+
+Sería el `curl` del README con menos teclas, y aun así sale perdiendo en cuatro
+puntos: `source .env` **ejecuta** el archivo (un valor con espacios o un `#`
+dentro lo rompe, o peor), parsear los marcos SSE pide `jq` —una dependencia
+más— y aun así queda torpe imprimir los `delta` sin salto entre ellos, traducir
+cada `code` de error a una pista es comparación de cadenas a mano, y ya hay
+convención: `scripts/check_llm.py` y `scripts/check_tools.py` se invocan igual.
+El costo de Python aquí es **cero**: `httpx` y `pydantic-settings` ya son
+dependencias del backend.
+
+Sus credenciales se declaran en un `BaseSettings` **propio del script**, no en
+`app/core/config.py`: un usuario de pruebas no pinta nada en la superficie de
+configuración de producción. Apunta al mismo `.env` y usa el mismo prefijo
+`ROVER_`, así que se configura como todo lo demás.
 
 ## Correr con Docker
 
