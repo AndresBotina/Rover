@@ -156,6 +156,86 @@ def test_el_resultado_esta_en_unidades_del_dominio(loop_de_test: BlockingPortal)
     assert clima.observed_at.tzinfo is not None
 
 
+@pytest.mark.parametrize(
+    ("metros_por_segundo", "kilometros_por_hora"),
+    [
+        # El valor del falso positivo que motivó estos tests: alguien comparó
+        # este m/s (de un punto) con los km/h de Rover (de otro punto) y dedujo
+        # un factor de 4,77 que ningún código aplica. Queda clavado aquí para
+        # que la pregunta "¿cuánto sale de 5,66?" tenga UNA respuesta en el repo.
+        (5.66, 20.4),
+        (7.6, 27.4),
+        (3.13, 11.3),
+        (1.0, 3.6),
+        (0.0, 0.0),
+        # 5,66 en OTRAS unidades, para que el test falle si alguna vez se
+        # interpretara mal la entrada: nudos → 10,5; mph → 9,1. Ninguno es 20,4.
+        (10.0, 36.0),
+    ],
+)
+def test_el_viento_se_convierte_de_m_s_a_km_h(
+    loop_de_test: BlockingPortal, metros_por_segundo: float, kilometros_por_hora: float
+) -> None:
+    """``wind_kph = wind.speed × 3.6``, y ningún otro factor.
+
+    Es la conversión más fácil de romper sin que se note: cualquier número
+    plausible en km/h pasa la vista, así que el único control real es fijarla
+    contra valores calculados a mano.
+    """
+    clima = dict(CLIMA_BOGOTA, wind={"speed": metros_por_segundo, "deg": 120})
+    proveedor, _ = _proveedor(_camino_feliz(clima=clima))
+
+    assert _consultar(loop_de_test, proveedor).wind_kph == pytest.approx(kilometros_por_hora)
+
+
+def test_el_viento_se_redondea_a_una_decima(loop_de_test: BlockingPortal) -> None:
+    """Al modelo no se le manda un número con seis decimales.
+
+    5,66 × 3,6 son 20,376 exactos: lo que viaja es 20,4. La precisión que sobra
+    solo gasta tokens y le da al modelo una falsa sensación de exactitud sobre
+    un dato que ya es una estimación de una estación cercana.
+    """
+    clima = dict(CLIMA_BOGOTA, wind={"speed": 5.66})
+    proveedor, _ = _proveedor(_camino_feliz(clima=clima))
+
+    assert _consultar(loop_de_test, proveedor).wind_kph == 20.4
+
+
+def test_un_viento_ausente_no_revienta_ni_inventa(loop_de_test: BlockingPortal) -> None:
+    """Sin ``wind`` en el cuerpo, 0 km/h — no un ``KeyError`` en una conversación."""
+    sin_viento = {k: v for k, v in CLIMA_BOGOTA.items() if k != "wind"}
+    proveedor, _ = _proveedor(_camino_feliz(clima=sin_viento))
+
+    assert _consultar(loop_de_test, proveedor).wind_kph == 0.0
+
+
+def test_las_demas_magnitudes_pasan_SIN_convertir(loop_de_test: BlockingPortal) -> None:
+    """Temperatura, sensación y humedad ya vienen en las unidades del dominio.
+
+    Con ``units=metric`` el proveedor entrega Celsius y porcentaje, así que lo
+    único que se les hace es redondear. Este test existe para dejar por escrito
+    que **no hay** aritmética escondida ahí: el fallo que se buscaba en el
+    viento habría sido invisible en la temperatura, donde 16,6 y 16,2 son
+    igual de creíbles.
+    """
+    clima = dict(CLIMA_BOGOTA, main={"temp": 16.59, "feels_like": 15.94, "humidity": 61})
+    proveedor, _ = _proveedor(_camino_feliz(clima=clima))
+
+    resultado = _consultar(loop_de_test, proveedor)
+
+    assert resultado.temperature_c == 16.6
+    assert resultado.feels_like_c == 15.9
+    assert resultado.humidity_pct == 61
+
+
+def test_sin_feels_like_se_cae_a_la_temperatura(loop_de_test: BlockingPortal) -> None:
+    """No se inventa una sensación térmica: se repite la temperatura real."""
+    clima = dict(CLIMA_BOGOTA, main={"temp": 16.59, "humidity": 61})
+    proveedor, _ = _proveedor(_camino_feliz(clima=clima))
+
+    assert _consultar(loop_de_test, proveedor).feels_like_c == 16.6
+
+
 def test_la_key_y_las_unidades_viajan_en_TODAS_las_peticiones(
     loop_de_test: BlockingPortal,
 ) -> None:
@@ -166,6 +246,12 @@ def test_la_key_y_las_unidades_viajan_en_TODAS_las_peticiones(
     for peticion in grabadora.peticiones:
         assert peticion.url.params["appid"] == API_KEY
     clima = grabadora.peticiones[1].url.params
+    # ``units`` decide en qué unidades LLEGA el cuerpo, así que perderlo
+    # cambiaría el significado de dos campos sin que nada fallara:
+    #   - sin ``units``  → ``main.temp`` en KELVIN (289 en vez de 16);
+    #   - ``imperial``   → ``wind.speed`` en MPH, y la conversión × 3.6 daría
+    #                      un número un 61 % alto que seguiría pareciendo viento.
+    # El de temperatura se vería enseguida; el de viento, no. De ahí el test.
     assert clima["units"] == "metric"
     assert clima["lang"] == "es"
     assert clima["lat"] == "4.6533326"

@@ -74,7 +74,14 @@ _WEATHER_PATH = "/data/2.5/weather"
 #: cambie esto convertiría el contrato en una mentira silenciosa.
 _UNITS = "metric"
 
-#: m/s (lo que devuelve el proveedor en unidades métricas) → km/h.
+#: m/s → km/h. El factor depende de ``_UNITS``: con ``metric`` (y con el
+#: default del proveedor) ``wind.speed`` viene en **metros por segundo**; con
+#: ``imperial`` vendría en **mph** y este 3.6 daría un número un 61 % alto.
+#: Es la razón de que la unidad esté fijada arriba y no en la config.
+#:
+#: Se comprueba con valores calculados a mano en ``tests/test_weather.py``,
+#: porque es la conversión más fácil de romper sin que se note: cualquier
+#: número plausible en km/h pasa la vista.
 _MS_A_KMH = 3.6
 
 _MSG_CAIDO = "El servicio de clima no está respondiendo."

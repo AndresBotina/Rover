@@ -1231,12 +1231,41 @@ data: {"type":"done","sequence":1}
 ```
 
 Que los **datos son reales** se comprueba contra la fuente, no leyendo la
-respuesta: la temperatura y la condición que diga Rover tienen que coincidir con
+respuesta. Pero hay que compararlos **bien**, y esto tiene una trampa que ya
+produjo un reporte de bug falso:
+
+> ⚠️ **No compares contra `?q=Bogota`.** Rover **no** consulta el clima por
+> nombre: geocodifica primero (`/geo/1.0/direct`) y luego pide el clima **por
+> coordenadas**. El registro de ciudad que resuelve `?q=` es **otro punto** —
+> para Bogotá, `(4.61, -74.08)` frente a `(4.71, -74.07)` que devuelve el
+> geocoding—, y a diez kilómetros de distancia el viento y la temperatura son
+> distintos de verdad. Comparar los dos da diferencias reales que **parecen un
+> error de conversión y no lo son**.
+
+Así que se compara **en las mismas coordenadas**, en dos pasos:
 
 ```bash
-curl -s "https://api.openweathermap.org/data/2.5/weather?q=Bogota&units=metric&lang=es&appid=$ROVER_WEATHER_API_KEY" \
-  | jq '{temp: .main.temp, cond: .weather[0].description}'
+KEY=$ROVER_WEATHER_API_KEY
+
+# 1. Las coordenadas que usa Rover (las del geocoding, no las de ?q=).
+curl -s "https://api.openweathermap.org/geo/1.0/direct?q=Bogotá&limit=1&appid=$KEY" \
+  | jq '.[0] | {lat, lon}'
+
+# 2. El clima EN ESE punto, con la conversión de viento hecha a la vista.
+curl -s "https://api.openweathermap.org/data/2.5/weather?lat=4.7110053&lon=-74.0720857&units=metric&lang=es&appid=$KEY" \
+  | jq '{temp: .main.temp, cond: .weather[0].description,
+         wind_ms: .wind.speed, wind_kph: (.wind.speed * 3.6 * 10 | round / 10)}'
 ```
+
+`wind_kph` de ahí es exactamente lo que debe reportar Rover: **m/s × 3.6**
+(`units=metric` hace que `wind.speed` venga en metros por segundo; con
+`imperial` vendría en mph, y de ahí que la unidad esté fijada en el código y no
+en la config). El `temp` y la condición, igual.
+
+La otra mitad de la trampa es el **tiempo**: el viento cambia en minutos, así
+que las dos consultas tienen que ir seguidas. Si quieres el contraste en el
+mismo instante y sin margen de error, `uv run python -m scripts.check_tools`
+imprime los `tool_steps` con el valor exacto que recibió el modelo.
 
 En el log del servidor quedan la ejecución de la herramienta y **las dos**
 llamadas al modelo del turno (la que pidió y la que redactó):
