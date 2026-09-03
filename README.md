@@ -139,4 +139,6 @@ El backend **no** se gestiona con pnpm. Ver [`apps/backend/README.md`](apps/back
 ```bash
 cd apps/backend
 uv sync
+
 ```
+## aquariusdev 
